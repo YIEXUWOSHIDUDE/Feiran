@@ -1,0 +1,10 @@
+{
+  "facts": [
+    {
+      "id": "fact-1",
+      "text": "参与课程项目，使用 Python 编写数据清洗脚本。",
+      "confirmed": true,
+      "terms": ["Python"]
+    }
+  ]
+}

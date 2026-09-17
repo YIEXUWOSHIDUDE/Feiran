@@ -1,0 +1,18 @@
+{
+  "jd": {
+    "text": "岗位要求：\n- 熟悉 Python\n- 有 Kubernetes 经验",
+    "source": null,
+    "captured_at": "2026-09-18T12:00:00-07:00"
+  },
+  "facts": [
+    {
+      "id": "fact-1",
+      "text": "参与课程项目，使用 Python 编写数据清洗脚本。",
+      "confirmed": true
+    }
+  ],
+  "selected_requirements": [
+    {"text": "熟悉 Python", "fact_id": "fact-1"},
+    {"text": "有 Kubernetes 经验", "fact_id": null}
+  ]
+}

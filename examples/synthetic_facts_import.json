@@ -1,0 +1,19 @@
+{
+  "facts": [
+    {
+      "type": "education",
+      "text": "计算机科学本科在读，预计 2027 年毕业。",
+      "tags": ["计算机", "Computer Science"]
+    },
+    {
+      "type": "project",
+      "text": "使用 Python 和 SQL 完成课程后端项目。",
+      "tags": ["Python", "SQL", "backend"]
+    },
+    {
+      "type": "achievement",
+      "text": "向一个开源项目提交过文档修复并被合并。",
+      "tags": ["开源项目", "open source"]
+    }
+  ]
+}
