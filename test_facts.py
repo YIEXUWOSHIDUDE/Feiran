@@ -11,6 +11,7 @@ from facts import (
     add_fact,
     confirm_fact,
     find_confirmed_facts,
+    import_facts,
     initialize_database,
     list_facts,
     load_confirmed_fact,
@@ -283,6 +284,38 @@ class FactStoreTests(unittest.TestCase):
         self.assertIn("facts[1]", stderr.getvalue())
         self.assertIn("tag", stderr.getvalue())
         self.assertFalse(database.exists())
+
+    def test_import_with_stable_ids_creates_then_versions_changed_items(self):
+        original = [{
+            "id": "fact-usc-coursework", "type": "education",
+            "text": "Coursework: Analysis of Algorithms", "tags": ["Algorithms"],
+        }]
+        edited = [{**original[0], "text": "Coursework: Analysis of Algorithms, Database Systems"}]
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "workbench.db"
+            created = import_facts(database, original)
+            confirm_fact(database, "fact-usc-coursework", 1)
+            unchanged = import_facts(database, original)
+            changed = import_facts(database, edited)
+            history = list_facts(database, "fact-usc-coursework")
+        self.assertEqual((created[0][0]["id"], created[0][1]), ("fact-usc-coursework", True))
+        self.assertFalse(unchanged[0][1])
+        self.assertEqual(
+            (changed[0][0]["version"], changed[0][0]["status"], changed[0][1]), (2, "pending", True)
+        )
+        self.assertEqual([item["status"] for item in history], ["confirmed", "pending"])
+
+    def test_import_rejects_new_id_that_duplicates_existing_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "workbench.db"
+            existing, _ = add_fact(database, "使用 Python。", "skill", ["Python"])
+            with self.assertRaisesRegex(FactStoreError, existing["id"]):
+                import_facts(database, [
+                    {"id": "fact-sql", "type": "skill", "text": "使用 SQL。", "tags": ["SQL"]},
+                    {"id": "fact-python", "type": "skill", "text": "使用 Python。", "tags": ["Python"]},
+                ])
+            stored = [fact["id"] for fact in list_facts(database)]
+        self.assertEqual(stored, [existing["id"]])
 
     def test_single_fact_can_still_be_confirmed_with_version_flag(self):
         with tempfile.TemporaryDirectory() as directory:

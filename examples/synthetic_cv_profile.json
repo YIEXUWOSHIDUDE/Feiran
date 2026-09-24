@@ -1,0 +1,65 @@
+{
+  "profile_version": 1,
+  "name": {"en": "Alex Example", "zh": "示例候选人"},
+  "contact": {
+    "location": {"en": "Los Angeles, CA", "zh": "美国 洛杉矶"},
+    "phone": "000-000-0000",
+    "email": "alex@example.com",
+    "links": [
+      {"label": "github.com/alex-example", "url": "https://github.com/alex-example"}
+    ]
+  },
+  "sections": [
+    {
+      "kind": "education",
+      "entries": [
+        {
+          "title": {"en": "Example State University", "zh": "示例州立大学"},
+          "location": {"en": "Los Angeles, CA", "zh": "美国 洛杉矶"},
+          "subtitle": {"en": "Master of Science in Computer Science", "zh": "计算机科学 硕士"},
+          "dates": {"en": "Aug 2026 – Expected May 2028", "zh": "2026.08 – 2028.05（预计）"},
+          "facts": ["fact-demo-coursework"]
+        }
+      ]
+    },
+    {
+      "kind": "experience",
+      "entries": [
+        {
+          "title": {"en": "Example Logistics Co.", "zh": ""},
+          "location": {"en": "Chengdu, China", "zh": "中国 成都"},
+          "subtitle": {"en": "Software Engineering Intern", "zh": "软件工程实习生"},
+          "dates": {"en": "Jun 2025 – Aug 2025", "zh": "2025.06 – 2025.08"},
+          "facts": ["fact-demo-intern-api", "fact-demo-intern-tests"],
+          "links": {"scheduling tool": "https://example.com/scheduling"}
+        }
+      ]
+    },
+    {
+      "kind": "projects",
+      "entries": [
+        {
+          "title": {"en": "Course Search", "zh": "课程搜索"},
+          "title_link": {"label": "GitHub", "url": "https://github.com/alex-example/course-search"},
+          "location": "Python, FastAPI, React, SQLite",
+          "facts": ["fact-demo-search-app", "fact-demo-search-ci"]
+        }
+      ]
+    },
+    {
+      "kind": "skills",
+      "entries": [
+        {"facts": ["fact-demo-skills-languages", "fact-demo-skills-tools"]}
+      ]
+    },
+    {
+      "kind": "publications",
+      "entries": [
+        {
+          "facts": ["fact-demo-paper"],
+          "links": {"Comparing Retrieval Methods for Course Search": "https://example.com/paper"}
+        }
+      ]
+    }
+  ]
+}

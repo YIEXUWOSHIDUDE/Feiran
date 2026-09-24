@@ -28,14 +28,16 @@ python3 facts.py confirm fact-xxxxxxxxxxxx@1
 
 支持的分类：`project`、`experience`、`skill`、`education`、`eligibility`、`availability`、`achievement`、`other`。
 
-事实较多时可从一个 JSON 文件批量导入，格式见 [examples/synthetic_facts_import.json](examples/synthetic_facts_import.json)：每条必须有 `type` 和 `text`，`tags` 可选，其他字段会被拒绝。
+事实较多时可从一个 JSON 文件批量导入，格式见 [examples/synthetic_facts_import.json](examples/synthetic_facts_import.json)：每条必须有 `type` 和 `text`，`tags` 和 `id` 可选，其他字段会被拒绝。
+
+`id` 是自定义的可读 ID（如 `fact-usc-coursework`，只能用 `fact-` 开头的字母、数字和连字符），简历 profile 用它引用事实，见 [examples/synthetic_cv_facts.json](examples/synthetic_cv_facts.json)。带 `id` 的条目：ID 不存在则新建；内容未变则不改动；内容改变则为该事实新建一个 `pending` 版本，需要重新确认。因此可以直接修改 JSON 文件后重新导入。新 ID 的内容若与已有事实完全相同会被拒绝，以免同一事实出现两份。
 
 ```sh
 python3 facts.py import .local/my-facts.json
 python3 facts.py confirm fact-aaaaaaaaaaaa@1 fact-bbbbbbbbbbbb@1
 ```
 
-导入会先校验全部条目，任何一条无效则整批不写入；全部新事实都是 `pending`，重复导入同一内容不会产生重复事实。导入输出的 `next_step` 会列出可确认的 `FACT_ID@VERSION`，请逐条核对后只保留确实无误的 ID。一次确认多个版本时，任何一个不是当前版本就全部不确认。导入不会修改已有事实；修改请用 `revise`。个人事实文件请放在 `.local/` 下，不要提交。
+导入会先校验全部条目，任何一条无效则整批不写入；全部新事实都是 `pending`，重复导入同一内容不会产生重复事实。导入输出的 `next_step` 会列出可确认的 `FACT_ID@VERSION`，请逐条核对后只保留确实无误的 ID。一次确认多个版本时，任何一个不是当前版本就全部不确认。不带 `id` 的条目不会修改已有事实；修改请用 `revise` 或带 `id` 重新导入。个人事实文件请放在 `.local/` 下，不要提交。
 
 修改文本、分类或标签会创建新的 `pending` 版本；没有提供的字段会沿用当前版本：
 
@@ -149,6 +151,24 @@ python3 review.py .local/review-linked.json
 
 `--no-match` 是明确的“当前没有支持事实”，审核结果会保留未知。检索顺序和候选数量不是匹配分数、资格结论或录取概率。
 
+### 5. 生成简历 PDF
+
+简历由两部分组成：`.local/cv-profile.json` 保存姓名、联系方式、学校/公司/职位/日期等版面信息和各条目引用的事实 ID（格式见 [examples/synthetic_cv_profile.json](examples/synthetic_cv_profile.json)）；每一行正文逐字来自事实库中当前已确认的事实版本。文字字段可以是普通字符串（各语言相同），也可以是 `{"en": ..., "zh": ...}`；中文留空时回退英文，并在输出的 `language_fallbacks` 中列出。
+
+```sh
+python3 cv.py draft --profile .local/cv-profile.json --language en --output .local/cv-draft-en.json
+python3 cv.py pdf .local/cv-draft-en.json --output .local/cv-en.pdf
+
+python3 cv.py draft --profile .local/cv-profile.json --language zh --output .local/cv-draft-zh.json
+python3 cv.py pdf .local/cv-draft-zh.json --output .local/cv-zh.pdf
+```
+
+- 英文默认 US Letter，中文默认 A4，可用 `--paper` 修改。`--job .local/review-linked.json` 会把与该岗位要求关联的事实排在各条目前面，不增删内容。
+- 引用了未确认事实时 `draft` 拒绝执行，并列出需要确认的 `FACT_ID@VERSION`。`pdf` 会再次核对：事实被修改、草稿被手工改写都会被拒绝，需要重新生成草稿。
+- PDF 由本机 Google Chrome 无界面打印（找不到时可设置 `CHROME_PATH`），HTML 中所有文字都经过转义并禁止任何网络加载。超过一页会给出提示。
+- 目前所有 PDF 都带“DRAFT / 草稿”水印；批准流程和 DeepSeek 按岗位改写尚未实现。
+- 输出文件都是新建，不会覆盖已有文件。
+
 ## 数据与限制
 
 - `.local/workbench.db`、运行 JSON、`.env` 和个人数据均被 Git 忽略。
@@ -157,7 +177,7 @@ python3 review.py .local/review-linked.json
 - `search --profile` 仍保留给合成样例，其 `confirmed` 字段只是输入声明；实际使用推荐 `--facts-db`。
 - 岗位来源目前只有 Greenhouse 搜索和手动粘贴；Lever、Ashby 等尚未接入。要求提取仍是固定标题规则，未知标题需用 `add` 手动补充。
 - TypeSafe 当前只判断 JD 要求；把候选人事实发送给外部模型尚未授权或实现。
-- 当前没有网页界面、材料批准记录、自动投递、正式导出或录取概率预测。
+- 当前没有网页界面、材料批准记录、AI 改写、自动投递或录取概率预测；简历 PDF 只有草稿版本。
 
 运行全部测试：
 

@@ -1,0 +1,58 @@
+{
+  "facts": [
+    {
+      "id": "fact-demo-ms-degree",
+      "type": "education",
+      "text": "Master of Science in Computer Science, Example State University, Aug 2026 – Expected May 2028.",
+      "tags": ["Computer Science", "Master", "M.S."]
+    },
+    {
+      "id": "fact-demo-coursework",
+      "type": "education",
+      "text": "Coursework: Distributed Systems, Machine Learning",
+      "tags": ["Distributed Systems", "Machine Learning"]
+    },
+    {
+      "id": "fact-demo-intern-api",
+      "type": "experience",
+      "text": "Built REST APIs in Java and Spring Boot for an internal scheduling tool.",
+      "tags": ["Java", "Spring Boot", "REST APIs"]
+    },
+    {
+      "id": "fact-demo-intern-tests",
+      "type": "experience",
+      "text": "Added unit and integration tests for the booking service with JUnit.",
+      "tags": ["JUnit", "testing", "Java"]
+    },
+    {
+      "id": "fact-demo-search-app",
+      "type": "project",
+      "text": "Built a course search app with FastAPI and React, using SQLite full-text search.",
+      "tags": ["FastAPI", "React", "SQLite", "Python"]
+    },
+    {
+      "id": "fact-demo-search-ci",
+      "type": "project",
+      "text": "Set up GitHub Actions to run tests and build Docker images on every pull request.",
+      "tags": ["GitHub Actions", "Docker", "CI/CD"]
+    },
+    {
+      "id": "fact-demo-skills-languages",
+      "type": "skill",
+      "text": "Languages: Python, Java, SQL, TypeScript",
+      "tags": ["Python", "Java", "SQL", "TypeScript"]
+    },
+    {
+      "id": "fact-demo-skills-tools",
+      "type": "skill",
+      "text": "Tools: Spring Boot, FastAPI, React, Docker, Git",
+      "tags": ["Spring Boot", "FastAPI", "React", "Docker", "Git"]
+    },
+    {
+      "id": "fact-demo-paper",
+      "type": "achievement",
+      "text": "Comparing Retrieval Methods for Course Search. Example Workshop, 2025.",
+      "tags": ["publication", "information retrieval"]
+    }
+  ]
+}

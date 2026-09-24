@@ -241,12 +241,12 @@ def _insert_tags(
     )
 
 
-def _add_in_transaction(
+def _same_payload(
     connection: sqlite3.Connection,
     text: str,
     fact_type: str,
     tags: list[tuple[str, str]],
-) -> tuple[dict[str, Any], bool]:
+) -> sqlite3.Row | None:
     rows = connection.execute(
         """SELECT v.fact_id, v.version, v.text, v.fact_type, v.status,
                   v.created_at, v.confirmed_at
@@ -261,8 +261,31 @@ def _add_in_transaction(
             connection, row["fact_id"], row["version"]
         )]
         if existing_keys == wanted_keys:
-            return _row_to_fact(connection, row), False
-    fact_id = f"fact-{uuid.uuid4().hex[:12]}"
+            return row
+    return None
+
+
+def _add_in_transaction(
+    connection: sqlite3.Connection,
+    text: str,
+    fact_type: str,
+    tags: list[tuple[str, str]],
+) -> tuple[dict[str, Any], bool]:
+    existing = _same_payload(connection, text, fact_type, tags)
+    if existing is not None:
+        return _row_to_fact(connection, existing), False
+    return _create_in_transaction(
+        connection, f"fact-{uuid.uuid4().hex[:12]}", text, fact_type, tags
+    )
+
+
+def _create_in_transaction(
+    connection: sqlite3.Connection,
+    fact_id: str,
+    text: str,
+    fact_type: str,
+    tags: list[tuple[str, str]],
+) -> tuple[dict[str, Any], bool]:
     created_at = _now()
     connection.execute(
         "INSERT INTO facts(fact_id, current_version, created_at) VALUES (?, 1, ?)",
@@ -314,29 +337,60 @@ def import_facts(path: Path, items: Any) -> list[tuple[dict[str, Any], bool]]:
     if len(items) > MAX_IMPORT_FACTS:
         raise FactStoreError(f"一次最多导入 {MAX_IMPORT_FACTS} 条事实")
     normalized = []
+    seen_ids: set[str] = set()
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             raise FactStoreError(f"facts[{index}] 必须是对象")
-        unknown = set(item) - {"text", "type", "tags"}
+        unknown = set(item) - {"id", "text", "type", "tags"}
         if unknown:
             raise FactStoreError(f"facts[{index}] 包含未知字段：{', '.join(sorted(unknown))}")
         tags = item.get("tags", [])
         if not isinstance(tags, list):
             raise FactStoreError(f"facts[{index}].tags 必须是字符串数组")
         try:
-            normalized.append((_fact_text(item.get("text")), _fact_type(item.get("type")), _tags(tags)))
+            fact_id = _fact_id(item["id"]) if "id" in item else None
+            values = (_fact_text(item.get("text")), _fact_type(item.get("type")), _tags(tags))
         except FactStoreError as exc:
             raise FactStoreError(f"facts[{index}]：{exc}") from exc
+        if fact_id is not None:
+            if fact_id in seen_ids:
+                raise FactStoreError(f"facts[{index}] 的 ID 重复：{fact_id}")
+            seen_ids.add(fact_id)
+        normalized.append((fact_id, *values))
     initialize_database(path)
     connection = _open_store(path)
     try:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
-            return [_add_in_transaction(connection, *values) for values in normalized]
+            return [
+                _import_in_transaction(connection, index, *values)
+                for index, values in enumerate(normalized)
+            ]
     except sqlite3.Error as exc:
         raise FactStoreError("无法导入事实") from exc
     finally:
         connection.close()
+
+
+def _import_in_transaction(
+    connection: sqlite3.Connection,
+    index: int,
+    fact_id: str | None,
+    text: str,
+    fact_type: str,
+    tags: list[tuple[str, str]],
+) -> tuple[dict[str, Any], bool]:
+    """Without an ID, deduplicate by payload; with one, create it or add a pending version."""
+    if fact_id is None:
+        return _add_in_transaction(connection, text, fact_type, tags)
+    if connection.execute("SELECT 1 FROM facts WHERE fact_id = ?", (fact_id,)).fetchone():
+        return _revise_in_transaction(connection, fact_id, text, fact_type, tags)
+    duplicate = _same_payload(connection, text, fact_type, tags)
+    if duplicate is not None:
+        raise FactStoreError(
+            f"facts[{index}] 与已有事实 {duplicate['fact_id']} 内容相同；请改用该 ID"
+        )
+    return _create_in_transaction(connection, fact_id, text, fact_type, tags)
 
 
 def revise_fact(
@@ -350,49 +404,63 @@ def revise_fact(
     fact_id = _fact_id(fact_id)
     if text is None and fact_type is None and tags is None:
         raise FactStoreError("修改事实时至少提供 --text、--type 或 --tag")
+    next_text = _fact_text(text) if text is not None else None
+    next_type = _fact_type(fact_type) if fact_type is not None else None
+    next_tags = _tags(tags) if tags is not None else None
     connection = _open_store(path)
     try:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
-            current = connection.execute(
-                """SELECT f.current_version, v.fact_id, v.version, v.text, v.fact_type,
-                          v.status, v.created_at, v.confirmed_at
-                   FROM facts AS f JOIN fact_versions AS v
-                     ON v.fact_id = f.fact_id AND v.version = f.current_version
-                   WHERE f.fact_id = ?""",
-                (fact_id,),
-            ).fetchone()
-            if current is None:
-                raise FactStoreError(f"事实不存在：{fact_id}")
-            next_text = _fact_text(text) if text is not None else current["text"]
-            next_type = _fact_type(fact_type) if fact_type is not None else current["fact_type"]
-            current_tags = _version_tags(connection, fact_id, current["version"])
-            next_tags = _tags(tags) if tags is not None else _tags(current_tags)
-            if (next_text == current["text"] and next_type == current["fact_type"]
-                    and [key for _, key in next_tags] == [tag.casefold() for tag in current_tags]):
-                return _row_to_fact(connection, current), False
-            version = current["current_version"] + 1
-            created_at = _now()
-            connection.execute(
-                """INSERT INTO fact_versions(
-                       fact_id, version, text, fact_type, status, created_at, confirmed_at
-                   ) VALUES (?, ?, ?, ?, 'pending', ?, NULL)""",
-                (fact_id, version, next_text, next_type, created_at),
-            )
-            _insert_tags(connection, fact_id, version, next_tags)
-            connection.execute(
-                "UPDATE facts SET current_version = ? WHERE fact_id = ?", (version, fact_id)
-            )
-            row = connection.execute(
-                """SELECT fact_id, version, text, fact_type, status, created_at, confirmed_at
-                   FROM fact_versions WHERE fact_id = ? AND version = ?""",
-                (fact_id, version),
-            ).fetchone()
-            return _row_to_fact(connection, row), True
+            return _revise_in_transaction(connection, fact_id, next_text, next_type, next_tags)
     except sqlite3.Error as exc:
         raise FactStoreError("无法创建事实新版本") from exc
     finally:
         connection.close()
+
+
+def _revise_in_transaction(
+    connection: sqlite3.Connection,
+    fact_id: str,
+    text: str | None,
+    fact_type: str | None,
+    tags: list[tuple[str, str]] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Add a pending version from normalized values; None carries the current value forward."""
+    current = connection.execute(
+        """SELECT f.current_version, v.fact_id, v.version, v.text, v.fact_type,
+                  v.status, v.created_at, v.confirmed_at
+           FROM facts AS f JOIN fact_versions AS v
+             ON v.fact_id = f.fact_id AND v.version = f.current_version
+           WHERE f.fact_id = ?""",
+        (fact_id,),
+    ).fetchone()
+    if current is None:
+        raise FactStoreError(f"事实不存在：{fact_id}")
+    next_text = text if text is not None else current["text"]
+    next_type = fact_type if fact_type is not None else current["fact_type"]
+    current_tags = _version_tags(connection, fact_id, current["version"])
+    next_tags = tags if tags is not None else _tags(current_tags)
+    if (next_text == current["text"] and next_type == current["fact_type"]
+            and [key for _, key in next_tags] == [tag.casefold() for tag in current_tags]):
+        return _row_to_fact(connection, current), False
+    version = current["current_version"] + 1
+    created_at = _now()
+    connection.execute(
+        """INSERT INTO fact_versions(
+               fact_id, version, text, fact_type, status, created_at, confirmed_at
+           ) VALUES (?, ?, ?, ?, 'pending', ?, NULL)""",
+        (fact_id, version, next_text, next_type, created_at),
+    )
+    _insert_tags(connection, fact_id, version, next_tags)
+    connection.execute(
+        "UPDATE facts SET current_version = ? WHERE fact_id = ?", (version, fact_id)
+    )
+    row = connection.execute(
+        """SELECT fact_id, version, text, fact_type, status, created_at, confirmed_at
+           FROM fact_versions WHERE fact_id = ? AND version = ?""",
+        (fact_id, version),
+    ).fetchone()
+    return _row_to_fact(connection, row), True
 
 
 def _confirm_in_transaction(
@@ -623,6 +691,28 @@ def load_confirmed_fact(path: Path, fact_id: str, version: int) -> dict[str, Any
         return _row_to_fact(connection, row)
     except sqlite3.Error as exc:
         raise FactStoreError("无法读取指定事实版本") from exc
+    finally:
+        connection.close()
+
+
+def load_current_facts(path: Path, fact_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Return the current version, confirmed or pending, of each requested fact that exists."""
+    ids = tuple(dict.fromkeys(_fact_id(value) for value in fact_ids))
+    if not ids:
+        return {}
+    connection = _open_store(path)
+    try:
+        rows = connection.execute(
+            f"""SELECT v.fact_id, v.version, v.text, v.fact_type, v.status,
+                       v.created_at, v.confirmed_at
+                FROM facts AS f JOIN fact_versions AS v
+                  ON v.fact_id = f.fact_id AND v.version = f.current_version
+                WHERE f.fact_id IN ({','.join('?' for _ in ids)})""",
+            ids,
+        ).fetchall()
+        return {row["fact_id"]: _row_to_fact(connection, row) for row in rows}
+    except sqlite3.Error as exc:
+        raise FactStoreError("无法读取引用的事实") from exc
     finally:
         connection.close()
 

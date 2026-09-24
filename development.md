@@ -8,7 +8,7 @@
 
 ## 当前已实现
 
-`facts.py` 使用本机 SQLite 保存事实文本、分类、标签、版本和独立人工确认，支持从 JSON 批量导入 pending 事实和原子化批量确认，并提供有限候选检索；`job_search.py` 读取 Greenhouse 招聘板，用事实库标签在本机排序，选岗后只保存 JD 快照，也接受用户粘贴的任意来源 JD；`requirement_flow.py` 按中英文常见标题提取并确认 JD 要求，允许用户手动补充 JD 原文要求，可选调用 TypeSafe/Jev 增加结构化语义判断；`matching.py` 在要求确认后按分类与标签检索少量当前已确认事实，再记录人工关联或明确无匹配；`review.py` 校验要求、事实及版本绑定，输出双侧原文或未知。目前没有材料批准、自动申请或网页界面。样例和离线测试使用合成数据；Greenhouse 公开接口和 TypeSafe API 已分别做过只读/合成数据探测，新加入的 TypeSafe 适配代码尚未用轮换后的 key 做真实联网回归。
+`facts.py` 使用本机 SQLite 保存事实文本、分类、标签、版本和独立人工确认，支持从 JSON 批量导入 pending 事实和原子化批量确认，并提供有限候选检索；`job_search.py` 读取 Greenhouse 招聘板，用事实库标签在本机排序，选岗后只保存 JD 快照，也接受用户粘贴的任意来源 JD；`requirement_flow.py` 按中英文常见标题提取并确认 JD 要求，允许用户手动补充 JD 原文要求，可选调用 TypeSafe/Jev 增加结构化语义判断；`matching.py` 在要求确认后按分类与标签检索少量当前已确认事实，再记录人工关联或明确无匹配；`review.py` 校验要求、事实及版本绑定，输出双侧原文或未知；`cv.py` 用本机简历 profile 和当前已确认事实生成中英文简历草稿，并通过无界面 Chrome 导出带草稿水印的 PDF。目前没有材料批准、AI 改写、自动申请或网页界面。样例和离线测试使用合成数据；Greenhouse 公开接口和 TypeSafe API 已分别做过只读/合成数据探测，新加入的 TypeSafe 适配代码尚未用轮换后的 key 做真实联网回归。
 
 ## 当前代码结构与数据流
 
@@ -22,12 +22,14 @@
 ├── typesafe_classifier.py        # 调用 TypeSafe/Jev 做语义判断
 ├── matching.py                   # 检索事实候选并记录人工关联
 ├── review.py                     # 校验要求与候选人事实证据
+├── cv.py                         # 简历草稿与 PDF（只用已确认事实）
 ├── test_job_search.py
 ├── test_facts.py
 ├── test_requirement_flow.py
 ├── test_matching.py
 ├── test_typesafe_classifier.py
 ├── test_review.py
+├── test_cv.py
 ├── test_end_to_end.py            # 粘贴 JD 到审核结果的离线全流程
 ├── examples/                     # 合成输入样例（含中文 JD 与事实导入文件）
 ├── README.md                     # 运行入口和当前限制
@@ -59,6 +61,11 @@ flowchart LR
     L --> N[人工 link / no-match]
     N --> O[review-linked.json]
     O --> P[review.py]
+    CP[cv-profile.json] --> CV[cv.py draft]
+    DB -->|profile 引用的已确认事实| CV
+    O -.->|--job 调整行序| CV
+    CV --> CX[cv.py pdf 再次核对]
+    CX --> CH[无界面 Chrome] --> PDF[带草稿水印的 PDF]
     P --> M[双侧证据审核结果]
 ```
 
@@ -72,6 +79,7 @@ flowchart LR
 | `typesafe_classifier.py` | 向 Jev 提出窄问题；校验并保留 Noul/Choice 概率、置信度和实际模型版本。 | 改变候选状态、选择事实依据或代替人工决定。 |
 | `matching.py` | 将已确认要求映射为类型偏好，检索事实候选，绑定人工 `link/no-match` 决定，并检查候选事实版本是否仍有效。 | 自动证明语义支持、读取历史/未确认事实或向外部模型发送个人资料。 |
 | `review.py` | 校验要求原文、事实存在性、确认状态和精确版本；输出双侧证据或未知。 | 证明录取概率、补全缺失事实或批准最终材料。 |
+| `cv.py` | 校验简历 profile；把引用的当前已确认事实逐字放入中英文草稿；导出前再次核对版本与原文；渲染转义后的 HTML 并调用 Chrome 生成 PDF。 | 改写或翻译事实、批准最终材料、把 profile 中的联系方式发送给任何外部服务。 |
 
 数据会经过一个本地权威事实库和五个主要文件状态：
 
@@ -136,6 +144,16 @@ flowchart LR
 
 默认模式采用确定性章节规则，因为它便于检查遗漏和误提取，也不需要把 JD 或候选人资料发送给模型。代价是未知章节标题会得到零候选（需用 `add` 手动补充），列表中的日期等子项可能被拆成独立候选，也不会自动判断 required 与 preferred 的语义强度。可选 TypeSafe 模式补充了语义判断，但当前仍只处理规则已经找到的候选，因此没有解决未知章节遗漏。
 
+## 简历草稿与 PDF（第一步已实现）
+
+`cv.py draft` 读取本机 `cv-profile.json`：姓名、联系方式和每个条目的学校/公司、职位、地点、日期由用户维护，条目正文只列事实 ID。文字字段可写成 `{"en", "zh"}`，缺少的语言回退到另一种并记录在 `language_fallbacks`，不会让程序自行翻译学校或公司名称。profile 先整体校验（未知字段、非 http(s) 链接、未知章节都报出具体路径），再读取引用事实；任何一条不存在或当前版本未确认，都整体拒绝并列出 `FACT_ID@VERSION`。草稿记录 profile 的 SHA-256、每条事实的精确版本、语言和纸张；`--job` 只把与岗位要求关联的事实排到条目前面。
+
+`cv.py pdf` 在打印前再次核对：每条事实仍是草稿记录的已确认版本，且每行文字与该版本逐字相同。这样事实被修改或草稿被手工改写时不会导出未经确认的文字。HTML 对所有文字转义，只为 profile 中的 http(s) 链接生成超链接，并用 Content-Security-Policy 禁止任何网络加载。PDF 由本机 Chrome 以临时 profile 无界面打印；在 Claude Code 沙箱中观察到 Chrome 写完文件后不退出，因此以文件末尾出现 `%%EOF` 作为完成条件，再结束 Chrome 进程。输出总是新建文件，超过一页会提示。
+
+为让 profile 可读地引用事实，`facts.py import` 支持可选的自定义 ID：新 ID 新建事实，内容相同不变，内容变化则生成新的 `pending` 版本；新 ID 与已有事实内容完全相同会被拒绝。
+
+当前限制：所有 PDF 都带草稿水印，尚无批准记录；正文逐字使用事实原文，中文简历中的英文事实不会被翻译。用户真实简历已转换为 `.local/my-facts.json` 和 `.local/cv-profile.json`，并以 pending 状态导入本机事实库，待用户逐条确认。
+
 ## TypeSafe/Jev 语义判断（第一小步已实现）
 
 `requirement_flow.py propose --typesafe` 调用 `typesafe_classifier.py`。程序把一份 JD 快照和规则找到的候选要求组成命名 JSON state，再对每个候选并行提出三个窄问题：它是否是申请人需要满足的要求、它主要属于哪一类、它表达的是 required、preferred 还是不明确/并非要求。Noul 返回“是”的概率；两个 Choice 保留选择、完整概率分布和置信度。输出同时记录请求的模型别名与 API 实际返回的版本，避免把可能移动的 `jev-latest` 当作固定版本。
@@ -160,4 +178,6 @@ Jev 在这里是**语义判断器**，不是业务决策者。代码继续控制
 
 下一步应根据实际使用场景选择：为事实、要求和匹配决定增加轻量审核界面，或在获得真实数据范围授权后评估受约束的语义复核。简历导入仍需设计“提取为 pending 候选、逐项确认、来源定位和重复合并”；搜索 profile 中的 `confirmed: true` 仍只是输入声明。
 
-2026-09-22 提出、尚待用户确认的后续顺序：B. 每个岗位一条引导式命令（或本地网页），减少 7 条命令和手工复制 ID；C. 基于已绑定证据生成受事实约束的简历要点/求职信，每句关联事实版本，经人工批准后导出，批准绑定具体内容与输入版本；D. 投递记录（岗位、日期、状态、所用已批准材料版本）。C 是否调用外部模型、使用哪家服务以及能否发送候选人事实，需要用户单独授权。
+2026-09-23 用户确认：开发和测试使用命令行，最终版本需要网页界面；输出为中英文简历 PDF；改写使用 DeepSeek，允许发送为某个岗位选中的事实与 JD（不发送姓名和联系方式）。API key 保存在 macOS 钥匙串（service `deepseek-api-key`），不写入任何文件；2026-09-23 用 `GET /models` 验证可用，返回 `deepseek-flash` 与 `deepseek-v4-pro`。自动投递是未来可能方向，与本文件和 AGENTS 规则中“不提交真实申请”的约束冲突，需要用户另行授权后再讨论。
+
+后续顺序：C2. DeepSeek 按岗位改写简历要点（每句引用事实 ID，确定性检查数字、强动词和技能词，未通过的句子不进入草稿），实现前先核对 DeepSeek 当前 API 文档；C3. 批准记录绑定草稿内容、profile 哈希、JD 和事实版本，批准后才能导出无水印 PDF；B. 本地网页串起粘贴 JD、要求确认、事实匹配、简历预览、批准和下载；D. 投递记录。
