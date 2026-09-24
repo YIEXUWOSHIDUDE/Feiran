@@ -22,7 +22,9 @@
 ├── typesafe_classifier.py        # 调用 TypeSafe/Jev 做语义判断
 ├── matching.py                   # 检索事实候选并记录人工关联
 ├── review.py                     # 校验要求与候选人事实证据
-├── cv.py                         # 简历草稿与 PDF（只用已确认事实）
+├── cv.py                         # 简历草稿、DeepSeek 改写与 PDF
+├── claims.py                     # 改写行的确定性事实检查
+├── deepseek_client.py            # DeepSeek JSON 调用与 key 读取
 ├── test_job_search.py
 ├── test_facts.py
 ├── test_requirement_flow.py
@@ -30,6 +32,8 @@
 ├── test_typesafe_classifier.py
 ├── test_review.py
 ├── test_cv.py
+├── test_claims.py
+├── test_deepseek_client.py
 ├── test_end_to_end.py            # 粘贴 JD 到审核结果的离线全流程
 ├── examples/                     # 合成输入样例（含中文 JD 与事实导入文件）
 ├── README.md                     # 运行入口和当前限制
@@ -64,6 +68,10 @@ flowchart LR
     CP[cv-profile.json] --> CV[cv.py draft]
     DB -->|profile 引用的已确认事实| CV
     O -.->|--job 调整行序| CV
+    CV -->|可选| TL[cv.py tailor]
+    TL -->|只发送要点原文与岗位要求| DS[DeepSeek]
+    DS -->|claims.py 逐行检查| TL
+    TL --> CX
     CV --> CX[cv.py pdf 再次核对]
     CX --> CH[无界面 Chrome] --> PDF[带草稿水印的 PDF]
     P --> M[双侧证据审核结果]
@@ -79,7 +87,9 @@ flowchart LR
 | `typesafe_classifier.py` | 向 Jev 提出窄问题；校验并保留 Noul/Choice 概率、置信度和实际模型版本。 | 改变候选状态、选择事实依据或代替人工决定。 |
 | `matching.py` | 将已确认要求映射为类型偏好，检索事实候选，绑定人工 `link/no-match` 决定，并检查候选事实版本是否仍有效。 | 自动证明语义支持、读取历史/未确认事实或向外部模型发送个人资料。 |
 | `review.py` | 校验要求原文、事实存在性、确认状态和精确版本；输出双侧证据或未知。 | 证明录取概率、补全缺失事实或批准最终材料。 |
-| `cv.py` | 校验简历 profile；把引用的当前已确认事实逐字放入中英文草稿；导出前再次核对版本与原文；渲染转义后的 HTML 并调用 Chrome 生成 PDF。 | 改写或翻译事实、批准最终材料、把 profile 中的联系方式发送给任何外部服务。 |
+| `cv.py` | 校验简历 profile；把引用的当前已确认事实逐字放入中英文草稿；按岗位请求 DeepSeek 改写并只保留通过检查的行；导出前再次核对版本、原文或改写检查；渲染转义后的 HTML 并调用 Chrome 生成 PDF。 | 批准最终材料、把 profile 中的姓名、联系方式、学校和公司名称发送给任何外部服务。 |
+| `claims.py` | 对单行改写做确定性检查：新数字、新技术或技能词、更强的职责表述、链接和格式。 | 判断语义是否等价；它只能拦截词面上可识别的夸大。 |
+| `deepseek_client.py` | 以 JSON 模式调用 DeepSeek，有限重试与空内容重试，校验响应，从环境变量或钥匙串读取 key。 | 决定发送哪些数据或是否采用结果。 |
 
 数据会经过一个本地权威事实库和五个主要文件状态：
 
@@ -154,6 +164,16 @@ flowchart LR
 
 当前限制：所有 PDF 都带草稿水印，尚无批准记录；正文逐字使用事实原文，中文简历中的英文事实不会被翻译。用户真实简历已转换为 `.local/my-facts.json` 和 `.local/cv-profile.json`，并以 pending 状态导入本机事实库，待用户逐条确认。
 
+## 按岗位改写（DeepSeek，第二步已实现）
+
+`cv.py tailor` 从 `cv.py draft` 的原始草稿出发（已改写过的草稿会被拒绝），先用与导出相同的规则核对事实，再把教育细节、经历和项目要点、技能行逐行发给 DeepSeek，同时发送岗位标题和已确认的要求。姓名、联系方式、学校和公司名称以及论文都不发送，测试逐项断言。回答必须是 JSON，且每条请求的 `fact_id` 恰好对应一行，否则整体失败。
+
+每行改写都经过 `claims.check_rewrite`：不允许出现事实中没有的数字；形似技术名的词（含数字、`.+#`、两个以上大写字母或驼峰）必须出现在事实原文或其标签中；草稿中任何事实的标签词（包括中文标签）出现在改写里，也必须属于该事实的原文或标签；在事实没有同类表述时，不允许 led/managed/owned 或 主导/带领/负责 等更强的职责词；不允许新增链接或邮箱，并限制为单行、300 字符以内。未通过的行保留事实原文，并把被拒绝的文字和原因记入草稿。导出时对已采用的改写重新运行同一检查，并要求 `source_text` 仍等于当前已确认版本；事实修改后旧改写不能导出。
+
+2026-09-23 用合成资料实测 `deepseek-flash`（`reasoning_effort=low`）：英文请求 7 行全部原样返回并通过；中文请求 7 行全部翻译并通过，技术名保持英文，没有出现更强表述。单次约 620 个输入 token、1,100–1,700 个输出 token，耗时 6–7 秒。
+
+限制：检查只看词面，“为内部工具”被改成“为多个团队的内部工具”这类不含数字和技术词的语义扩大不会被拦截，因此仍需人工逐行核对；在“不新增内容”的规则下，英文改写往往接近原文，主要价值在中文翻译和按岗位排序；批准流程尚未实现，所有 PDF 仍带草稿水印。
+
 ## TypeSafe/Jev 语义判断（第一小步已实现）
 
 `requirement_flow.py propose --typesafe` 调用 `typesafe_classifier.py`。程序把一份 JD 快照和规则找到的候选要求组成命名 JSON state，再对每个候选并行提出三个窄问题：它是否是申请人需要满足的要求、它主要属于哪一类、它表达的是 required、preferred 还是不明确/并非要求。Noul 返回“是”的概率；两个 Choice 保留选择、完整概率分布和置信度。输出同时记录请求的模型别名与 API 实际返回的版本，避免把可能移动的 `jev-latest` 当作固定版本。
@@ -180,4 +200,4 @@ Jev 在这里是**语义判断器**，不是业务决策者。代码继续控制
 
 2026-09-23 用户确认：开发和测试使用命令行，最终版本需要网页界面；输出为中英文简历 PDF；改写使用 DeepSeek，允许发送为某个岗位选中的事实与 JD（不发送姓名和联系方式）。API key 保存在 macOS 钥匙串（service `deepseek-api-key`），不写入任何文件；2026-09-23 用 `GET /models` 验证可用，返回 `deepseek-flash` 与 `deepseek-v4-pro`。自动投递是未来可能方向，与本文件和 AGENTS 规则中“不提交真实申请”的约束冲突，需要用户另行授权后再讨论。
 
-后续顺序：C2. DeepSeek 按岗位改写简历要点（每句引用事实 ID，确定性检查数字、强动词和技能词，未通过的句子不进入草稿），实现前先核对 DeepSeek 当前 API 文档；C3. 批准记录绑定草稿内容、profile 哈希、JD 和事实版本，批准后才能导出无水印 PDF；B. 本地网页串起粘贴 JD、要求确认、事实匹配、简历预览、批准和下载；D. 投递记录。
+后续顺序：C2（DeepSeek 按岗位改写）已完成，见上一节；C3. 批准记录绑定草稿内容、profile 哈希、JD 和事实版本，批准后才能导出无水印 PDF；B. 本地网页串起粘贴 JD、要求确认、事实匹配、简历预览与改写对比、批准和下载；D. 投递记录；最后用用户真实岗位做端到端评估（约 5 个岗位，逐行核对 DeepSeek 改写，记录拒绝率与人工修改）。

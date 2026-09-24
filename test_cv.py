@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from cv import CVError, build_draft, export_pdf, main, render_html
+from cv import CVError, build_draft, export_pdf, main, render_html, tailor_draft
 from facts import confirm_facts, import_facts, revise_fact
 
 
@@ -180,6 +180,9 @@ class CVRenderTests(unittest.TestCase):
         english = render_html(draft_for("en"))
         chinese = render_html(draft_for("zh"))
         self.assertIn("<strong>Languages:</strong> Python, Java", english)
+        translated = draft_for("zh")
+        translated["sections"][2]["entries"][0]["lines"][0]["text"] = "语言：Python, Java"
+        self.assertIn("<strong>语言：</strong>Python, Java", render_html(translated))
         self.assertIn("size: Letter", english)
         self.assertIn('lang="zh-CN"', chinese)
         self.assertIn("size: A4", chinese)
@@ -225,6 +228,96 @@ class CVExportTests(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["workbench.db"])
 
 
+class FakeChat:
+    """Stands in for DeepSeek: echoes each requested line unless a rewrite is given."""
+
+    def __init__(self, rewrites=None, drop=None):
+        self.rewrites = rewrites or {}
+        self.drop = drop
+        self.messages = None
+
+    def __call__(self, messages, model, effort):
+        self.messages = messages
+        request = json.loads(messages[-1]["content"])
+        lines = [
+            {"fact_id": line["fact_id"], "text": self.rewrites.get(line["fact_id"], line["text"])}
+            for line in request["lines"] if line["fact_id"] != self.drop
+        ]
+        return {
+            "model": "deepseek-flash",
+            "content": {"lines": lines},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+
+def line_for(draft, fact_id):
+    return next(
+        line for section in draft["sections"] for entry in section["entries"]
+        for line in entry["lines"] if line["fact_id"] == fact_id
+    )
+
+
+class CVTailorTests(unittest.TestCase):
+    def test_supported_rewrites_are_used_and_unsupported_ones_keep_the_fact(self):
+        chat = FakeChat({
+            "fact-intern-api": "For an internal tool, built REST APIs.",
+            "fact-intern-tests": "Wrote 40 unit tests for billing code.",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            draft = build_draft(PROFILE, database, "en")
+            tailored = tailor_draft(draft, database, job=linked_job(["fact-intern-api"]), chat=chat)
+        accepted = line_for(tailored, "fact-intern-api")
+        rejected = line_for(tailored, "fact-intern-tests")
+        self.assertEqual(accepted["text"], "For an internal tool, built REST APIs.")
+        self.assertEqual(accepted["source_text"], "Built REST APIs for an internal tool.")
+        self.assertEqual(accepted["tailoring"]["status"], "accepted")
+        self.assertEqual(rejected["text"], "Wrote unit tests for billing code.")
+        self.assertEqual(rejected["tailoring"]["status"], "rejected")
+        self.assertTrue(any("40" in reason for reason in rejected["tailoring"]["reasons"]))
+        self.assertEqual((tailored["tailoring"]["accepted"], tailored["tailoring"]["rejected"]), (3, 1))
+
+    def test_request_holds_only_lines_and_requirements_never_contact_or_papers(self):
+        profile = copy.deepcopy(PROFILE)
+        profile["contact"]["phone"] = "213-555-0100"
+        profile["sections"].append({"kind": "publications", "entries": [{"facts": ["fact-paper"]}]})
+        chat = FakeChat()
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            import_facts(database, [{
+                "id": "fact-paper", "type": "achievement", "text": "A Private Paper Title. Venue, 2025.",
+            }])
+            confirm_facts(database, [("fact-paper", 1)])
+            draft = build_draft(profile, database, "zh")
+            tailor_draft(draft, database, job=linked_job(["fact-intern-api"]), chat=chat)
+        request = json.dumps(chat.messages, ensure_ascii=False)
+        for private in ("Alex Example", "示例", "alex@example.com", "213-555-0100",
+                        "Los Angeles", "github.com/alex", "Example Corp", "Example University",
+                        "A Private Paper Title"):
+            self.assertNotIn(private, request)
+        self.assertIn("Built REST APIs for an internal tool.", request)
+        self.assertIn("Requirement number 0", request)
+
+    def test_tailored_draft_exports_until_its_fact_changes(self):
+        chat = FakeChat({"fact-intern-api": "For an internal tool, built REST APIs."})
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            tailored = tailor_draft(build_draft(PROFILE, database, "en"), database, chat=chat)
+            printer = FakePrinter()
+            export_pdf(tailored, database, Path(directory) / "tailored.pdf", printer=printer)
+            revise_fact(database, "fact-intern-api", text="Built REST APIs for two internal tools.")
+            with self.assertRaisesRegex(CVError, "fact-intern-api"):
+                export_pdf(tailored, database, Path(directory) / "stale.pdf", printer=FakePrinter())
+        self.assertIn("For an internal tool, built REST APIs.", printer.html)
+
+    def test_answers_that_skip_a_requested_line_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            draft = build_draft(PROFILE, database, "en")
+            with self.assertRaisesRegex(CVError, "不一致"):
+                tailor_draft(draft, database, chat=FakeChat(drop="fact-intern-tests"))
+
+
 class CVCommandLineTests(unittest.TestCase):
     def run_cli(self, arguments):
         stdout = io.StringIO()
@@ -251,6 +344,24 @@ class CVCommandLineTests(unittest.TestCase):
         self.assertEqual((drafted["language"], drafted["paper"]), ("zh", "a4"))
         self.assertEqual(printed["pages"], 2)
         self.assertIn("2 页", printed["warning"])
+
+    def test_cli_tailor_writes_a_new_draft_and_lists_rejected_lines(self):
+        chat = FakeChat({"fact-intern-tests": "Wrote 40 unit tests for billing code."})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = make_store(directory)
+            (root / "draft.json").write_text(
+                json.dumps(build_draft(PROFILE, database, "en"), ensure_ascii=False), encoding="utf-8"
+            )
+            with patch("cv.chat_json", chat):
+                summary = self.run_cli([
+                    "tailor", root / "draft.json", "--facts-db", database,
+                    "--output", root / "tailored.json",
+                ])
+            saved = json.loads((root / "tailored.json").read_text(encoding="utf-8"))
+        self.assertEqual((summary["accepted"], summary["rejected"]), (3, 1))
+        self.assertEqual(summary["rejected_lines"][0]["fact_id"], "fact-intern-tests")
+        self.assertEqual(saved["tailoring"]["model"], "deepseek-flash")
 
     def test_documented_example_profile_and_facts_work_together(self):
         examples = Path(__file__).parent / "examples"

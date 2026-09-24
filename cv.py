@@ -1,6 +1,7 @@
 """Assemble a CV draft from a local profile and confirmed facts, and render it."""
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -15,6 +16,8 @@ from html import escape
 from pathlib import Path
 from typing import Any, Callable
 
+from claims import check_rewrite
+from deepseek_client import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, load_current_facts
 from review import build_report
 
@@ -330,7 +333,8 @@ def _labelled(text: str, links: dict[str, str]) -> str:
     for separator in (": ", "："):
         label, found, rest = text.partition(separator)
         if found and 0 < len(label) <= 40:
-            return f"<strong>{escape(label + found.strip())}</strong> {_linked(rest, links)}"
+            space = " " if found == ": " else ""
+            return f"<strong>{escape(label + found.strip())}</strong>{space}{_linked(rest, links)}"
     return _linked(text, links)
 
 
@@ -471,8 +475,25 @@ def print_with_chrome(html_path: Path, pdf_path: Path) -> None:
                     process.wait()
 
 
-def _verify_draft(draft: Any, facts_db: Path) -> None:
-    """Every line must still quote the current confirmed version of its fact, word for word."""
+def _line_supported(line: dict[str, Any], fact: dict[str, Any], vocabulary: list[str]) -> bool:
+    """A plain line quotes its fact; an accepted rewrite still passes every claim check."""
+    tailoring = line.get("tailoring")
+    status = tailoring.get("status") if isinstance(tailoring, dict) else None
+    if tailoring is None or status == "rejected":
+        return line["text"] == fact["text"]
+    if status == "accepted":
+        return (
+            line.get("source_text") == fact["text"]
+            and not check_rewrite(line["text"], fact["text"], fact["tags"], vocabulary)
+        )
+    return False
+
+
+def _verify_draft(draft: Any, facts_db: Path) -> dict[str, dict[str, Any]]:
+    """Every line must still rest on the current confirmed version of its fact.
+
+    Returns those current facts, keyed by ID, for callers that need their tags.
+    """
     if not isinstance(draft, dict) or draft.get("cv_draft_version") != DRAFT_VERSION:
         raise CVError("草稿文件版本无效")
     if draft.get("language") not in LANGUAGES or draft.get("paper") not in PAPERS:
@@ -490,20 +511,22 @@ def _verify_draft(draft: Any, facts_db: Path) -> None:
         if fact_id not in current or current[fact_id]["status"] != "confirmed"
         or current[fact_id]["version"] != version
     ]
+    vocabulary = [tag for fact in current.values() for tag in fact["tags"]]
     try:
         for section in draft["sections"]:
             for entry in section["entries"]:
                 for line in entry["lines"]:
                     fact = current.get(line["fact_id"])
                     if (fact is None or versions.get(line["fact_id"]) != line["fact_version"]
-                            or line["text"] != fact["text"]):
+                            or not _line_supported(line, fact, vocabulary)):
                         problems.append(line["fact_id"])
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, AttributeError) as exc:
         raise CVError("草稿文件结构无效") from exc
     if problems:
         raise CVError(
             "草稿与当前已确认事实不一致，请重新生成草稿：" + ", ".join(dict.fromkeys(problems))
         )
+    return current
 
 
 def _count_pages(data: bytes) -> int | None:
@@ -542,6 +565,114 @@ def export_pdf(
     return {"saved_to": str(output), "pages": _count_pages(data), "watermark": WATERMARK[draft["language"]]}
 
 
+TAILOR_KINDS = {"education", "experience", "projects", "skills"}
+LANGUAGE_NAMES = {"en": "English", "zh": "Simplified Chinese (简体中文)"}
+TAILOR_RULES = """You rewrite resume lines for one job application and reply in json only.
+Rules:
+1. Rewrite each input line into exactly one line in {language}. Use only what that line states:
+   add no numbers, metrics, technologies, tools, team sizes, results or impact.
+2. Keep the strength of every claim. "Developed", "implemented" or "participated" must never
+   become "led", "owned", "managed", "spearheaded" or "responsible for"; in Chinese do not use
+   主导、带领、领导、牵头、负责 or 统筹 unless the line itself says so.
+3. Keep technology names, product names and numbers exactly as written; do not translate them.
+4. You may reorder and reword so the parts relevant to the job requirements come first, using
+   only content already in the line.
+5. One sentence per line, no line breaks, about the same length or shorter.
+6. For "Label: items" lines keep the items exactly; you may translate only the label.
+Reply with this json shape, exactly one entry per input line, reusing each fact_id:
+{{"lines": [{{"fact_id": "fact-example", "text": "rewritten line"}}]}}"""
+
+
+def _rewrites(content: Any, expected: set[str]) -> dict[str, str]:
+    lines = content.get("lines") if isinstance(content, dict) else None
+    if not isinstance(lines, list):
+        raise CVError("DeepSeek 返回的行与请求不一致：缺少 lines")
+    rewrites: dict[str, str] = {}
+    for item in lines:
+        if (not isinstance(item, dict) or not isinstance(item.get("fact_id"), str)
+                or not isinstance(item.get("text"), str) or item["fact_id"] in rewrites):
+            raise CVError("DeepSeek 返回的行与请求不一致")
+        rewrites[item["fact_id"]] = item["text"].strip()
+    if set(rewrites) != expected:
+        raise CVError("DeepSeek 返回的行与请求不一致")
+    return rewrites
+
+
+def tailor_draft(
+    draft: Any,
+    facts_db: Path,
+    job: Any = None,
+    chat: Callable[..., dict[str, Any]] = chat_json,
+    model: str = DEFAULT_MODEL,
+    effort: str = DEFAULT_EFFORT,
+) -> dict[str, Any]:
+    """Rewrite bullet, skill and coursework lines for one job, keeping only checked rewrites.
+
+    Only line text, the job title and its confirmed requirements are sent: never the name,
+    contact details, entry titles or publications. A rewrite that fails check_rewrite is
+    recorded with its reasons while the line keeps the confirmed fact word for word.
+    """
+    if isinstance(draft, dict) and "tailoring" in draft:
+        raise CVError("草稿已经改写过；请从 cv.py draft 生成的原始草稿开始")
+    current = _verify_draft(draft, facts_db)
+    job_summary = _job_summary(job)
+    requested = [
+        {"fact_id": line["fact_id"], "section": section["kind"], "text": line["text"]}
+        for section in draft["sections"] if section["kind"] in TAILOR_KINDS
+        for entry in section["entries"] for line in entry["lines"]
+    ]
+    if not requested:
+        raise CVError("草稿中没有可改写的行")
+    language = LANGUAGE_NAMES[draft["language"]]
+    request = {
+        "target_language": language,
+        "job_title": job_summary["title"] if job_summary else None,
+        "job_requirements": [item["text"] for item in job["selected_requirements"]] if job_summary else [],
+        "lines": requested,
+    }
+    messages = [
+        {"role": "system", "content": TAILOR_RULES.format(language=language)},
+        {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+    ]
+    try:
+        answer = chat(messages, model=model, effort=effort)
+    except DeepSeekError as exc:
+        raise CVError(f"DeepSeek 改写失败：{exc}") from exc
+    rewrites = _rewrites(answer.get("content"), {item["fact_id"] for item in requested})
+    vocabulary = [tag for fact in current.values() for tag in fact["tags"]]
+    result = copy.deepcopy(draft)
+    counts = {"accepted": 0, "rejected": 0}
+    for section in result["sections"]:
+        if section["kind"] not in TAILOR_KINDS:
+            continue
+        for entry in section["entries"]:
+            for line in entry["lines"]:
+                fact = current[line["fact_id"]]
+                rewrite = rewrites[line["fact_id"]]
+                reasons = check_rewrite(rewrite, fact["text"], fact["tags"], vocabulary)
+                if reasons:
+                    line["tailoring"] = {
+                        "status": "rejected", "rejected_text": rewrite, "reasons": reasons,
+                    }
+                    counts["rejected"] += 1
+                else:
+                    line["source_text"] = line["text"]
+                    line["text"] = rewrite
+                    line["tailoring"] = {"status": "accepted"}
+                    counts["accepted"] += 1
+    result["tailoring"] = {
+        "provider": "deepseek",
+        "requested_model": model,
+        "model": answer.get("model"),
+        "effort": effort,
+        "usage": answer.get("usage"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "job": job_summary,
+        **counts,
+    }
+    return result
+
+
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -563,6 +694,13 @@ def main(argv: list[str] | None = None) -> int:
     drafting.add_argument("--language", choices=LANGUAGES, default="en")
     drafting.add_argument("--paper", choices=PAPERS, help="默认英文 letter、中文 a4")
     drafting.add_argument("--output", type=Path, required=True, help="新建草稿 JSON；不覆盖已有文件")
+    tailoring = actions.add_parser("tailor", help="用 DeepSeek 按岗位改写草稿；未通过检查的行保留原文")
+    tailoring.add_argument("draft", type=Path, help="cv.py draft 生成的原始草稿")
+    tailoring.add_argument("--job", type=Path, help="matching.py decide 的输出；不提供则只翻译和润色")
+    tailoring.add_argument("--facts-db", type=Path, default=DEFAULT_DATABASE)
+    tailoring.add_argument("--model", default=DEFAULT_MODEL)
+    tailoring.add_argument("--effort", choices=EFFORTS, default=DEFAULT_EFFORT)
+    tailoring.add_argument("--output", type=Path, required=True, help="新建改写后的草稿；不覆盖已有文件")
     printing = actions.add_parser("pdf", help="重新核对事实后生成带草稿水印的 PDF")
     printing.add_argument("draft", type=Path)
     printing.add_argument("--facts-db", type=Path, default=DEFAULT_DATABASE)
@@ -581,6 +719,29 @@ def main(argv: list[str] | None = None) -> int:
                 "fact_count": len(draft["facts"]),
                 "language_fallbacks": draft["language_fallbacks"],
                 "next_step": "运行 cv.py pdf 生成带草稿水印的 PDF 并逐行检查",
+            }
+        elif args.action == "tailor":
+            job = _read_json(args.job) if args.job else None
+            tailored = tailor_draft(
+                _read_json(args.draft), args.facts_db, job,
+                chat=chat_json, model=args.model, effort=args.effort,
+            )
+            _write_new_json(args.output, tailored)
+            summary = {
+                "saved_to": str(args.output),
+                "model": tailored["tailoring"]["model"],
+                "usage": tailored["tailoring"]["usage"],
+                "accepted": tailored["tailoring"]["accepted"],
+                "rejected": tailored["tailoring"]["rejected"],
+                "rejected_lines": [
+                    {"fact_id": line["fact_id"], **{
+                        key: line["tailoring"][key] for key in ("rejected_text", "reasons")
+                    }}
+                    for section in tailored["sections"] for entry in section["entries"]
+                    for line in entry["lines"]
+                    if line.get("tailoring", {}).get("status") == "rejected"
+                ],
+                "next_step": "运行 cv.py pdf 生成 PDF，并逐行核对改写后的内容",
             }
         else:
             summary = export_pdf(

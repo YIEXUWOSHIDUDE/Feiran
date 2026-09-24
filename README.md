@@ -166,8 +166,22 @@ python3 cv.py pdf .local/cv-draft-zh.json --output .local/cv-zh.pdf
 - 英文默认 US Letter，中文默认 A4，可用 `--paper` 修改。`--job .local/review-linked.json` 会把与该岗位要求关联的事实排在各条目前面，不增删内容。
 - 引用了未确认事实时 `draft` 拒绝执行，并列出需要确认的 `FACT_ID@VERSION`。`pdf` 会再次核对：事实被修改、草稿被手工改写都会被拒绝，需要重新生成草稿。
 - PDF 由本机 Google Chrome 无界面打印（找不到时可设置 `CHROME_PATH`），HTML 中所有文字都经过转义并禁止任何网络加载。超过一页会给出提示。
-- 目前所有 PDF 都带“DRAFT / 草稿”水印；批准流程和 DeepSeek 按岗位改写尚未实现。
+- 目前所有 PDF 都带“DRAFT / 草稿”水印；批准流程尚未实现。
 - 输出文件都是新建，不会覆盖已有文件。
+
+按岗位改写或翻译（DeepSeek）：
+
+```sh
+python3 cv.py tailor .local/cv-draft-zh.json \
+  --job .local/review-linked.json \
+  --output .local/cv-tailored-zh.json
+python3 cv.py pdf .local/cv-tailored-zh.json --output .local/cv-tailored-zh.pdf
+```
+
+- API key 依次从环境变量 `DEEPSEEK_API_KEY` 和 macOS 钥匙串（service `deepseek-api-key`）读取，不写入任何文件。存入或更换：`security add-generic-password -U -a "$USER" -s deepseek-api-key -w`（会提示输入且不显示）。
+- 只发送教育细节、经历和项目要点、技能行的原文，以及岗位标题和已确认的要求；不发送姓名、联系方式、学校和公司名称、论文。
+- 每一行对应一条事实。改写中出现事实里没有的数字、技术或技能词、“主导/负责/led/managed”等更强的表述、链接，或者格式不对，都会被拒绝；该行保留事实原文，拒绝原因写在命令输出和草稿中。这些检查只看词面，不能证明语义完全一致，导出前仍需逐行核对。
+- `--job` 可以省略，此时只翻译和润色。默认模型 `deepseek-flash`、`--effort low`，可用 `--model deepseek-v4-pro` 或 `--effort high` 调整。
 
 ## 数据与限制
 
@@ -177,7 +191,7 @@ python3 cv.py pdf .local/cv-draft-zh.json --output .local/cv-zh.pdf
 - `search --profile` 仍保留给合成样例，其 `confirmed` 字段只是输入声明；实际使用推荐 `--facts-db`。
 - 岗位来源目前只有 Greenhouse 搜索和手动粘贴；Lever、Ashby 等尚未接入。要求提取仍是固定标题规则，未知标题需用 `add` 手动补充。
 - TypeSafe 当前只判断 JD 要求；把候选人事实发送给外部模型尚未授权或实现。
-- 当前没有网页界面、材料批准记录、AI 改写、自动投递或录取概率预测；简历 PDF 只有草稿版本。
+- 当前没有网页界面、材料批准记录、自动投递或录取概率预测；简历 PDF 只有草稿版本。
 
 运行全部测试：
 
