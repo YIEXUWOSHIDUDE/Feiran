@@ -166,7 +166,7 @@ python3 cv.py pdf .local/cv-draft-zh.json --output .local/cv-zh.pdf
 - 英文默认 US Letter，中文默认 A4，可用 `--paper` 修改。`--job .local/review-linked.json` 会把与该岗位要求关联的事实排在各条目前面，不增删内容。
 - 引用了未确认事实时 `draft` 拒绝执行，并列出需要确认的 `FACT_ID@VERSION`。`pdf` 会再次核对：事实被修改、草稿被手工改写都会被拒绝，需要重新生成草稿。
 - PDF 由本机 Google Chrome 无界面打印（找不到时可设置 `CHROME_PATH`），HTML 中所有文字都经过转义并禁止任何网络加载。超过一页会给出提示。
-- 目前所有 PDF 都带“DRAFT / 草稿”水印；批准流程尚未实现。
+- 未批准的草稿导出的 PDF 都带“DRAFT / 草稿”水印；批准流程见本节末尾。
 - 输出文件都是新建，不会覆盖已有文件。
 
 按岗位改写或翻译（DeepSeek）：
@@ -183,6 +183,17 @@ python3 cv.py pdf .local/cv-tailored-zh.json --output .local/cv-tailored-zh.pdf
 - 每一行对应一条事实。改写中出现事实里没有的数字、技术或技能词、“主导/负责/led/managed”等更强的表述、链接，或者格式不对，都会被拒绝；该行保留事实原文，拒绝原因写在命令输出和草稿中。这些检查只看词面，不能证明语义完全一致，导出前仍需逐行核对。
 - `--job` 可以省略，此时只翻译和润色。默认模型 `deepseek-flash`、`--effort low`，可用 `--model deepseek-v4-pro` 或 `--effort high` 调整。
 
+审核、批准与最终 PDF：
+
+```sh
+python3 cv.py approve .local/cv-tailored-zh.json --output .local/cv-approved-zh.json
+python3 cv.py pdf .local/cv-approved-zh.json --output .local/cv-final-zh.pdf
+```
+
+- 先用带水印的 PDF 逐行核对。`approve` 会再次核对全部事实，列出 DeepSeek 改动过的每一行（原文 → 改写），并在新文件中记录批准时间和内容指纹。
+- 只有已批准、且批准后内容没有任何改动的文件才能导出无水印的最终 PDF。批准后改动任何内容（包括姓名、日期），或引用的事实被修改，最终导出都会被拒绝，需要重新生成草稿并重新批准。
+- 已批准的文件不能再改写，也不能重复批准。
+
 ## 数据与限制
 
 - `.local/workbench.db`、运行 JSON、`.env` 和个人数据均被 Git 忽略。
@@ -191,7 +202,7 @@ python3 cv.py pdf .local/cv-tailored-zh.json --output .local/cv-tailored-zh.pdf
 - `search --profile` 仍保留给合成样例，其 `confirmed` 字段只是输入声明；实际使用推荐 `--facts-db`。
 - 岗位来源目前只有 Greenhouse 搜索和手动粘贴；Lever、Ashby 等尚未接入。要求提取仍是固定标题规则，未知标题需用 `add` 手动补充。
 - TypeSafe 当前只判断 JD 要求；把候选人事实发送给外部模型尚未授权或实现。
-- 当前没有网页界面、材料批准记录、自动投递或录取概率预测；简历 PDF 只有草稿版本。
+- 当前没有网页界面、投递记录、自动投递或录取概率预测。
 
 运行全部测试：
 

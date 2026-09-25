@@ -8,7 +8,15 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from cv import CVError, build_draft, export_pdf, main, render_html, tailor_draft
+from cv import (
+    CVError,
+    approve_draft,
+    build_draft,
+    export_pdf,
+    main,
+    render_html,
+    tailor_draft,
+)
 from facts import confirm_facts, import_facts, revise_fact
 
 
@@ -318,6 +326,53 @@ class CVTailorTests(unittest.TestCase):
                 tailor_draft(draft, database, chat=FakeChat(drop="fact-intern-tests"))
 
 
+class CVApprovalTests(unittest.TestCase):
+    def test_only_an_approved_draft_exports_without_watermark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            draft = build_draft(PROFILE, database, "en")
+            unapproved = export_pdf(draft, database, Path(directory) / "draft.pdf", printer=FakePrinter())
+            printer = FakePrinter()
+            final = export_pdf(
+                approve_draft(draft, database), database, Path(directory) / "final.pdf", printer=printer
+            )
+        self.assertFalse(unapproved["final"])
+        self.assertEqual(unapproved["watermark"], "DRAFT")
+        self.assertTrue(final["final"])
+        self.assertIsNone(final["watermark"])
+        self.assertNotIn('class="watermark"', printer.html)
+
+    def test_any_change_after_approval_blocks_the_final_pdf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            approved = approve_draft(build_draft(PROFILE, database, "en"), database)
+            edited = copy.deepcopy(approved)
+            edited["header"]["name"] = "Alex Q. Example"
+            with self.assertRaisesRegex(CVError, "批准后内容已改变"):
+                export_pdf(edited, database, Path(directory) / "edited.pdf", printer=FakePrinter())
+            revise_fact(database, "fact-intern-api", text="Built REST APIs for two internal tools.")
+            with self.assertRaisesRegex(CVError, "fact-intern-api"):
+                export_pdf(approved, database, Path(directory) / "stale.pdf", printer=FakePrinter())
+            self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["workbench.db"])
+
+    def test_stale_or_already_approved_drafts_cannot_be_approved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            draft = build_draft(PROFILE, database, "en")
+            with self.assertRaisesRegex(CVError, "已经批准"):
+                approve_draft(approve_draft(draft, database), database)
+            revise_fact(database, "fact-intern-tests", text="Wrote unit tests for payment code.")
+            with self.assertRaisesRegex(CVError, "fact-intern-tests"):
+                approve_draft(draft, database)
+
+    def test_approved_file_cannot_be_tailored_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            approved = approve_draft(build_draft(PROFILE, database, "en"), database)
+            with self.assertRaisesRegex(CVError, "已批准"):
+                tailor_draft(approved, database, chat=FakeChat())
+
+
 class CVCommandLineTests(unittest.TestCase):
     def run_cli(self, arguments):
         stdout = io.StringIO()
@@ -362,6 +417,28 @@ class CVCommandLineTests(unittest.TestCase):
         self.assertEqual((summary["accepted"], summary["rejected"]), (3, 1))
         self.assertEqual(summary["rejected_lines"][0]["fact_id"], "fact-intern-tests")
         self.assertEqual(saved["tailoring"]["model"], "deepseek-flash")
+
+    def test_cli_approve_lists_rewrites_then_pdf_is_final(self):
+        chat = FakeChat({"fact-intern-api": "For an internal tool, built REST APIs."})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = make_store(directory)
+            tailored = tailor_draft(build_draft(PROFILE, database, "en"), database, chat=chat)
+            (root / "tailored.json").write_text(json.dumps(tailored, ensure_ascii=False), encoding="utf-8")
+            with patch("cv.print_with_chrome", FakePrinter()):
+                approved = self.run_cli([
+                    "approve", root / "tailored.json", "--facts-db", database,
+                    "--output", root / "approved.json",
+                ])
+                printed = self.run_cli([
+                    "pdf", root / "approved.json", "--facts-db", database, "--output", root / "final.pdf",
+                ])
+        self.assertEqual(approved["rewritten_lines"], [{
+            "fact_id": "fact-intern-api",
+            "from": "Built REST APIs for an internal tool.",
+            "to": "For an internal tool, built REST APIs.",
+        }])
+        self.assertTrue(printed["final"])
 
     def test_documented_example_profile_and_facts_work_together(self):
         examples = Path(__file__).parent / "examples"

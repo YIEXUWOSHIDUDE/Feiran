@@ -24,6 +24,7 @@ from review import build_report
 
 PROFILE_VERSION = 1
 DRAFT_VERSION = 1
+APPROVAL_VERSION = 1
 LANGUAGES = ("en", "zh")
 PAPERS = ("letter", "a4")
 DEFAULT_PAPER = {"en": "letter", "zh": "a4"}
@@ -534,6 +535,38 @@ def _count_pages(data: bytes) -> int | None:
     return count or None
 
 
+def _content_hash(draft: dict[str, Any]) -> str:
+    content = {key: value for key, value in draft.items() if key != "approval"}
+    return _profile_hash(content)
+
+
+def approve_draft(draft: Any, facts_db: Path) -> dict[str, Any]:
+    """Stamp a verified draft with the fingerprint of exactly what the user reviewed."""
+    if isinstance(draft, dict) and "approval" in draft:
+        raise CVError("这个文件已经批准过；如内容需要修改，请重新生成草稿再批准")
+    _verify_draft(draft, facts_db)
+    approved = copy.deepcopy(draft)
+    approved["approval"] = {
+        "approval_version": APPROVAL_VERSION,
+        "approved_at": datetime.now(timezone.utc).isoformat(),
+        "content_sha256": _content_hash(draft),
+    }
+    return approved
+
+
+def _is_final(draft: dict[str, Any]) -> bool:
+    """An approval counts only while the content still matches its fingerprint."""
+    approval = draft.get("approval")
+    if approval is None:
+        return False
+    if (not isinstance(approval, dict) or approval.get("approval_version") != APPROVAL_VERSION
+            or not isinstance(approval.get("content_sha256"), str)):
+        raise CVError("批准记录结构无效")
+    if approval["content_sha256"] != _content_hash(draft):
+        raise CVError("批准后内容已改变；请重新生成草稿并重新批准")
+    return True
+
+
 def export_pdf(
     draft: Any,
     facts_db: Path,
@@ -541,13 +574,17 @@ def export_pdf(
     html_output: Path | None = None,
     printer: Callable[[Path, Path], None] = print_with_chrome,
 ) -> dict[str, Any]:
-    """Re-check a draft against the fact store, then print it to a new watermarked PDF."""
+    """Re-check a draft against the fact store, then print it to a new PDF.
+
+    Only an approved draft whose content is unchanged prints without the watermark.
+    """
     _verify_draft(draft, facts_db)
+    final = _is_final(draft)
     output = Path(output)
     for path in (output, html_output):
         if path is not None and Path(path).exists():
             raise CVError(f"输出文件已存在，不会覆盖：{path}")
-    html = render_html(draft)
+    html = render_html(draft, final=final)
     with tempfile.TemporaryDirectory(prefix="cv-export-") as directory:
         html_path = Path(directory) / "cv.html"
         pdf_path = Path(directory) / "cv.pdf"
@@ -562,7 +599,12 @@ def export_pdf(
     if html_output is not None:
         with Path(html_output).open("x", encoding="utf-8") as handle:
             handle.write(html)
-    return {"saved_to": str(output), "pages": _count_pages(data), "watermark": WATERMARK[draft["language"]]}
+    return {
+        "saved_to": str(output),
+        "pages": _count_pages(data),
+        "final": final,
+        "watermark": None if final else WATERMARK[draft["language"]],
+    }
 
 
 TAILOR_KINDS = {"education", "experience", "projects", "skills"}
@@ -612,6 +654,8 @@ def tailor_draft(
     contact details, entry titles or publications. A rewrite that fails check_rewrite is
     recorded with its reasons while the line keeps the confirmed fact word for word.
     """
+    if isinstance(draft, dict) and "approval" in draft:
+        raise CVError("已批准的文件不能再改写；请从 cv.py draft 生成的原始草稿开始")
     if isinstance(draft, dict) and "tailoring" in draft:
         raise CVError("草稿已经改写过；请从 cv.py draft 生成的原始草稿开始")
     current = _verify_draft(draft, facts_db)
@@ -673,6 +717,16 @@ def tailor_draft(
     return result
 
 
+def _rewritten_lines(draft: dict[str, Any]) -> list[dict[str, str]]:
+    """Every line whose wording DeepSeek changed, as original → rewrite, for review."""
+    return [
+        {"fact_id": line["fact_id"], "from": line["source_text"], "to": line["text"]}
+        for section in draft["sections"] for entry in section["entries"]
+        for line in entry["lines"]
+        if line.get("tailoring", {}).get("status") == "accepted" and line["text"] != line["source_text"]
+    ]
+
+
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -701,7 +755,11 @@ def main(argv: list[str] | None = None) -> int:
     tailoring.add_argument("--model", default=DEFAULT_MODEL)
     tailoring.add_argument("--effort", choices=EFFORTS, default=DEFAULT_EFFORT)
     tailoring.add_argument("--output", type=Path, required=True, help="新建改写后的草稿；不覆盖已有文件")
-    printing = actions.add_parser("pdf", help="重新核对事实后生成带草稿水印的 PDF")
+    approving = actions.add_parser("approve", help="逐行核对后批准草稿；只有批准且未改动的文件能导出无水印 PDF")
+    approving.add_argument("draft", type=Path)
+    approving.add_argument("--facts-db", type=Path, default=DEFAULT_DATABASE)
+    approving.add_argument("--output", type=Path, required=True, help="新建已批准文件；不覆盖已有文件")
+    printing = actions.add_parser("pdf", help="重新核对事实后生成 PDF；未批准的带草稿水印")
     printing.add_argument("draft", type=Path)
     printing.add_argument("--facts-db", type=Path, default=DEFAULT_DATABASE)
     printing.add_argument("--output", type=Path, required=True, help="新建 PDF；不覆盖已有文件")
@@ -741,7 +799,22 @@ def main(argv: list[str] | None = None) -> int:
                     for line in entry["lines"]
                     if line.get("tailoring", {}).get("status") == "rejected"
                 ],
+                "rewritten_lines": _rewritten_lines(tailored),
                 "next_step": "运行 cv.py pdf 生成 PDF，并逐行核对改写后的内容",
+            }
+        elif args.action == "approve":
+            approved = approve_draft(_read_json(args.draft), args.facts_db)
+            _write_new_json(args.output, approved)
+            summary = {
+                "saved_to": str(args.output),
+                "approved_at": approved["approval"]["approved_at"],
+                "language": approved["language"],
+                "job": (approved.get("tailoring") or {}).get("job") or approved.get("job"),
+                "line_count": sum(
+                    len(entry["lines"]) for section in approved["sections"] for entry in section["entries"]
+                ),
+                "rewritten_lines": _rewritten_lines(approved),
+                "next_step": "运行 cv.py pdf 生成无水印的最终 PDF；内容或事实变化后需重新批准",
             }
         else:
             summary = export_pdf(
