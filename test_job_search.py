@@ -15,6 +15,7 @@ from job_search import (
     load_profile,
     main,
     normalize_board,
+    parse_board_link,
     plain_text,
     prepare_review_input,
     rank_jobs,
@@ -57,7 +58,79 @@ def posting(job_id, title, content, location=None):
     }
 
 
+LEVER_ID = "6ed76ce8-4156-4b60-b120-403538bd66cd"
+ASHBY_ID = "8fb1615c-34bf-47c4-a1d1-b7b2f836bbd3"
+
+
+def lever_posting(posting_id=LEVER_ID, title="Backend Engineer"):
+    return {
+        "id": posting_id,
+        "text": title,
+        "categories": {"location": "Palo Alto, CA", "allLocations": ["Palo Alto, CA", "New York, NY"]},
+        "hostedUrl": f"https://jobs.lever.co/example/{posting_id}",
+        "createdAt": 1788000000000,
+        "description": "<div>Build <b>data</b> tools.</div><div>&nbsp;</div>",
+        "lists": [{"text": "What We Require", "content": "<li>Python &amp; SQL</li><li>Linux</li>"}],
+        "additional": "<div>Visa sponsorship available.</div>",
+    }
+
+
+def ashby_posting(posting_id=ASHBY_ID):
+    return {
+        "id": posting_id,
+        "title": "Research Engineer",
+        "location": "San Francisco",
+        "secondaryLocations": [{"location": "London, UK"}],
+        "isRemote": True,
+        "isListed": True,
+        "publishedAt": "2026-03-12T16:38:15.322+00:00",
+        "jobUrl": f"https://jobs.ashbyhq.com/example/{posting_id}",
+        "descriptionHtml": "<h3>About the Team</h3><p>We train models.</p><ul><li>Python</li><li>PyTorch</li></ul>",
+        "descriptionPlain": "ABOUT THE TEAM\n\nWe train models.",
+    }
+
+
 class JobSearchTests(unittest.TestCase):
+    @patch("job_search._fetch_json")
+    def test_lever_postings_keep_their_requirement_lists(self, fetch_json):
+        fetch_json.return_value = [lever_posting()]
+        job = fetch_board("example", provider="lever")[0]
+        self.assertEqual(fetch_json.call_args.args[0], "https://api.lever.co/v0/postings/example?mode=json")
+        self.assertEqual((job["provider"], job["board"], job["job_id"]), ("lever", "example", LEVER_ID))
+        self.assertEqual(job["title"], "Backend Engineer")
+        self.assertEqual(job["location"], "Palo Alto, CA; New York, NY")
+        self.assertEqual(job["source"], f"https://jobs.lever.co/example/{LEVER_ID}")
+        self.assertEqual(job["posted_at"], "2026-08-29T10:40:00+00:00")
+        self.assertEqual(job["text"], "Build data tools.\nWhat We Require\nPython & SQL\nLinux\nVisa sponsorship available.")
+
+    @patch("job_search._fetch_json")
+    def test_ashby_board_skips_unlisted_jobs_and_keeps_every_location(self, fetch_json):
+        fetch_json.return_value = {"jobs": [
+            ashby_posting(),
+            {**ashby_posting("11111111-2222-3333-4444-555555555555"), "isListed": False},
+        ]}
+        jobs = fetch_board("example", provider="ashby")
+        self.assertEqual(fetch_json.call_args.args[0], "https://api.ashbyhq.com/posting-api/job-board/example")
+        self.assertEqual([job["job_id"] for job in jobs], [ASHBY_ID])
+        self.assertEqual(jobs[0]["location"], "San Francisco; London, UK; Remote")
+        self.assertEqual(jobs[0]["posted_at"], "2026-03-12T16:38:15+00:00")
+        self.assertEqual(jobs[0]["text"], "About the Team\nWe train models.\nPython\nPyTorch")
+
+    @patch("job_search._fetch_json")
+    def test_selected_lever_and_ashby_jobs_are_read_again(self, fetch_json):
+        fetch_json.return_value = lever_posting()
+        lever = fetch_selected("example", LEVER_ID, provider="lever")
+        self.assertEqual(fetch_json.call_args.args[0], f"https://api.lever.co/v0/postings/example/{LEVER_ID}")
+        fetch_json.return_value = {"jobs": [ashby_posting()]}
+        ashby = fetch_selected("example", ASHBY_ID, provider="ashby")
+        self.assertEqual((lever["jd"]["provider"], ashby["jd"]["provider"]), ("lever", "ashby"))
+        self.assertEqual(ashby["jd"]["source"], f"https://jobs.ashbyhq.com/example/{ASHBY_ID}")
+        self.assertIn("What We Require", lever["jd"]["text"])
+        with self.assertRaisesRegex(SearchError, "已不在"):
+            fetch_selected("example", "11111111-2222-3333-4444-555555555555", provider="ashby")
+        with self.assertRaisesRegex(SearchError, "岗位 ID"):
+            fetch_selected("example", "../../secrets", provider="lever")
+
     def test_escaped_html_preserves_literal_angle_brackets(self):
         self.assertEqual(plain_text("&lt;p&gt;Use &amp;lt;T&amp;gt; in Python.&lt;/p&gt;"), "Use <T> in Python.")
 
@@ -315,6 +388,27 @@ class JobSearchTests(unittest.TestCase):
     def test_invalid_board_token_is_rejected(self):
         with self.assertRaisesRegex(SearchError, "招聘板标识"):
             fetch_board("../other")
+
+    def test_posting_dates_are_compared_in_utc(self):
+        raw = {**posting(1, "Intern", "<p>Python</p>"), "first_published": "2026-09-03T13:32:53-04:00"}
+        broken = {**posting(2, "Intern", "<p>Python</p>"), "first_published": "last week"}
+        jobs = normalize_board({"jobs": [raw, broken]}, "example", CAPTURED)
+        self.assertEqual([job["posted_at"] for job in jobs], ["2026-09-03T17:32:53+00:00", None])
+
+    def test_career_links_name_their_public_board(self):
+        links = {
+            "https://boards.greenhouse.io/stripe": ("greenhouse", "stripe"),
+            "https://job-boards.greenhouse.io/anthropic/jobs/4020305008": ("greenhouse", "anthropic"),
+            "https://boards.greenhouse.io/embed/job_board?for=discord": ("greenhouse", "discord"),
+            "jobs.lever.co/palantir/6ed76ce8-4156-4b60-b120-403538bd66cd": ("lever", "palantir"),
+            "https://jobs.ashbyhq.com/openai/": ("ashby", "openai"),
+        }
+        for link, board in links.items():
+            with self.subTest(link=link):
+                self.assertEqual(parse_board_link(link), board)
+        for link in ("https://stripe.com/jobs", "https://jobs.lever.co/", "https://jobs.ashbyhq.com/a%2F..%2Fb"):
+            with self.subTest(link=link), self.assertRaisesRegex(SearchError, "boards.greenhouse.io"):
+                parse_board_link(link)
 
 
 if __name__ == "__main__":

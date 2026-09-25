@@ -120,6 +120,87 @@ Familiarity with Kubernetes
             "Familiarity with Kubernetes",
         ])
 
+    def test_headings_used_on_public_job_boards_start_and_end_sections(self):
+        text = """A World-Changing Company
+What We Require
+Strong engineering background in Computer Science
+About 3 years of experience with Python and SQL in production systems
+Life at Palantir
+We offer a comprehensive benefits package.
+Your background looks something like:
+Some experience with relational databases
+About OpenAI
+OpenAI is an AI research and deployment company.
+We’re excited about you because…
+You have built data pipelines in Python
+In this role, you will:
+Ship features every week to customers
+You might thrive in this role if you:
+Care deeply about product quality
+Pay Range Transparency
+$120,000—$180,000 USD
+What we look for
+At least two years of backend experience
+Why Harvey
+Harvey is growing quickly across the world.
+Strong candidates may also have:
+Experience with LLM evaluation
+Annual base salary range (excluding equity and bonus)
+$150,000 - $200,000 per year
+"""
+        self.assertEqual([item["text"] for item in extract_requirement_candidates(text)], [
+            "Strong engineering background in Computer Science",
+            "About 3 years of experience with Python and SQL in production systems",
+            "Some experience with relational databases",
+            "You have built data pipelines in Python",
+            "Care deeply about product quality",
+            "At least two years of backend experience",
+            "Experience with LLM evaluation",
+        ])
+
+    def test_heading_variants_match_whole_lines_only(self):
+        text = """Your Expertise
+Strong experience with Python
+The Difference You Will Make
+Own services end to end at scale
+You may be a good fit if you have:
+Experience training large language models
+You'll thrive in this role if you:
+Enjoy fast iteration with users
+Position Expectations:
+Collaborate with project teams daily
+On day one we will expect you to have:
+Experience with distributed systems
+Bonus points for the following:
+Familiarity with Kubernetes operators
+MongoDB's base salary range for this role in the U.S. is:
+$130,000—$180,000 USD
+Things We Love
+Formal training in computer science
+Representative Projects
+Building a platform for data labeling
+You may be a fit if
+You might thrive in this role if you enjoy long meetings with many stakeholders
+Applying
+If there appears to be a fit, we will reach out to schedule interviews
+Strong candidates may also have:
+Experience with async Python
+The annual compensation range for this role is listed below.
+For sales roles, the range provided is the On Target Earnings range
+A Typical Day
+Planning meetings with the team
+"""
+        self.assertEqual([item["text"] for item in extract_requirement_candidates(text)], [
+            "Strong experience with Python",
+            "Experience training large language models",
+            "Enjoy fast iteration with users",
+            "Experience with distributed systems",
+            "Familiarity with Kubernetes operators",
+            "Formal training in computer science",
+            "You might thrive in this role if you enjoy long meetings with many stakeholders",
+            "Experience with async Python",
+        ])
+
     def test_heading_with_inline_content_starts_a_section(self):
         text = """About the role
 Build useful software.

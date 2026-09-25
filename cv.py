@@ -554,7 +554,7 @@ def approve_draft(draft: Any, facts_db: Path) -> dict[str, Any]:
     return approved
 
 
-def _is_final(draft: dict[str, Any]) -> bool:
+def is_final_approval(draft: dict[str, Any]) -> bool:
     """An approval counts only while the content still matches its fingerprint."""
     approval = draft.get("approval")
     if approval is None:
@@ -579,7 +579,7 @@ def export_pdf(
     Only an approved draft whose content is unchanged prints without the watermark.
     """
     _verify_draft(draft, facts_db)
-    final = _is_final(draft)
+    final = is_final_approval(draft)
     output = Path(output)
     for path in (output, html_output):
         if path is not None and Path(path).exists():
@@ -717,7 +717,18 @@ def tailor_draft(
     return result
 
 
-def _rewritten_lines(draft: dict[str, Any]) -> list[dict[str, str]]:
+def rejected_lines(draft: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rewrites the claim checks refused, with their reasons; those lines kept the fact."""
+    return [
+        {"fact_id": line["fact_id"], "rejected_text": line["tailoring"]["rejected_text"],
+         "reasons": line["tailoring"]["reasons"]}
+        for section in draft["sections"] for entry in section["entries"]
+        for line in entry["lines"]
+        if line.get("tailoring", {}).get("status") == "rejected"
+    ]
+
+
+def rewritten_lines(draft: dict[str, Any]) -> list[dict[str, str]]:
     """Every line whose wording DeepSeek changed, as original → rewrite, for review."""
     return [
         {"fact_id": line["fact_id"], "from": line["source_text"], "to": line["text"]}
@@ -791,15 +802,8 @@ def main(argv: list[str] | None = None) -> int:
                 "usage": tailored["tailoring"]["usage"],
                 "accepted": tailored["tailoring"]["accepted"],
                 "rejected": tailored["tailoring"]["rejected"],
-                "rejected_lines": [
-                    {"fact_id": line["fact_id"], **{
-                        key: line["tailoring"][key] for key in ("rejected_text", "reasons")
-                    }}
-                    for section in tailored["sections"] for entry in section["entries"]
-                    for line in entry["lines"]
-                    if line.get("tailoring", {}).get("status") == "rejected"
-                ],
-                "rewritten_lines": _rewritten_lines(tailored),
+                "rejected_lines": rejected_lines(tailored),
+                "rewritten_lines": rewritten_lines(tailored),
                 "next_step": "运行 cv.py pdf 生成 PDF，并逐行核对改写后的内容",
             }
         elif args.action == "approve":
@@ -813,7 +817,7 @@ def main(argv: list[str] | None = None) -> int:
                 "line_count": sum(
                     len(entry["lines"]) for section in approved["sections"] for entry in section["entries"]
                 ),
-                "rewritten_lines": _rewritten_lines(approved),
+                "rewritten_lines": rewritten_lines(approved),
                 "next_step": "运行 cv.py pdf 生成无水印的最终 PDF；内容或事实变化后需重新批准",
             }
         else:

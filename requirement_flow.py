@@ -13,7 +13,7 @@ from review import build_report
 from typesafe_classifier import DEFAULT_MODEL, TypeSafeError, classify_requirement_candidates
 
 
-EXTRACTION_METHOD = "section-lines-v2"
+EXTRACTION_METHOD = "section-lines-v3"
 MANUAL_METHOD = "manual-quote-v1"
 TARGET_HEADINGS = {
     "requirements",
@@ -43,7 +43,6 @@ TARGET_HEADINGS = {
     "nice to haves",
     "nice-to-have",
     "nice-to-haves",
-    "bonus points",
     "you have",
     "you should have",
     "what you'll need",
@@ -53,11 +52,25 @@ TARGET_HEADINGS = {
     "must have",
     "must haves",
     "must-haves",
-    "ideal candidate",
-    "the ideal candidate",
     "your profile",
     "your qualifications",
     "eligibility requirements",
+    # Seen on Greenhouse, Lever and Ashby boards (2026-09): each introduces requirement lines.
+    "what we look for",
+    "what we require",
+    "what we value",
+    "what you have",
+    "we prefer",
+    "we're excited about you because",
+    "strong candidates may also have",
+    "candidates must be",
+    "we'd love to hear from you if you have",
+    "desirable skills, knowledge, and experience",
+    "required skills and experience",
+    "experience",
+    "your expertise",
+    "things we love",
+    "candidate profile",
     "岗位要求",
     "任职要求",
     "职位要求",
@@ -113,6 +126,38 @@ STOP_HEADINGS = {
     "who we are",
     "the team",
     "our team",
+    "you will",
+    "in this role, you will",
+    "in this role you will",
+    "the impact you will have",
+    "core responsibilities",
+    "role overview",
+    "our principles",
+    "how we work",
+    "how we're different",
+    "come work with us",
+    "logistics",
+    "compliance",
+    "equity",
+    "time off",
+    "our commitment to diversity and inclusion",
+    "our commitment to inclusion",
+    "our commitment to inclusion and belonging",
+    "the difference you will make",
+    "a typical day",
+    "the community you will join",
+    "how we'll take care of you",
+    "your location",
+    "success measures",
+    "what you will learn",
+    "you'll be responsible for",
+    "workplace and location",
+    "in this role you will get to",
+    "position expectations",
+    "representative projects",
+    "example projects",
+    "example projects include",
+    "applying",
     "岗位职责",
     "工作职责",
     "职位描述",
@@ -131,7 +176,22 @@ STOP_HEADINGS = {
     "投递方式",
     "申请方式",
 }
-KNOWN_HEADINGS = TARGET_HEADINGS | STOP_HEADINGS
+# Requirement headings that come in many small variants; each must match the whole line,
+# so a sentence such as "You might thrive in this role if you enjoy …" stays content.
+TARGET_PATTERN = re.compile(
+    r"you (?:may|might) be a (?:good )?fit if(?: you)?(?: have)?"
+    r"|you(?:'ll| will| might| may) thrive in (?:this|these) roles?(?: if(?: you)?(?: have)?)?"
+    r"|your background (?:looks|might look) something like"
+    r"|bonus points(?: for(?: experience with)? the following)?"
+    r"|(?:our |the )?ideal candidate(?: will have)?"
+    r"|on day one we will expect you to have"
+)
+# Short lines that end a section whatever company follows: "About OpenAI", "Life at Palantir",
+# "Why Harvey", "Pay Range Transparency". Longer lines are content, e.g. "About 3 years of …".
+STOP_PREFIXES = ("about ", "life at ", "why ", "what makes ")
+STOP_PREFIX_MAX_WORDS = 5
+STOP_WORDS = ("salary", "pay range", "compensation", "benefits", "equal opportunit")
+STOP_WORDS_MAX_WORDS = 12
 LIST_MARKER = re.compile(
     r"^(?:\d+[.)]\s+"
     r"|\d+\.(?=[^\x00-\x7f])"
@@ -154,6 +214,20 @@ def _heading_key(line: str) -> str:
     value = re.sub(r"^[\W_]+|[\W_]+$", "", value)
     value = value.replace("’", "'").replace("&", "and")
     return re.sub(r"\s+", " ", value).casefold()
+
+
+def _section_kind(key: str) -> str | None:
+    """"target" for a requirement heading, "stop" for any other heading, None for content."""
+    if key in TARGET_HEADINGS or TARGET_PATTERN.fullmatch(key):
+        return "target"
+    words = len(key.split())
+    if (
+        key in STOP_HEADINGS
+        or (words <= STOP_PREFIX_MAX_WORDS and key.startswith(STOP_PREFIXES))
+        or (words <= STOP_WORDS_MAX_WORDS and any(word in key for word in STOP_WORDS))
+    ):
+        return "stop"
+    return None
 
 
 def _candidate_text(line: str) -> str:
@@ -180,14 +254,14 @@ def extract_requirement_candidates(jd_text: str) -> list[dict[str, Any]]:
     seen: set[str] = set()
     candidates: list[dict[str, Any]] = []
     for line in jd_text.splitlines():
-        heading = _heading_key(line)
-        if heading in KNOWN_HEADINGS:
-            active_section = line.strip().rstrip(":：") if heading in TARGET_HEADINGS else None
+        kind = _section_kind(_heading_key(line))
+        if kind:
+            active_section = line.strip().rstrip(":：") if kind == "target" else None
             continue
         inline = INLINE_HEADING.match(line.strip())
-        inline_heading = _heading_key(inline.group(1)) if inline else ""
-        if inline_heading in KNOWN_HEADINGS:
-            active_section = inline.group(1).strip() if inline_heading in TARGET_HEADINGS else None
+        inline_kind = _section_kind(_heading_key(inline.group(1))) if inline else None
+        if inline_kind:
+            active_section = inline.group(1).strip() if inline_kind == "target" else None
             line = inline.group(2)
         if active_section is None:
             continue

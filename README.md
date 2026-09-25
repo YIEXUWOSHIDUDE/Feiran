@@ -1,6 +1,6 @@
 # 岗位匹配与申请材料审核工作台
 
-当前命令行流程在本机 SQLite 中保存带版本、分类和标签的候选人事实；从 Greenhouse 搜索并获取 JD；确认 JD 要求后按需检索少量事实候选；最后由用户绑定双侧原文并生成待审核建议。仓库不包含真实候选人资料。
+当前命令行流程在本机 SQLite 中保存带版本、分类和标签的候选人事实；从 Greenhouse、Lever、Ashby 公开招聘板获取岗位，或手动粘贴 JD；确认 JD 要求后按需检索少量事实候选；最后由用户绑定双侧原文并生成待审核建议。仓库不包含真实候选人资料。
 
 架构、业务不变量和当前限制见 [development.md](development.md)。
 
@@ -71,7 +71,7 @@ pbpaste | python3 job_search.py paste --file - --title "后端开发实习生" -
 
 不提供 `--url` 时来源记为“未知”。`captured_at` 是粘贴时间，不是官方发布时间；粘贴内容也不能证明岗位仍开放。`--output` 与 `select` 生成的审核输入格式相同。
 
-Greenhouse 招聘板可以直接搜索。搜索可以使用事实库中当前已确认版本的标签进行本地词面排序；不会把候选人事实发送给 Greenhouse。排序按命中的不同标签数量，同一标签被多条事实使用只算一次。排序时先只读标签和事实 ID，最终只为展示中命中的事实读取原文；每个岗位最多展示 20 条证据。接口超时、连接失败、429 或 5xx 会自动重试一次；404 通常表示招聘板标识或岗位 ID 有误。
+Greenhouse、Lever、Ashby 招聘板可以直接搜索（`--provider` 默认 `greenhouse`）。搜索可以使用事实库中当前已确认版本的标签进行本地词面排序；不会把候选人事实发送给 Greenhouse。排序按命中的不同标签数量，同一标签被多条事实使用只算一次。排序时先只读标签和事实 ID，最终只为展示中命中的事实读取原文；每个岗位最多展示 20 条证据。接口超时、连接失败、429 或 5xx 会自动重试一次；404 通常表示招聘板标识或岗位 ID 有误。
 
 ```sh
 python3 job_search.py search \
@@ -84,6 +84,8 @@ python3 job_search.py select \
   --job-id 实际岗位ID \
   --output .local/review-input.json
 ```
+
+Lever 用 `--provider lever --board palantir`，Ashby 用 `--provider ashby --board openai`；招聘板标识就是 `jobs.lever.co/<标识>`、`jobs.ashbyhq.com/<标识>` 或 `boards.greenhouse.io/<标识>` 里的那一段。
 
 `select` 会再次读取选中岗位，并只生成 JD 快照。它不会提前复制全部事实；岗位已消失或接口失败时也不会使用旧内容冒充最新。
 
@@ -194,15 +196,46 @@ python3 cv.py pdf .local/cv-approved-zh.json --output .local/cv-final-zh.pdf
 - 只有已批准、且批准后内容没有任何改动的文件才能导出无水印的最终 PDF。批准后改动任何内容（包括姓名、日期），或引用的事实被修改，最终导出都会被拒绝，需要重新生成草稿并重新批准。
 - 已批准的文件不能再改写，也不能重复批准。
 
+## 网页界面
+
+网页版需要项目内的虚拟环境（只需安装一次，不会安装到全局）：
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+启动后在浏览器打开 http://127.0.0.1:8765/ ，按 Ctrl+C 停止：
+
+```sh
+.venv/bin/python web.py
+```
+
+- **Facts**：查看全部事实，勾选后一次确认多个 pending 版本。全部确认后自动转到 Find jobs。
+- **Find jobs**：关注公司的全部公开岗位按“提到你多少个已确认技能标签”排序，最多的在前；同分时较新的在前。同一职位在多个城市发布只显示一行。可按标题、地点筛选，可勾选“Hide senior roles”（隐藏 Senior、Staff、Principal、Lead、Manager、Director 等标题；“Member of Technical Staff” 保留）。点 **Start** 会重新读取该岗位并新建到 My jobs；同一岗位再点只会打开已有的那一个。
+- **My jobs**：已开始的岗位；也可以粘贴任意来源的 JD 新建岗位，要求会自动提取。
+- **每个岗位**：1. 确认或排除要求、补充漏掉的原文；2. 查找匹配事实，选择一条或“无匹配”，查看证据；3. 中英文简历：生成草稿、可选 DeepSeek 改写、查看改动对照和预览，勾选“已逐行核对”后批准，再生成并下载最终 PDF。
+
+说明：
+
+- 关注的公司和下载的岗位保存在 `.local/listings.db`（与事实库分开；删除它只会丢掉公司列表和下载的岗位）。第一次创建时预置 `starter_boards.json` 里的 30 家公司，之后删掉的公司不会自动回来。在页面下方 Companies 里粘贴 `boards.greenhouse.io/…`、`jobs.lever.co/…` 或 `jobs.ashbyhq.com/…` 链接即可添加公司。
+- 打开 Find jobs 时，超过 24 小时未更新的公司会自动重新下载（每次 4 家并行，2026-09 实测 30 家约 6 秒）；没有后台定时任务。只向公开招聘板发送不含个人信息的 GET 请求；排序完全在本机进行。
+- 排序数字是词面计数，不是匹配度或录取概率。实测 “AI” 出现在 79% 的岗位里，所以数字只适合比较先后。技能标签与岗位的匹配结果会保存在 `listings.db`，只有岗位文字或已确认技能变化时才重新计算（约 9 千个岗位首次约 5 秒，之后约 0.05 秒）。
+- 每个岗位保存在 `.local/jobs/<岗位编号>/`，每一步一个文件。重做某一步时，这一步和之后的文件会移到该岗位的 `history/`，不会被覆盖或删除。
+- 只接受发往 127.0.0.1/localhost 的请求；所有接口都需要页面启动时生成的随机令牌（预览和下载链接把同一令牌放在地址里）。其他网站无法读取你的事实，也无法触发 DeepSeek 调用。
+- 可用 `--facts-db`、`--jobs`、`--profile`、`--port` 修改路径和端口；`listings.db` 放在事实库所在目录。
+- 网页测试需要虚拟环境：`.venv/bin/python -m unittest`；直接用 `python3` 运行时网页测试会自动跳过。
+
 ## 数据与限制
 
 - `.local/workbench.db`、运行 JSON、`.env` 和个人数据均被 Git 忽略。
 - 所有生成命令只新建 JSON 文件，不覆盖已有文件。
 - SQLite schema 当前为 v2；程序会保留数据并自动把 v1 迁移到 v2，旧事实分类为 `other`、标签为空。
 - `search --profile` 仍保留给合成样例，其 `confirmed` 字段只是输入声明；实际使用推荐 `--facts-db`。
-- 岗位来源目前只有 Greenhouse 搜索和手动粘贴；Lever、Ashby 等尚未接入。要求提取仍是固定标题规则，未知标题需用 `add` 手动补充。
+- 岗位来源是 Greenhouse、Lever、Ashby 的公开招聘板和手动粘贴；LinkedIn 等需要登录的网站不采集，也不做全网岗位发现。中国公司的官网岗位请粘贴。
+- 要求提取仍是标题规则（`section-lines-v3`）。按 2026-09 下载的 8,787 个岗位统计，找不到任何要求行的比例：Greenhouse 9%、Ashby 7%、Lever 1%；这些岗位请用 `add` 或网页的 “Add missed requirement” 手动补充原文。
 - TypeSafe 当前只判断 JD 要求；把候选人事实发送给外部模型尚未授权或实现。
-- 当前没有网页界面、投递记录、自动投递或录取概率预测。
+- 当前没有投递记录、自动投递或录取概率预测；网页中还不能编辑事实原文（请用命令行）。地点筛选只是“包含文字”，还没有“只看美国”这类按国家的筛选。
 
 运行全部测试：
 

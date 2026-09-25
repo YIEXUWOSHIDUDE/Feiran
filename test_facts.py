@@ -19,6 +19,8 @@ from facts import (
     load_search_terms,
     main,
     revise_fact,
+    tag_finder,
+    tag_pattern,
 )
 
 
@@ -326,6 +328,19 @@ class FactStoreTests(unittest.TestCase):
             ])
         self.assertEqual(exit_code, 0)
         self.assertEqual(confirmed["facts"][0]["status"], "confirmed")
+
+
+class TagFinderTests(unittest.TestCase):
+    def test_quick_finder_gives_exactly_the_tags_the_full_patterns_give(self):
+        tags = ["Python", "Go", "C++", "machine learning", "CI/CD", "SQL", "机器学习", "Linux", "Kubernetes"]
+        texts = [
+            "Go to market", "We use Go and C++.", "MACHINE LEARNING systems", "熟悉机器学习", "MySQL only",
+            "CI/CD pipelines", "lınux kernel", "LİNUX", "KUBERNETES", "Pythonic", "",
+        ]
+        find = tag_finder(tags)
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertEqual(find(text), [tag for tag in tags if tag_pattern(tag).search(text)])
 
 
 if __name__ == "__main__":
