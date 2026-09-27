@@ -7,14 +7,25 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from deepseek_client import DEFAULT_MODEL as DEEPSEEK_MODEL, DeepSeekError
 from review import build_report
 from typesafe_classifier import DEFAULT_MODEL, TypeSafeError, classify_requirement_candidates
 
 
 EXTRACTION_METHOD = "section-lines-v3"
 MANUAL_METHOD = "manual-quote-v1"
+MODEL_METHOD = "deepseek-lines-v1"
+MAX_MODEL_LINES = 400
+FIND_RULES = """You read one job posting given as numbered lines and reply in json only.
+Pick every line that states something an applicant must have or should have: requirements,
+qualifications, skills, experience, education, work eligibility and nice-to-haves.
+Do not pick headings or sub-headings (short title-like lines that introduce a group of lines,
+such as "Technical Leadership & Systems Architecture"), duties or responsibilities (what the
+person will do), locations, benefits, pay, company or team descriptions, legal or
+equal-opportunity text, or how to apply.
+Reply as {"requirements": [{"line": <line number>, "kind": "required" or "preferred"}]}."""
 TARGET_HEADINGS = {
     "requirements",
     "qualifications",
@@ -246,6 +257,62 @@ def _candidate_id(text: str) -> str:
     return f"req-{digest}"
 
 
+def _content_text(line: str) -> str | None:
+    """The requirement text a single JD line holds, or None for headings and fragments."""
+    if _section_kind(_heading_key(line)):
+        return None
+    inline = INLINE_HEADING.match(line.strip())
+    if inline and _section_kind(_heading_key(inline.group(1))):
+        line = inline.group(2)
+    text = _candidate_text(line)
+    if not text or _text_weight(text) < 8 or len(text) > 500:
+        return None
+    return text
+
+
+def find_requirements_with_model(
+    jd_text: str, chat: Callable[..., dict], title: str | None = None, effort: str = "none"
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Let DeepSeek choose requirement lines by number; the text is then copied from the JD.
+
+    Only the public JD lines and title are sent. The model can choose lines but never write
+    a requirement, so every candidate stays an exact JD quote. Numbers outside the posting,
+    headings and fragments are dropped. Thinking is off by default: on real postings (2026-09)
+    it answered in about 1 s instead of 4-20 s with the same lines chosen.
+    """
+    lines = jd_text.splitlines()[:MAX_MODEL_LINES]
+    request = {"job_title": title, "lines": [{"n": number, "text": line} for number, line in enumerate(lines, 1)]}
+    reply = chat(
+        [{"role": "system", "content": FIND_RULES}, {"role": "user", "content": json.dumps(request, ensure_ascii=False)}],
+        model=DEEPSEEK_MODEL,
+        effort=effort,
+    )
+    picks = reply["content"].get("requirements")
+    if not isinstance(picks, list):
+        raise RequirementError("DeepSeek 的回答缺少 requirements 数组")
+    chosen: dict[int, str] = {}
+    for pick in picks:
+        number = pick.get("line") if isinstance(pick, dict) else None
+        if isinstance(number, int) and not isinstance(number, bool) and 1 <= number <= len(lines):
+            chosen.setdefault(number, "Preferred" if pick.get("kind") == "preferred" else "Required")
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for number in sorted(chosen):
+        text = _content_text(lines[number - 1])
+        if text is None or text.casefold() in seen or text not in jd_text:
+            continue
+        seen.add(text.casefold())
+        candidates.append({
+            "id": _candidate_id(text),
+            "text": text,
+            "section": chosen[number],
+            "status": "pending",
+            "fact_id": None,
+            "extraction_method": MODEL_METHOD,
+        })
+    return candidates, {"model": reply.get("model"), "usage": reply.get("usage"), "chosen_lines": len(chosen)}
+
+
 def extract_requirement_candidates(jd_text: str) -> list[dict[str, Any]]:
     """Extract exact non-heading lines under known requirement sections."""
     if not isinstance(jd_text, str) or not jd_text.strip():
@@ -285,8 +352,12 @@ def extract_requirement_candidates(jd_text: str) -> list[dict[str, Any]]:
     return candidates
 
 
-def propose_requirements(data: Any) -> dict[str, Any]:
-    """Add pending candidates to a fresh review input without selecting them."""
+def propose_requirements(data: Any, chat: Callable[..., dict] | None = None) -> dict[str, Any]:
+    """Add pending candidates to a fresh review input without selecting them.
+
+    With ``chat`` DeepSeek chooses the lines; if it fails or finds nothing, the heading
+    rules are used and the reason is recorded.
+    """
     if not isinstance(data, dict):
         raise RequirementError("输入顶层必须是对象")
     jd = data.get("jd")
@@ -298,11 +369,23 @@ def propose_requirements(data: Any) -> dict[str, Any]:
     if "requirement_candidates" in data:
         raise RequirementError("输入已经包含 requirement_candidates")
     build_report(data)
-    candidates = extract_requirement_candidates(jd.get("text"))
+    extraction: dict[str, Any] = {}
+    candidates: list[dict[str, Any]] = []
+    if chat is not None:
+        try:
+            candidates, details = find_requirements_with_model(jd.get("text"), chat, jd.get("title"))
+            extraction = {"method": MODEL_METHOD, **details}
+            if not candidates:
+                extraction = {"fallback_reason": "DeepSeek 没有找到要求行"}
+        except (DeepSeekError, RequirementError) as exc:
+            extraction = {"fallback_reason": str(exc)}
+    if not candidates:
+        candidates = extract_requirement_candidates(jd.get("text"))
+        extraction["method"] = EXTRACTION_METHOD
     result = copy.deepcopy(data)
     result["requirement_candidates"] = candidates
     result["requirement_extraction"] = {
-        "method": EXTRACTION_METHOD,
+        **extraction,
         "status": "candidates_found" if candidates else "none_found",
         "candidate_count": len(candidates),
     }

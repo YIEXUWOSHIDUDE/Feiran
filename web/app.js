@@ -152,7 +152,7 @@ async function renderJobs() {
     el("section", { class: "panel" }, el("h2", {}, "Jobs"), list),
     el("section", { class: "panel" },
       el("h2", {}, "New job"),
-      el("p", { class: "muted" }, "Paste a job description from any site. Requirements are found automatically; you confirm them next."),
+      el("p", { class: "muted" }, "Paste a job description from any site. Its requirements are found and your CV is prepared for it automatically."),
       el("div", { class: "grid" }, field("Title *", inputs.title), field("Company", inputs.company), field("Official link", inputs.url, "Leave empty if unknown; the source is then recorded as unknown."), field("Location", inputs.location)),
       field("Job description *", inputs.text),
       el("div", { class: "toolbar" }, create),
@@ -374,19 +374,11 @@ async function renderFind() {
   await refreshNow(sources.filter((source) => source.stale));
 }
 
-const STEP_LABELS = [
-  ["decided", "Requirements"], ["linked", "Matching"],
-  ["cv-approved-en", "CV (EN)"], ["cv-approved-zh", "CV (ZH)"],
-];
+const STEP_LABELS = [["decided", "Requirements"], ["cv-approved-en", "CV (EN)"], ["cv-approved-zh", "CV (ZH)"]];
 
 function progress(steps) {
   return el("span", {}, STEP_LABELS.map(([step, label]) =>
     el("span", { class: `pill ${steps.includes(step) ? "done" : ""}` }, label)));
-}
-
-function laterStepsExist(view, step) {
-  const order = ["candidates", "decided", "matches", "linked"];
-  return view.steps.some((name) => name.startsWith("cv-") || order.indexOf(name) > order.indexOf(step));
 }
 
 function requirementsPanel(view, refresh) {
@@ -404,87 +396,38 @@ function requirementsPanel(view, refresh) {
     );
   });
   const missed = el("input", { type: "text", placeholder: "Copy a line or phrase exactly from the job description" });
-  const add = el("button", { class: "secondary" }, "Add missed requirement");
-  add.addEventListener("click", () => run(async () => {
+  const add = actionButton("Add missed requirement", async () => {
     await api(`/api/jobs/${view.job_id}/requirements/add`, { method: "POST", body: JSON.stringify({ text: missed.value }) });
     await refresh();
-    show("Added. It starts undecided; choose Requirement or Not a requirement.", "ok");
-  }));
-  const save = el("button", {}, "Save decisions");
-  save.addEventListener("click", () => run(async () => {
+    show("Added. It counts, and the CV was prepared again.", "ok");
+  }, true);
+  const save = actionButton("Save", async () => {
     const confirm = [...choices].filter(([, status]) => status === "confirmed").map(([id]) => id);
     const exclude = [...choices].filter(([, status]) => status === "excluded").map(([id]) => id);
     await api(`/api/jobs/${view.job_id}/requirements/decide`, { method: "POST", body: JSON.stringify({ confirm, exclude }) });
     await refresh();
-    show(`Saved: ${confirm.length} requirement(s) confirmed.`, "ok");
-  }));
-  const selected = view.selected_requirements || [];
-  return el("section", { class: "panel" },
-    el("h2", {}, "1. Requirements"),
-    el("p", { class: "muted" }, "Lines found under requirement headings, copied word for word. Decide which are real requirements."),
-    laterStepsExist(view, "decided") ? el("p", { class: "warning" }, "Changing requirements resets matching and CV steps for this job. Old versions are kept in the job's history folder.") : null,
-    rows.length ? el("table", {}, el("tbody", {}, rows)) : el("p", {}, "No requirement lines were found. Add them below by copying exact text from the job description."),
-    el("div", { class: "toolbar" }, missed, add),
-    el("div", { class: "toolbar" }, save),
-    selected.length ? el("p", { class: "ok-text" }, `${selected.length} requirement(s) confirmed.`) : null,
-  );
-}
-
-function matchingPanel(view, refresh) {
-  const title = el("h2", {}, "2. Matching");
-  const selected = view.selected_requirements || [];
-  if (selected.length === 0) {
-    return el("section", { class: "panel" }, title, el("p", { class: "muted" }, "Confirm at least one requirement first."));
-  }
-  const propose = el("button", { class: view.matching ? "secondary" : "" }, view.matching ? "Search again" : "Find matching facts");
-  propose.addEventListener("click", () => run(async () => {
-    await api(`/api/jobs/${view.job_id}/matches/propose`, { method: "POST" });
-    await refresh();
-  }));
-  if (!view.matching) {
-    return el("section", { class: "panel" }, title,
-      el("p", { class: "muted" }, "Looks up your confirmed facts whose tags appear in each requirement. Pending facts are never offered."),
-      el("div", { class: "toolbar" }, propose));
-  }
-  const choices = new Map();
-  const blocks = view.matching.requirements.map((requirement) => {
-    const decision = requirement.decision;
-    if (decision) choices.set(requirement.requirement_id, decision.status === "linked" ? decision.fact_id : "__none__");
-    const option = (value, label, detail) => {
-      const input = el("input", { type: "radio", name: `match-${requirement.requirement_id}`, checked: choices.get(requirement.requirement_id) === value });
-      input.addEventListener("change", () => choices.set(requirement.requirement_id, value));
-      return el("label", { class: "option" }, input, el("span", {}, label, detail ? el("div", { class: "muted" }, detail) : null));
-    };
-    return el("div", { class: "requirement" },
-      el("div", { class: "requirement-text" }, requirement.text),
-      requirement.candidates.length === 0 ? el("p", { class: "muted" }, "No confirmed fact has a matching tag.") : null,
-      requirement.candidates.map((fact) => option(fact.fact_id, fact.fact_text,
-        `${fact.fact_id} · ${fact.fact_type} · matched: ${(fact.retrieval_basis.matched_tags || []).join(", ") || "type only"}`)),
-      option("__none__", "No matching fact", "Recorded as unknown; nothing is invented."),
-    );
+    show(`Saved: ${confirm.length} requirement(s). The CV was prepared again for them.`, "ok");
   });
-  const save = el("button", {}, "Save matches");
-  save.addEventListener("click", () => run(async () => {
-    const links = {};
-    const noMatch = [];
-    for (const [requirementId, value] of choices) {
-      if (value === "__none__") noMatch.push(requirementId); else links[requirementId] = value;
-    }
-    await api(`/api/jobs/${view.job_id}/matches/decide`, { method: "POST", body: JSON.stringify({ links, no_match: noMatch }) });
+  const findAgain = actionButton("Find again with DeepSeek", async () => {
+    await api(`/api/jobs/${view.job_id}/requirements/find`, { method: "POST" });
     await refresh();
-    show("Matches saved.", "ok");
-  }));
-  const report = view.report ? el("div", {},
-    el("h3", {}, "Evidence"),
-    el("table", {}, el("tbody", {}, view.report.items.map((item) => el("tr", {},
-      el("td", {}, item.requirement_quote),
-      el("td", {}, item.fact_quote || el("span", { class: "muted" }, "Unknown — no fact linked")),
-    ))))) : null;
-  return el("section", { class: "panel" }, title,
-    view.steps.some((name) => name.startsWith("cv-")) ? el("p", { class: "warning" }, "Changing matches resets this job's CV steps. Old versions stay in history.") : null,
-    blocks,
-    el("div", { class: "toolbar" }, save, propose),
-    report,
+  }, true);
+  const extraction = view.extraction || {};
+  const foundBy = extraction.method === "deepseek-lines-v1"
+    ? "Found by DeepSeek, which picks lines of the job description; each line is copied word for word."
+    : `Found by heading rules${extraction.fallback_reason ? ` (DeepSeek not used: ${extraction.fallback_reason})` : ""}.`;
+  const body = [
+    view.steps.some((name) => name.startsWith("cv-")) ? el("p", { class: "warning" }, "Saving changes here prepares the CV again; an approved CV is moved to the job's history folder.") : null,
+    rows.length ? el("table", {}, el("tbody", {}, rows)) : el("p", {}, "No requirement lines were found. Try Find again with DeepSeek, or add lines below by copying exact text from the job description."),
+    el("div", { class: "toolbar" }, missed, add),
+    el("div", { class: "toolbar" }, save, findAgain),
+  ];
+  const counted = (view.selected_requirements || []).length;
+  // Once requirements count, the CV is what matters; the list folds away until needed.
+  return el("section", { class: "panel" },
+    el("h2", {}, "1. What this job asks for"),
+    el("p", { class: "muted" }, foundBy, " All of them count, and your CV below is adjusted to them. If a line is not really a requirement, choose Not a requirement and Save."),
+    counted ? el("details", {}, el("summary", {}, `${counted} requirement(s) — open to review or change`), body) : body,
   );
 }
 
@@ -503,70 +446,153 @@ function actionButton(label, action, secondary = false) {
   return button;
 }
 
-function cvBlock(view, language, title, refresh) {
+const CV_TITLES = { en: "English CV (US Letter)", zh: "Chinese CV (A4)" };
+const CHANGE_ICONS = { order: "↕", cut: "✕", reword: "✎" };
+
+function changeRow(view, language, change, refresh, editable) {
+  const toggle = editable
+    ? actionButton(change.undone ? "Redo" : "Undo", async () => {
+      await api(`/api/jobs/${view.job_id}/cv/${language}/change`, {
+        method: "POST", body: JSON.stringify({ change_id: change.id, undone: !change.undone }),
+      });
+      await refresh();
+    }, true)
+    : null;
+  return el("tr", { class: change.undone ? "undone" : "" },
+    el("td", { class: "icon" }, CHANGE_ICONS[change.type] || "•"),
+    el("td", {}, change.label,
+      change.reason ? el("div", { class: "muted" }, change.reason) : null,
+      change.undone ? el("div", { class: "muted" }, "Undone: your usual CV is shown for this part.") : null),
+    el("td", { class: "choice" }, toggle));
+}
+
+function cvBlock(view, language, refresh) {
   const cv = view.cv[language];
-  const step = (action) => async () => {
+  const title = CV_TITLES[language];
+  const post = (action) => async () => {
     await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`, { method: "POST" });
     await refresh();
   };
-  const tools = [actionButton(cv.head ? "Rebuild draft" : "Build draft", step("draft"), Boolean(cv.head))];
-  if (cv.head === "draft") {
-    tools.push(actionButton("Tailor with DeepSeek", step("tailor"), true));
+  if (!cv.head) {
+    return el("div", { class: "cv-block" }, el("h3", {}, title),
+      el("p", { class: "muted" }, "Not prepared yet."),
+      el("div", { class: "toolbar" }, actionButton("Prepare this CV", post("prepare"))));
   }
-  let approval = null;
-  if (cv.head === "draft" || cv.head === "tailored") {
-    const approve = actionButton("Approve this version", step("approve"));
-    approve.disabled = true;
-    const read = el("input", { type: "checkbox" });
-    read.addEventListener("change", () => { approve.disabled = !read.checked; });
-    approval = el("div", { class: "approval" },
-      el("label", {}, read, " I read every line of the preview below, including the DeepSeek changes."),
-      approve);
-  }
-  if (cv.head === "approved" && !cv.final_pdf) tools.push(actionButton("Create final PDF", step("export")));
+  const approved = cv.head === "approved";
+  const tools = [];
+  if (cv.head === "draft") tools.push(actionButton("Reword with DeepSeek", post("tailor"), true));
+  if (cv.head === "draft" || cv.head === "tailored") tools.push(actionButton("Adjust for this job", post("plan")));
+  if (cv.head === "planned") tools.push(actionButton("Adjust again", post("plan"), true));
+  tools.push(actionButton("Start over", post("prepare"), true));
+  if (approved && !cv.final_pdf) tools.push(actionButton("Create final PDF", post("export")));
   if (cv.final_pdf) {
     tools.push(el("a", { class: "button", href: `/download/${view.job_id}/${language}.pdf?token=${encodeURIComponent(TOKEN)}` }, "Download final PDF"));
   }
   const notes = [];
-  if (cv.head === "approved") notes.push(el("p", { class: "ok-text" }, `Approved ${new Date(cv.approved_at).toLocaleString()}. Any later change needs a new draft and a new approval.`));
+  if (approved) notes.push(el("p", { class: "ok-text" }, `Approved ${new Date(cv.approved_at).toLocaleString()}. To change anything, use Start over and approve again.`));
+  if (cv.head === "draft") notes.push(el("p", { class: "warning" }, "This is your usual CV: DeepSeek could not reword or adjust it yet. Use the buttons above."));
+  if (cv.head === "tailored") notes.push(el("p", { class: "warning" }, "Reworded, but not adjusted for this job yet: DeepSeek could not plan it. Use Adjust for this job."));
   if ((cv.language_fallbacks || []).length) {
     const missing = language === "zh" ? "Chinese" : "English";
     notes.push(el("p", { class: "warning" },
       `Shown in the other language because your profile has no ${missing} text for — `,
       cv.language_fallbacks.join("; ")));
   }
-  if (cv.tailoring) {
-    notes.push(el("p", { class: "muted" }, `DeepSeek (${cv.tailoring.model}): ${cv.tailoring.accepted} line(s) passed the checks, ${cv.tailoring.rejected} rejected and kept as your original text.`));
-    if (cv.rewrites.length) {
-      notes.push(el("h3", {}, "Lines DeepSeek changed — check each one"),
-        el("table", {}, el("tbody", {}, cv.rewrites.map((line) => el("tr", {},
-          el("td", { class: "muted" }, line.from), el("td", {}, "→"), el("td", {}, line.to))))));
-    }
-    if (cv.rejected.length) {
-      notes.push(el("h3", {}, "Rejected rewrites (your original line is used)"),
-        el("table", {}, el("tbody", {}, cv.rejected.map((line) => el("tr", {},
-          el("td", {}, line.rejected_text), el("td", { class: "bad-text" }, line.reasons.join("; ")))))));
-    }
+  const rewrites = (cv.rewrites || []).map((line) => ({
+    id: `reword:${line.fact_id}`, type: "reword", undone: line.undone, reason: null,
+    label: el("span", {}, el("span", { class: "muted" }, line.from), " → ", line.to),
+  }));
+  const changes = [...(cv.changes || []), ...rewrites];
+  const editable = cv.head === "planned";
+  if (changes.length) {
+    notes.push(el("p", {}, el("strong", {}, `${changes.length} change(s) from your usual CV`),
+      editable ? " — undo any you disagree with:" : ":"));
+    notes.push(el("table", { class: "changes" }, el("tbody", {}, changes.map((change) => changeRow(view, language, change, refresh, editable)))));
+  } else if (cv.head === "planned") {
+    notes.push(el("p", { class: "muted" }, "DeepSeek kept your usual CV unchanged for this job."));
   }
-  const preview = cv.head ? el("iframe", {
+  if ((cv.rejected || []).length) {
+    notes.push(el("details", {}, el("summary", {}, `${cv.rejected.length} rewording(s) failed the fact check, so your own wording is kept`),
+      el("table", {}, el("tbody", {}, cv.rejected.map((line) => el("tr", {},
+        el("td", {}, line.rejected_text), el("td", { class: "bad-text" }, line.reasons.join("; "))))))));
+  }
+  let approval = null;
+  if (!approved) {
+    const approve = actionButton("Approve this CV", post("approve"));
+    approve.disabled = true;
+    const read = el("input", { type: "checkbox" });
+    read.addEventListener("change", () => { approve.disabled = !read.checked; });
+    approval = el("div", { class: "approval" },
+      el("label", {}, read, " I read the CV below and every change listed above."), approve);
+  }
+  const preview = el("iframe", {
     class: "preview", sandbox: "", title: `${title} preview`,
     src: `/preview/${view.job_id}/${language}?token=${encodeURIComponent(TOKEN)}&v=${Date.now()}`,
-  }) : el("p", { class: "muted" }, "No draft yet.");
-  return el("div", { class: "cv-block" },
-    el("h3", {}, title),
-    el("div", { class: "toolbar" }, tools),
-    notes, approval, preview);
+  });
+  return el("div", { class: "cv-block" }, el("h3", {}, title), el("div", { class: "toolbar" }, tools), notes, approval, preview);
 }
 
 function cvPanel(view, refresh) {
+  const main = view.language || "en";
+  const other = main === "en" ? "zh" : "en";
   return el("section", { class: "panel" },
-    el("h2", {}, "3. CV"),
+    el("h2", {}, "2. Your CV for this job"),
     el("p", { class: "muted" },
-      "Built only from your confirmed facts; facts matched to this job come first. ",
-      "DeepSeek receives only the bullet lines and this job's requirements, never your name or contact details."),
-    cvBlock(view, "en", "English CV (US Letter)", refresh),
-    cvBlock(view, "zh", "Chinese CV (A4)", refresh),
+      "Made from your confirmed facts and adjusted for this job: the most relevant parts first, what does not help cut, ",
+      "and wording that follows the job's requirements. Nothing is added, and every reworded line is fact-checked. ",
+      "DeepSeek sees only your CV lines and this job's requirements, never your name, contact details, schools or employers."),
+    cvBlock(view, main, refresh),
+    // A second language is offered only when the resume itself is written in it.
+    (view.cv_languages || []).includes(other)
+      ? el("details", { class: "other-language", open: Boolean(view.cv[other].head) },
+        el("summary", {}, `${CV_TITLES[other]} for this job`), cvBlock(view, other, refresh))
+      : null,
   );
+}
+
+function suggestionText(suggestion) {
+  if (suggestion.kind === "skill") {
+    return el("span", {}, "Add to your skills line ", el("span", { class: "muted" }, `“${suggestion.where}”`), ": ",
+      el("strong", {}, suggestion.items.join(", ")));
+  }
+  return el("span", {}, `New line under ${suggestion.where}: `, el("strong", {}, `“${suggestion.text}”`));
+}
+
+function gapsPanel(view, refresh) {
+  const gaps = view.gaps;
+  const post = (path) => async () => {
+    await api(`/api/jobs/${view.job_id}/gaps${path}`, { method: "POST" });
+    await refresh();
+  };
+  const check = actionButton(gaps ? "Check again" : "Check what is missing", post(""), Boolean(gaps));
+  const items = gaps ? gaps.gaps : [];
+  const open = items.filter((gap) => gap.status === "open").length;
+  const rows = items.map((gap) => {
+    let detail;
+    if (gap.status === "added") detail = el("p", { class: "ok-text" }, "Added to your facts and to this CV.");
+    else if (gap.status === "declined") detail = el("p", { class: "muted" }, "Not true for you — kept off your CV.");
+    else if (!gap.suggestion) detail = el("p", { class: "muted" }, "No honest line to suggest (for example years, seniority or a degree).");
+    else {
+      detail = el("div", {},
+        el("p", {}, suggestionText(gap.suggestion)),
+        el("div", { class: "toolbar" },
+          actionButton("True for me — add it", post(`/${gap.requirement_id}/accept`)),
+          actionButton("Not true", post(`/${gap.requirement_id}/decline`), true)));
+    }
+    return el("div", { class: `requirement ${gap.status}` }, el("div", { class: "requirement-text" }, gap.text), detail);
+  });
+  const notes = [];
+  if (gaps && gaps.suggesting && gaps.suggesting.fallback_reason) {
+    notes.push(el("p", { class: "warning" }, `No suggestions this time (DeepSeek: ${gaps.suggesting.fallback_reason}). Use Check again.`));
+  }
+  return el("section", { class: "panel" },
+    el("h2", {}, gaps ? `3. Not on your CV yet (${open})` : "3. Not on your CV yet"),
+    el("p", { class: "muted" },
+      "Requirements none of your confirmed facts shows. For each, DeepSeek may suggest a line you could add if it is true for you. ",
+      "Nothing is added until you click True for me; then it becomes a confirmed fact and the CV is prepared again."),
+    notes,
+    gaps ? (rows.length ? rows : el("p", { class: "ok-text" }, "Your CV already shows something for every requirement.")) : el("p", { class: "muted" }, "Checking…"),
+    el("div", { class: "toolbar" }, check));
 }
 
 async function renderJob(jobId) {
@@ -582,11 +608,17 @@ async function renderJob(jobId) {
         el("details", {}, el("summary", {}, "Job description"), el("pre", { class: "jd" }, jd.text)),
       ),
       requirementsPanel(view, refresh),
-      matchingPanel(view, refresh),
       cvPanel(view, refresh),
+      gapsPanel(view, refresh),
     );
+    return view;
   };
-  await refresh();
+  const view = await refresh();
+  // Gaps are checked once the CV exists, after the page shows, so Start stays quick.
+  if (!view.gaps && (view.selected_requirements || []).length && view.cv[view.language].head) {
+    await api(`/api/jobs/${jobId}/gaps`, { method: "POST" });
+    await refresh();
+  }
 }
 
 const routes = { facts: renderFacts, find: renderFind, jobs: renderJobs };

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from claims import check_rewrite
+from cv_layout import shown_sections
 from deepseek_client import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, load_current_facts
 from review import build_report
@@ -105,6 +106,19 @@ def _localized(value: Any, language: str, path: str, fallbacks: list[str]) -> st
             fallbacks.append(path)
             return options[key]
     raise CVError(f"{path} 至少需要一种语言的文字")
+
+
+def profile_languages(profile: Any) -> list[str]:
+    """The CV languages a profile is written in, judged by the name: a resume given in one
+    language gets CVs in that language only, instead of machine-filled gaps in another."""
+    name = profile.get("name") if isinstance(profile, dict) else None
+    if isinstance(name, str):
+        return ["zh" if any("\u4e00" <= character <= "\u9fff" for character in name) else "en"]
+    if isinstance(name, dict):
+        written = [language for language in LANGUAGES if isinstance(name.get(language), str) and name[language].strip()]
+        if written:
+            return written
+    return ["en"]
 
 
 def _url(value: Any, path: str) -> str:
@@ -383,7 +397,7 @@ def render_html(draft: dict[str, Any], final: bool = False) -> str:
         f'<section><h2>{escape(section["title"])}</h2>'
         + "".join(_entry_html(section["kind"], entry) for entry in section["entries"])
         + "</section>"
-        for section in draft["sections"]
+        for section in shown_sections(draft)
     )
     links = f'<div class="contact">{_items(header["links"])}</div>' if header["links"] else ""
     watermark = "" if final else f'<div class="watermark">{WATERMARK[language]}</div>'
@@ -717,23 +731,38 @@ def tailor_draft(
     return result
 
 
+def _shown_lines(draft: dict[str, Any]) -> list[dict[str, Any]]:
+    """The stored lines (with any rewrite) of every line the CV shows, in CV order."""
+    stored = {
+        line["fact_id"]: line
+        for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
+    }
+    return [
+        stored[line["fact_id"]]
+        for section in shown_sections(draft) for entry in section["entries"] for line in entry["lines"]
+    ]
+
+
 def rejected_lines(draft: dict[str, Any]) -> list[dict[str, Any]]:
     """Rewrites the claim checks refused, with their reasons; those lines kept the fact."""
     return [
         {"fact_id": line["fact_id"], "rejected_text": line["tailoring"]["rejected_text"],
          "reasons": line["tailoring"]["reasons"]}
-        for section in draft["sections"] for entry in section["entries"]
-        for line in entry["lines"]
+        for line in _shown_lines(draft)
         if line.get("tailoring", {}).get("status") == "rejected"
     ]
 
 
-def rewritten_lines(draft: dict[str, Any]) -> list[dict[str, str]]:
-    """Every line whose wording DeepSeek changed, as original → rewrite, for review."""
+def rewritten_lines(draft: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every shown line whose wording DeepSeek changed, as original → rewrite, for review.
+
+    ``undone`` marks a rewrite the user turned back to the confirmed fact's own words.
+    """
+    undone = set((draft.get("plan") or {}).get("undone", []))
     return [
-        {"fact_id": line["fact_id"], "from": line["source_text"], "to": line["text"]}
-        for section in draft["sections"] for entry in section["entries"]
-        for line in entry["lines"]
+        {"fact_id": line["fact_id"], "from": line["source_text"], "to": line["text"],
+         "undone": f"reword:{line['fact_id']}" in undone}
+        for line in _shown_lines(draft)
         if line.get("tailoring", {}).get("status") == "accepted" and line["text"] != line["source_text"]
     ]
 

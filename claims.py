@@ -17,6 +17,41 @@ LEADERSHIP_EN = re.compile(
     re.IGNORECASE,
 )
 LEADERSHIP_ZH = ("主导", "带领", "领导", "牵头", "负责", "统筹")
+# Terms a translation may use for words its source line already has, in either direction:
+# "linking the frontend" may become "连接前端". A term missing from the source in every
+# language is still a new claim.
+EQUIVALENTS = (
+    ("前端", "frontend", "front-end", "front end"),
+    ("后端", "backend", "back-end", "back end"),
+    ("接口", "API", "APIs", "interface", "interfaces"),
+    ("数据库", "database", "databases"),
+    ("测试", "testing", "test", "tests", "tested"),
+    ("单元测试", "unit test", "unit tests"),
+    ("算法", "algorithm", "algorithms"),
+    ("机器学习", "machine learning"),
+    ("深度学习", "deep learning"),
+    ("大模型", "large language model", "large language models", "LLM", "LLMs"),
+    ("重构", "refactor", "refactored", "refactoring"),
+    ("文字识别", "OCR", "text recognition"),
+    ("持续集成", "continuous integration", "CI"),
+    ("计算机", "computer", "computer science"),
+    ("论文", "paper", "papers", "publication", "publications"),
+    ("硕士", "master", "master's", "M.S."),
+    ("学士", "bachelor", "bachelor's", "B.S."),
+    ("本科", "bachelor", "bachelor's", "undergraduate", "B.S."),
+    ("研究生", "graduate", "master", "master's", "M.S."),
+    ("研究", "research"),
+    ("调试", "debugging", "debug", "debugged"),
+    ("部署", "deployment", "deploy", "deployed"),
+    ("实时", "real-time", "realtime"),
+    ("预测", "forecasting", "forecast"),
+    ("分类", "classification"),
+    ("数据交换", "data exchange"),
+)
+_OTHER_NAMES: dict[str, set[str]] = {}
+for _group in EQUIVALENTS:
+    for _term in _group:
+        _OTHER_NAMES.setdefault(_term.casefold(), set()).update(name for name in _group if name != _term)
 
 
 def _numbers(text: str) -> set[str]:
@@ -26,6 +61,20 @@ def _numbers(text: str) -> set[str]:
 def _leadership(text: str) -> list[str]:
     words = [match.group(0) for match in LEADERSHIP_EN.finditer(text)]
     return words + [word for word in LEADERSHIP_ZH if word in text]
+
+
+def _mentioned(term: str, text: str) -> bool:
+    """The term, or its English singular or plural, appears in the text as a whole word."""
+    variants = [term]
+    if term.isascii():
+        variants.append(term[:-1] if term.endswith("s") else term + "s")
+    return any(tag_pattern(variant).search(text) for variant in variants if variant.strip())
+
+
+def _supported(term: str, source_text: str, tags: set[str]) -> bool:
+    """The source line or its own tags already state the term, in this or the other language."""
+    names = [term, *_OTHER_NAMES.get(term.casefold(), ())]
+    return any(name.casefold() in tags or _mentioned(name, source_text) for name in names)
 
 
 def _technical(token: str) -> bool:
@@ -70,9 +119,7 @@ def check_rewrite(
         if _technical(token) and token.casefold() not in source and token.casefold() not in tags:
             reasons.append(f"原事实中没有这个技术或技能词：{token}")
     for term in dict.fromkeys(vocabulary):
-        pattern = tag_pattern(term)
-        if (pattern.search(text) and not pattern.search(source_text)
-                and term.casefold() not in tags):
+        if tag_pattern(term).search(text) and not _supported(term, source_text, tags):
             reason = f"原事实中没有这个技术或技能词：{term}"
             if reason not in reasons:
                 reasons.append(reason)

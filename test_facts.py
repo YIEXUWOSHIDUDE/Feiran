@@ -289,18 +289,18 @@ class FactStoreTests(unittest.TestCase):
 
     def test_import_with_stable_ids_creates_then_versions_changed_items(self):
         original = [{
-            "id": "fact-usc-coursework", "type": "education",
+            "id": "fact-uni-coursework", "type": "education",
             "text": "Coursework: Analysis of Algorithms", "tags": ["Algorithms"],
         }]
         edited = [{**original[0], "text": "Coursework: Analysis of Algorithms, Database Systems"}]
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "workbench.db"
             created = import_facts(database, original)
-            confirm_fact(database, "fact-usc-coursework", 1)
+            confirm_fact(database, "fact-uni-coursework", 1)
             unchanged = import_facts(database, original)
             changed = import_facts(database, edited)
-            history = list_facts(database, "fact-usc-coursework")
-        self.assertEqual((created[0][0]["id"], created[0][1]), ("fact-usc-coursework", True))
+            history = list_facts(database, "fact-uni-coursework")
+        self.assertEqual((created[0][0]["id"], created[0][1]), ("fact-uni-coursework", True))
         self.assertFalse(unchanged[0][1])
         self.assertEqual(
             (changed[0][0]["version"], changed[0][0]["status"], changed[0][1]), (2, "pending", True)

@@ -40,6 +40,8 @@ class DeepSeekClientTests(unittest.TestCase):
         self.assertEqual(payload["response_format"], {"type": "json_object"})
         self.assertEqual(payload["model"], "deepseek-flash")
         self.assertEqual(payload["reasoning_effort"], "low")
+        # Structured tasks: the same question should get the same answer each time.
+        self.assertEqual(payload["temperature"], 0)
         self.assertIn("max_tokens", payload)
         self.assertEqual(result["content"], {"lines": []})
         self.assertEqual(result["model"], "deepseek-flash")

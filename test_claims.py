@@ -55,6 +55,20 @@ class ClaimCheckTests(unittest.TestCase):
         self.assertEqual(faithful, [])
         self.assertTrue(any("后端" in reason for reason in added))
 
+    def test_a_translation_may_name_in_chinese_what_the_source_says_in_english(self):
+        fact = ("Designed and documented REST APIs linking the frontend, backend, document parser, "
+                "and object storage to support team integration and deployment.")
+        tags = ["REST APIs", "APIs", "API design"]
+        vocabulary = tags + ["API", "前端", "后端", "接口", "测试"]
+        faithful = check_rewrite("设计并记录 REST API，连接前端、后端、文档解析器和对象存储，以支持团队集成和部署。",
+                                 fact, tags, vocabulary)
+        singular = check_rewrite("Designed and documented a REST API linking the frontend and backend.", fact, tags, vocabulary)
+        added = check_rewrite("设计 REST API，连接前端和后端，并编写测试。", fact, tags, vocabulary)
+        self.assertEqual(faithful, [])
+        self.assertEqual(singular, [])
+        # Testing is not in the source in any language, so it is still a new claim.
+        self.assertEqual(added, ["原事实中没有这个技术或技能词：测试"])
+
     def test_malformed_lines_are_rejected(self):
         for text in ["  ", "Designed REST APIs.\nAnd more.", "Designed REST APIs, see https://example.com.", "x" * 301]:
             with self.subTest(text=text[:24]):

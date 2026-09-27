@@ -6,13 +6,21 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from facts import FactStoreError, find_confirmed_facts, load_confirmed_fact
+from deepseek_client import DEFAULT_MODEL as DEEPSEEK_MODEL, DeepSeekError
+from facts import FactStoreError, find_confirmed_facts, list_facts, load_confirmed_fact
 from review import build_report
 
 
 MATCHING_METHOD = "versioned-tags-and-type-v1"
+MODEL_MATCHING_METHOD = "deepseek-facts-v1"
+MAX_MODEL_FACTS = 3
+MATCH_RULES = """You match one job's requirements to an applicant's confirmed resume facts and reply in json only.
+For each requirement, list the ids of facts whose own words show that the applicant meets it,
+strongest first, at most 3. Being related is not enough. Years of experience, seniority or
+leadership count only when the fact states them. Use an empty list when no fact shows it.
+Reply as {"matches": [{"requirement": "<requirement id>", "facts": ["<fact id>", ...]}]}."""
 REQUIREMENT_TYPE_PREFERENCES = {
     "skill_or_experience": ("project", "experience", "skill", "achievement"),
     "education_or_eligibility": ("education", "eligibility"),
@@ -76,8 +84,57 @@ def _validated_requirements(data: dict[str, Any]) -> list[dict[str, Any]]:
     return requirements
 
 
-def propose_matches(data: Any, facts_db: Path, limit: int = 10) -> dict[str, Any]:
-    """Retrieve bounded local candidates without copying unrelated facts."""
+def _model_choices(
+    requirements: list[dict[str, Any]], facts_db: Path, chat: Callable[..., dict], effort: str
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Ask DeepSeek which confirmed facts show each requirement is met.
+
+    Only requirement texts and confirmed fact texts are sent. Unknown or pending fact IDs
+    and unknown requirements in the answer are dropped, so the model can only point at
+    facts the user confirmed.
+    """
+    confirmed = {fact["id"]: fact for fact in list_facts(facts_db) if fact["status"] == "confirmed"}
+    request = {
+        "requirements": [{"id": item["id"], "text": item["text"]} for item in requirements],
+        "facts": [{"id": fact["id"], "text": fact["text"]} for fact in confirmed.values()],
+    }
+    reply = chat(
+        [{"role": "system", "content": MATCH_RULES}, {"role": "user", "content": json.dumps(request, ensure_ascii=False)}],
+        model=DEEPSEEK_MODEL,
+        effort=effort,
+    )
+    picks = reply["content"].get("matches")
+    if not isinstance(picks, list):
+        raise MatchingError("DeepSeek 的回答缺少 matches 数组")
+    wanted = {item["id"] for item in requirements}
+    choices: dict[str, list[dict[str, Any]]] = {}
+    for pick in picks:
+        requirement_id = pick.get("requirement") if isinstance(pick, dict) else None
+        fact_ids = pick.get("facts") if isinstance(pick, dict) else None
+        if requirement_id not in wanted or requirement_id in choices or not isinstance(fact_ids, list):
+            continue
+        known = [fact_id for fact_id in dict.fromkeys(fact_ids) if isinstance(fact_id, str) and fact_id in confirmed]
+        choices[requirement_id] = [
+            {**confirmed[fact_id], "retrieval_basis": {"method": "deepseek", "rank": rank}}
+            for rank, fact_id in enumerate(known[:MAX_MODEL_FACTS], 1)
+        ]
+    if requirements and not choices:
+        raise MatchingError("DeepSeek 的回答没有对应任何要求")
+    return choices, {"model": reply.get("model"), "usage": reply.get("usage")}
+
+
+def propose_matches(
+    data: Any,
+    facts_db: Path,
+    limit: int = 10,
+    chat: Callable[..., dict] | None = None,
+    effort: str = "none",
+) -> dict[str, Any]:
+    """Retrieve bounded local candidates without copying unrelated facts.
+
+    With ``chat`` DeepSeek chooses up to three confirmed facts per requirement; if it fails,
+    facts sharing tags with the requirement are offered instead and the reason is recorded.
+    """
     if not isinstance(data, dict):
         raise MatchingError("输入顶层必须是对象")
     if data.get("facts") != []:
@@ -86,13 +143,23 @@ def propose_matches(data: Any, facts_db: Path, limit: int = 10) -> dict[str, Any
         raise MatchingError("输入已经包含事实匹配结果")
     requirements = _validated_requirements(data)
     result = copy.deepcopy(data)
+    choices: dict[str, list[dict[str, Any]]] | None = None
+    details: dict[str, Any] = {}
+    if chat is not None:
+        try:
+            choices, details = _model_choices(requirements, facts_db, chat, effort)
+        except (DeepSeekError, MatchingError) as exc:
+            details = {"fallback_reason": str(exc)}
     match_candidates = []
     requirement_summaries = []
     for requirement in requirements:
-        preferred_types = REQUIREMENT_TYPE_PREFERENCES.get(requirement["category"], ())
-        facts = find_confirmed_facts(
-            facts_db, requirement["text"], preferred_types=preferred_types, limit=limit
-        )
+        if choices is not None:
+            facts = choices.get(requirement["id"], [])
+        else:
+            preferred_types = REQUIREMENT_TYPE_PREFERENCES.get(requirement["category"], ())
+            facts = find_confirmed_facts(
+                facts_db, requirement["text"], preferred_types=preferred_types, limit=limit
+            )
         requirement_summaries.append({
             "requirement_id": requirement["id"],
             "category_signal": requirement["category"],
@@ -114,8 +181,9 @@ def propose_matches(data: Any, facts_db: Path, limit: int = 10) -> dict[str, Any
             })
     result["match_candidates"] = match_candidates
     result["fact_matching"] = {
-        "method": MATCHING_METHOD,
-        "candidate_limit_per_requirement": limit,
+        "method": MODEL_MATCHING_METHOD if choices is not None else MATCHING_METHOD,
+        **details,
+        "candidate_limit_per_requirement": MAX_MODEL_FACTS if choices is not None else limit,
         "requirements": requirement_summaries,
         "candidate_count": len(match_candidates),
     }
@@ -134,13 +202,33 @@ def _parse_links(values: list[str]) -> dict[str, str]:
     return links
 
 
+def first_candidates(data: dict[str, Any]) -> tuple[dict[str, str], set[str]]:
+    """The best-ranked proposed fact for each requirement, or no match when none was found."""
+    links: dict[str, str] = {}
+    no_matches: set[str] = set()
+    for summary in data["fact_matching"]["requirements"]:
+        requirement_id = summary["requirement_id"]
+        first = next(
+            (item for item in data["match_candidates"] if item["requirement_id"] == requirement_id), None
+        )
+        if first is None:
+            no_matches.add(requirement_id)
+        else:
+            links[requirement_id] = first["fact_id"]
+    return links, no_matches
+
+
 def apply_match_decisions(
     data: Any,
     facts_db: Path,
     links: dict[str, str],
     no_matches: set[str],
+    decided_by: str = "user",
 ) -> dict[str, Any]:
-    """Bind explicit decisions to the exact fact versions proposed earlier."""
+    """Bind decisions to the exact fact versions proposed earlier.
+
+    ``decided_by`` records whether the user chose or the first candidate was taken ("auto").
+    """
     if not isinstance(data, dict) or not isinstance(data.get("match_candidates"), list):
         raise MatchingError("输入缺少 match_candidates")
     if not links and not no_matches:
@@ -191,9 +279,9 @@ def apply_match_decisions(
     if not isinstance(decisions, dict) or not set(decisions).issubset(selections_by_id):
         raise MatchingError("已有 match_decisions 结构无效")
     for requirement_id, fact_id in links.items():
-        decisions[requirement_id] = {"status": "linked", "fact_id": fact_id}
+        decisions[requirement_id] = {"status": "linked", "fact_id": fact_id, "decided_by": decided_by}
     for requirement_id in no_matches:
-        decisions[requirement_id] = {"status": "no_match", "fact_id": None}
+        decisions[requirement_id] = {"status": "no_match", "fact_id": None, "decided_by": decided_by}
     result["match_decisions"] = decisions
 
     selected_facts: dict[tuple[str, int], dict[str, Any]] = {}

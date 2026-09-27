@@ -13,10 +13,14 @@ from typing import Any
 
 
 DEFAULT_ROOT = Path(".local/jobs")
-JOB_STEPS = ("input", "candidates", "decided", "matches", "linked")
-CV_STEPS = ("cv-draft", "cv-tailored", "cv-approved", "cv-final")
+JOB_STEPS = ("input", "candidates", "decided")
+# Optional extras derived from the requirements; the CV does not depend on them. Talking points
+# (matches, linked) and gaps can be redone without touching the CV.
+EXTRA_STEPS = ("matches", "linked", "gaps")
+EXTRA_DEPENDENTS = {"matches": ("matches", "linked"), "linked": ("linked",), "gaps": ("gaps",)}
+CV_STEPS = ("cv-draft", "cv-tailored", "cv-planned", "cv-approved", "cv-final")
 LANGUAGES = ("en", "zh")
-STEPS = JOB_STEPS + tuple(f"{step}-{language}" for language in LANGUAGES for step in CV_STEPS)
+STEPS = JOB_STEPS + EXTRA_STEPS + tuple(f"{step}-{language}" for language in LANGUAGES for step in CV_STEPS)
 JOB_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 
 
@@ -32,6 +36,8 @@ def _later_steps(step: str) -> list[str]:
     """The step itself plus everything derived from it."""
     if step in JOB_STEPS:
         return list(JOB_STEPS[JOB_STEPS.index(step):]) + list(STEPS[len(JOB_STEPS):])
+    if step in EXTRA_DEPENDENTS:
+        return list(EXTRA_DEPENDENTS[step])
     base, language = step.rsplit("-", 1)
     return [f"{later}-{language}" for later in CV_STEPS[CV_STEPS.index(base):]]
 

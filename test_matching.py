@@ -5,8 +5,9 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+from deepseek_client import DeepSeekError
 from facts import FactStoreError, add_fact, confirm_fact, initialize_database, revise_fact
-from matching import MatchingError, apply_match_decisions, main, propose_matches
+from matching import MatchingError, apply_match_decisions, first_candidates, main, propose_matches
 from requirement_flow import apply_requirement_decisions, propose_requirements
 from review import build_report
 
@@ -39,7 +40,67 @@ def decided_requirements(include_education=False):
     return apply_requirement_decisions(proposed, confirmed, set()), ids
 
 
+class FakeMatcher:
+    """Stands in for DeepSeek: returns fixed fact choices per requirement, or fails."""
+
+    def __init__(self, matches=None, error=None):
+        self.matches = matches
+        self.error = error
+        self.messages = None
+
+    def __call__(self, messages, model, effort):
+        self.messages = messages
+        if self.error:
+            raise self.error
+        return {"model": "deepseek-flash", "content": {"matches": self.matches},
+                "usage": {"prompt_tokens": 40, "completion_tokens": 8}}
+
+
 class MatchingTests(unittest.TestCase):
+    def facts_for_model(self, database):
+        python, _ = add_fact(database, "Built services in Python.", "project", ["Python"])
+        degree, _ = add_fact(database, "Enrolled in a computer science degree.", "education", ["computer science"])
+        pending, _ = add_fact(database, "Ran Kubernetes clusters.", "skill", ["Kubernetes"])
+        confirm_fact(database, python["id"], 1)
+        confirm_fact(database, degree["id"], 1)
+        return python, degree, pending
+
+    def test_deepseek_links_only_confirmed_facts_it_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "workbench.db"
+            python, degree, pending = self.facts_for_model(database)
+            data, ids = decided_requirements(include_education=True)
+            matcher = FakeMatcher([
+                {"requirement": ids[0], "facts": [python["id"], pending["id"], "fact-unknown", python["id"]]},
+                {"requirement": ids[1], "facts": []},
+                {"requirement": "req-unknown", "facts": [degree["id"]]},
+            ])
+            proposed = propose_matches(data, database, chat=matcher)
+            linked = apply_match_decisions(proposed, database, *first_candidates(proposed), decided_by="auto")
+        sent = json.loads(matcher.messages[-1]["content"])
+        self.assertEqual(
+            [(item["requirement_id"], item["fact_id"]) for item in proposed["match_candidates"]],
+            [(ids[0], python["id"])],
+        )
+        self.assertEqual(proposed["fact_matching"]["method"], "deepseek-facts-v1")
+        # Pending facts are never offered, so they are never sent either.
+        self.assertEqual(sorted(fact["id"] for fact in sent["facts"]), sorted([python["id"], degree["id"]]))
+        self.assertEqual(
+            {key: (value["status"], value["decided_by"]) for key, value in linked["match_decisions"].items()},
+            {ids[0]: ("linked", "auto"), ids[1]: ("no_match", "auto")},
+        )
+
+    def test_word_matching_takes_over_when_deepseek_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "workbench.db"
+            python, _, _ = self.facts_for_model(database)
+            data, ids = decided_requirements()
+            matcher = FakeMatcher(error=DeepSeekError("DeepSeek API 返回 HTTP 503"))
+            proposed = propose_matches(data, database, chat=matcher)
+        self.assertEqual(proposed["fact_matching"]["fallback_reason"], "DeepSeek API 返回 HTTP 503")
+        self.assertEqual(proposed["fact_matching"]["method"], "versioned-tags-and-type-v1")
+        self.assertEqual([item["fact_id"] for item in proposed["match_candidates"]], [python["id"]])
+
     def test_cli_propose_writes_candidates_without_copying_all_facts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

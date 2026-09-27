@@ -6,12 +6,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from deepseek_client import DeepSeekError
 from requirement_flow import (
     RequirementError,
     add_manual_requirements,
     apply_requirement_decisions,
     attach_semantic_judgments,
     extract_requirement_candidates,
+    find_requirements_with_model,
     main,
     propose_requirements,
 )
@@ -43,6 +45,34 @@ def review_input():
         ],
         "selected_requirements": [],
     }
+
+
+class FakeFinder:
+    """Stands in for DeepSeek: answers with fixed line numbers, or fails."""
+
+    def __init__(self, picks=None, error=None):
+        self.picks = picks
+        self.error = error
+        self.messages = None
+
+    def __call__(self, messages, model, effort):
+        self.messages = messages
+        if self.error:
+            raise self.error
+        return {"model": "deepseek-flash", "content": {"requirements": self.picks},
+                "usage": {"prompt_tokens": 50, "completion_tokens": 9}}
+
+
+BOARD_JD = """About the role
+Build ML services.
+Must-Have Skills
+Mastery of Python
+Strong SQL skills
+Nice-to-Have Skills
+Experience with Kubernetes
+Benefits
+Health insurance
+"""
 
 
 class RequirementFlowTests(unittest.TestCase):
@@ -200,6 +230,36 @@ Planning meetings with the team
             "You might thrive in this role if you enjoy long meetings with many stakeholders",
             "Experience with async Python",
         ])
+
+    def test_deepseek_chooses_lines_by_number_and_their_text_is_copied_exactly(self):
+        finder = FakeFinder([
+            {"line": 7, "kind": "preferred"}, {"line": 4, "kind": "required"}, {"line": 5},
+            {"line": 1, "kind": "required"}, {"line": 99, "kind": "required"}, {"line": "4"},
+        ])
+        candidates, details = find_requirements_with_model(BOARD_JD, finder, title="ML Engineer")
+        sent = json.loads(finder.messages[-1]["content"])
+        self.assertEqual(
+            [(item["text"], item["section"]) for item in candidates],
+            [("Mastery of Python", "Required"), ("Strong SQL skills", "Required"), ("Experience with Kubernetes", "Preferred")],
+        )
+        self.assertEqual({item["extraction_method"] for item in candidates}, {"deepseek-lines-v1"})
+        self.assertEqual(set(sent), {"job_title", "lines"})
+        self.assertEqual(sent["lines"][3], {"n": 4, "text": "Mastery of Python"})
+        self.assertEqual(details["model"], "deepseek-flash")
+
+    def test_heading_rules_take_over_when_deepseek_fails_or_finds_nothing(self):
+        for finder, reason in (
+            (FakeFinder(error=DeepSeekError("无法连接 DeepSeek API")), "无法连接 DeepSeek API"),
+            (FakeFinder(picks=[]), "DeepSeek 没有找到要求行"),
+        ):
+            with self.subTest(reason=reason):
+                proposed = propose_requirements(review_input(), chat=finder)
+                self.assertEqual(
+                    [item["text"] for item in proposed["requirement_candidates"]],
+                    ["Experience building services with Python", "Knowledge of relational databases"],
+                )
+                self.assertEqual(proposed["requirement_extraction"]["method"], "section-lines-v3")
+                self.assertEqual(proposed["requirement_extraction"]["fallback_reason"], reason)
 
     def test_heading_with_inline_content_starts_a_section(self):
         text = """About the role

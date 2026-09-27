@@ -4,7 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from deepseek_client import DeepSeekError
 from facts import confirm_facts, import_facts
+from cv_plan import PLAN_RULES
+from gaps import SUGGEST_RULES
+from matching import MATCH_RULES
+from requirement_flow import FIND_RULES
 from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
 from test_listings import FakeBoards, posting
 
@@ -21,6 +26,39 @@ FACTS = [
 ]
 
 
+class FakeDeepSeek(FakeChat):
+    """Tailors like FakeChat. For requirement finding it picks the lines listed in
+    requirement_lines, and for CV planning it returns ``plan``; while either is None that
+    request fails like an unreachable API. Fact matching always fails that way, so the
+    tag-matching fallback is what these tests see."""
+
+    def __init__(self, rewrites=None):
+        super().__init__(rewrites)
+        self.requirement_lines = None
+        self.plan = None
+        self.gap_suggestions = None
+
+    def __call__(self, messages, model, effort):
+        if messages[0]["content"] == SUGGEST_RULES:
+            if self.gap_suggestions is None:
+                raise DeepSeekError("测试中不联网")
+            ids = {item["text"]: item["id"] for item in json.loads(messages[-1]["content"])["gaps"]}
+            return {"model": "deepseek-flash", "content": {"suggestions": self.gap_suggestions(ids)}, "usage": {}}
+        if messages[0]["content"] == MATCH_RULES or (messages[0]["content"] == PLAN_RULES and self.plan is None):
+            raise DeepSeekError("测试中不联网")
+        if messages[0]["content"] == PLAN_RULES:
+            return {"model": "deepseek-flash", "content": self.plan, "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        if messages[0]["content"] != FIND_RULES:
+            return super().__call__(messages, model, effort)
+        if self.requirement_lines is None:
+            raise DeepSeekError("测试中不联网")
+        lines = json.loads(messages[-1]["content"])["lines"]
+        picks = [{"line": line["n"], "kind": "required"} for line in lines
+                 if line["text"].lstrip("- ") in self.requirement_lines]
+        return {"model": "deepseek-flash", "content": {"requirements": picks},
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+
 @unittest.skipUnless(HAS_FASTAPI, "web tests need the packages in requirements.txt")
 class WebTests(unittest.TestCase):
     def setUp(self):
@@ -29,7 +67,8 @@ class WebTests(unittest.TestCase):
         self.database = root / "workbench.db"
         profile = root / "cv-profile.json"
         profile.write_text(json.dumps(PROFILE, ensure_ascii=False), encoding="utf-8")
-        self.chat = FakeChat({"fact-intern-api": "For an internal tool, built REST APIs."})
+        self.profile_path = profile
+        self.chat = FakeDeepSeek({"fact-intern-api": "For an internal tool, built REST APIs."})
         self.boards = FakeBoards([
             posting("1", "Data Engineer", "Requirements:\n- Python and SQL"),
             posting("2", "Designer", "Figma."),
@@ -165,18 +204,20 @@ class WebTests(unittest.TestCase):
         import_facts(self.database, CV_FACTS)
         confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
         job_id = self.create_job()
-        with self.assertRaises(AssertionError):
-            self.cv_step(job_id, "approve")
-        self.cv_step(job_id, "draft")
-        tailored = self.cv_step(job_id, "tailor")
+        view = self.job(job_id)
+        # A Chinese posting gets its Chinese CV at once; the English one comes on request.
+        self.assertEqual((view["language"], view["cv"]["zh"]["head"], view["cv"]["en"]["head"]), ("zh", "tailored", None))
+        prepared = self.cv_step(job_id, "prepare")
         preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}")
         approved = self.cv_step(job_id, "approve")
         final = self.cv_step(job_id, "export")
         download = self.client.get(f"/download/{job_id}/en.pdf?token={TOKEN}")
-        self.assertEqual(tailored["rewrites"], [{
+        self.assertEqual(prepared["head"], "tailored")  # planning is offline in these tests
+        self.assertEqual(prepared["rewrites"], [{
             "fact_id": "fact-intern-api",
             "from": "Built REST APIs for an internal tool.",
             "to": "For an internal tool, built REST APIs.",
+            "undone": False,
         }])
         self.assertIn('class="watermark"', preview.text)
         self.assertEqual(approved["head"], "approved")
@@ -234,6 +275,111 @@ class WebTests(unittest.TestCase):
         self.assertEqual(view["jd"]["company"], "Example")
         self.assertEqual([item["text"] for item in view["candidates"]], ["Python and SQL"])
         self.assertEqual({item["title"]: item["started_job"] for item in ranked}, {"Data Engineer": job_id, "Designer": None})
+
+
+    def test_a_started_job_is_ready_for_cv_review_without_clicks(self):
+        import_facts(self.database, FACTS + CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in FACTS + CV_FACTS])
+        self.chat.requirement_lines = {"Python and SQL"}
+        self.client.post("/api/sources", json={"link": "https://boards.greenhouse.io/example"}, headers=self.headers)
+        started = self.client.post("/api/listings/start", json={"provider": "greenhouse", "board": "example", "job_id": "1"}, headers=self.headers)
+        job_id = started.json()["job_id"]
+        view = self.job(job_id)
+        self.assertEqual(
+            [(item["text"], item["status"], item["extraction_method"]) for item in view["candidates"]],
+            [("Python and SQL", "confirmed", "deepseek-lines-v1")],
+        )
+        self.assertEqual((view["language"], view["cv"]["en"]["head"], view["cv"]["zh"]["head"]), ("en", "tailored", None))
+        self.assertNotIn("matching", view)  # talking points are made only on request
+        self.assertEqual(view["extraction"]["method"], "deepseek-lines-v1")
+        # Changing a requirement decision prepares the CV again by itself.
+        self.client.post(f"/api/jobs/{job_id}/requirements/decide",
+                         json={"confirm": [view["candidates"][0]["id"]]}, headers=self.headers)
+        self.assertTrue({"decided", "cv-draft-en", "cv-tailored-en"} <= set(self.job(job_id)["steps"]))
+
+    def test_the_cv_is_adjusted_for_the_job_and_each_change_can_be_undone(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.chat.plan = {
+            "sections": ["education", "skills", "experience"],
+            "entries": [{"entry": "s1e0", "lines": ["fact-intern-tests"]}],
+            "reasons": [{"target": "fact-intern-api", "reason": "REST APIs are not asked for."}],
+        }
+        job_id = self.client.post(
+            "/api/jobs", json={"title": "Test Engineer", "text": "Requirements:\n- Writing unit tests"}, headers=self.headers,
+        ).json()["job_id"]
+        cv = self.job(job_id)["cv"]["en"]
+        before = self.client.get(f"/preview/{job_id}/en?token={TOKEN}").text
+        undone = self.client.post(f"/api/jobs/{job_id}/cv/en/change",
+                                  json={"change_id": "cut:fact-intern-api", "undone": True}, headers=self.headers)
+        after = self.client.get(f"/preview/{job_id}/en?token={TOKEN}").text
+        talking = self.client.post(f"/api/jobs/{job_id}/matches/propose", headers=self.headers)
+        self.assertEqual(cv["head"], "planned")
+        self.assertEqual({item["id"]: (item["reason"], item["undone"]) for item in cv["changes"]}, {
+            "order:sections": (None, False),
+            "cut:fact-intern-api": ("REST APIs are not asked for.", False),
+        })
+        self.assertNotIn("REST APIs", before)
+        self.assertIn("REST APIs", after)
+        self.assertTrue(next(item for item in undone.json()["cv"]["en"]["changes"] if item["id"] == "cut:fact-intern-api")["undone"])
+        # Talking points are optional extra reading: making them leaves the CV alone.
+        self.assertEqual(talking.status_code, 200, talking.text)
+        self.assertIn("cv-planned-en", talking.json()["steps"])
+
+    def test_nothing_found_leaves_the_requirements_step_to_the_user_and_can_be_retried(self):
+        import_facts(self.database, FACTS)
+        confirm_facts(self.database, [("fact-web-python", 1)])
+        job_id = self.client.post(
+            "/api/jobs", json={"title": "Engineer", "text": "We build tools.\nYou will ship code daily."}, headers=self.headers,
+        ).json()["job_id"]
+        view = self.job(job_id)
+        self.assertEqual(view["steps"], ["input", "candidates"])
+        self.assertEqual(view["extraction"]["fallback_reason"], "测试中不联网")
+        self.chat.requirement_lines = {"You will ship code daily."}
+        retried = self.client.post(f"/api/jobs/{job_id}/requirements/find", headers=self.headers)
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertEqual([item["text"] for item in retried.json()["candidates"]], ["You will ship code daily."])
+        self.assertIn("decided", retried.json()["steps"])
+
+
+    def test_an_english_only_profile_gets_english_cvs_even_for_chinese_postings(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        english_only = {**PROFILE, "name": {"en": "Alex Example", "zh": ""}}
+        self.profile_path.write_text(json.dumps(english_only, ensure_ascii=False), encoding="utf-8")
+        view = self.job(self.create_job())
+        self.assertEqual((view["cv_languages"], view["language"]), (["en"], "en"))
+        self.assertEqual((view["cv"]["en"]["head"], view["cv"]["zh"]["head"]), ("tailored", None))
+
+
+    def test_gaps_show_only_what_the_cv_lacks_and_a_line_true_for_you_joins_the_cv(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        text = "Requirements:\n- Hands-on Docker and Kubernetes\n- 3+ years of backend experience\n- Writing integration tests"
+        job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": text}, headers=self.headers).json()["job_id"]
+        self.chat.gap_suggestions = lambda ids: [
+            {"requirement": ids["Hands-on Docker and Kubernetes"], "kind": "skill", "line": "fact-skills-languages", "items": ["Docker"]},
+            {"requirement": ids["3+ years of backend experience"], "kind": "none"},
+            {"requirement": ids["Writing integration tests"], "kind": "bullet", "entry": "s1e0",
+             "text": "Wrote integration tests for the internal tool.", "tags": ["integration tests"]},
+        ]
+        found = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers)
+        ids = {item["text"]: item["requirement_id"] for item in found.json()["gaps"]["gaps"]}
+        docker, years, tests = ids["Hands-on Docker and Kubernetes"], ids["3+ years of backend experience"], ids["Writing integration tests"]
+        self.client.post(f"/api/jobs/{job_id}/gaps/{docker}/accept", headers=self.headers)
+        self.client.post(f"/api/jobs/{job_id}/gaps/{tests}/accept", headers=self.headers)
+        declined = self.client.post(f"/api/jobs/{job_id}/gaps/{years}/decline", headers=self.headers).json()
+        preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}").text
+        saved = json.loads(self.profile_path.read_text(encoding="utf-8"))
+        backups = list((self.profile_path.parent / "profile-history").glob("*.json"))
+        self.assertEqual(found.status_code, 200, found.text)
+        self.assertEqual({item["requirement_id"]: item["status"] for item in declined["gaps"]["gaps"]},
+                         {docker: "added", years: "declined", tests: "added"})
+        self.assertIn("Python, Java, Docker", preview)
+        self.assertIn("Wrote integration tests for the internal tool.", preview)
+        self.assertEqual(len(saved["sections"][1]["entries"][0]["facts"]), 3)
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(json.loads(backups[0].read_text(encoding="utf-8")), PROFILE)
 
 
 if __name__ == "__main__":

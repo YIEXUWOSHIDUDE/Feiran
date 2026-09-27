@@ -60,6 +60,17 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(self.workspace.path(self.job, "cv-final-zh").read_bytes(), b"%PDF-1.4 zh")
 
+    def test_talking_points_can_be_redone_without_touching_the_cv(self):
+        for step in ("decided", "cv-draft-en", "cv-tailored-en", "cv-planned-en", "matches", "linked"):
+            self.workspace.write(self.job, step, {"version": 1})
+        self.workspace.write(self.job, "matches", {"version": 2})
+        self.assertEqual(
+            self.workspace.state(self.job),
+            ["input", "decided", "matches", "cv-draft-en", "cv-tailored-en", "cv-planned-en"],
+        )
+        self.workspace.write(self.job, "cv-tailored-en", {"version": 2})
+        self.assertEqual(self.workspace.state(self.job), ["input", "decided", "matches", "cv-draft-en", "cv-tailored-en"])
+
     def test_job_ids_and_step_names_cannot_leave_the_workspace(self):
         for job_id, step in (("../outside", "input"), (self.job, "../input"), (self.job, "notes")):
             with self.subTest(job_id=job_id, step=step):

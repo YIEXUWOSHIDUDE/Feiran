@@ -14,6 +14,7 @@ from cv import (
     build_draft,
     export_pdf,
     main,
+    profile_languages,
     render_html,
     tailor_draft,
 )
@@ -55,6 +56,19 @@ PROFILE = {
         {"kind": "skills", "entries": [{"facts": ["fact-skills-languages"]}]},
     ],
 }
+
+
+class ProfileLanguageTests(unittest.TestCase):
+    def test_cvs_are_offered_only_in_the_languages_the_profile_is_written_in(self):
+        cases = {
+            "both": ({"en": "Alex Example", "zh": "示例"}, ["en", "zh"]),
+            "english only": ({"en": "Alex Example", "zh": "  "}, ["en"]),
+            "plain english": ("Alex Example", ["en"]),
+            "plain chinese": ("张三", ["zh"]),
+        }
+        for label, (name, languages) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(profile_languages({**PROFILE, "name": name}), languages)
 
 
 def make_store(directory, confirm=True):
@@ -437,6 +451,7 @@ class CVCommandLineTests(unittest.TestCase):
             "fact_id": "fact-intern-api",
             "from": "Built REST APIs for an internal tool.",
             "to": "For an internal tool, built REST APIs.",
+            "undone": False,
         }])
         self.assertTrue(printed["final"])
 

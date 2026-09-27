@@ -11,6 +11,7 @@ import re
 import secrets
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -26,13 +27,16 @@ from cv import (
     export_pdf,
     is_final_approval,
     print_with_chrome,
+    profile_languages,
     rejected_lines,
     render_html,
     rewritten_lines,
     tailor_draft,
 )
+from cv_plan import plan_draft, set_change
 from deepseek_client import chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, list_facts, parse_fact_refs
+from gaps import accept_gap, decline_gap, find_gaps
 from job_search import (
     SearchError,
     fetch_board,
@@ -52,7 +56,7 @@ from listings import (
     refresh_source,
     remove_source,
 )
-from matching import MatchingError, apply_match_decisions, propose_matches
+from matching import MatchingError, apply_match_decisions, first_candidates, propose_matches
 from requirement_flow import (
     RequirementError,
     add_manual_requirements,
@@ -125,6 +129,18 @@ class StartListingRequest(BaseModel):
     provider: str
     board: str
     job_id: str
+
+
+class ChangeRequest(BaseModel):
+    change_id: str
+    undone: bool = True
+
+
+def _job_language(text: str) -> str:
+    """The CV language a posting most likely wants: Chinese when it is mostly written in Chinese."""
+    chinese = sum("\u4e00" <= character <= "\u9fff" for character in text)
+    latin = sum(character.isascii() and character.isalpha() for character in text)
+    return "zh" if chinese * 4 > latin else "en"
 
 
 class MatchDecisionRequest(BaseModel):
@@ -216,10 +232,14 @@ def create_app(
         """What the page needs for one job: the JD and the current file of each step."""
         steps = workspace.state(job_id)
         jd = {key: value for key, value in require(job_id, "input")["jd"].items() if key != "raw_content"}
-        view: dict = {"job_id": job_id, "steps": steps, "jd": jd}
+        view: dict = {
+            "job_id": job_id, "steps": steps, "jd": jd,
+            "language": job_cv_language(jd["text"]), "cv_languages": cv_languages(),
+        }
         decided = workspace.read(job_id, "decided")
         requirements = decided or workspace.read(job_id, "candidates")
         if requirements:
+            view["extraction"] = requirements.get("requirement_extraction")
             view["candidates"] = [
                 {field: item.get(field) for field in CANDIDATE_FIELDS}
                 for item in requirements["requirement_candidates"]
@@ -233,6 +253,9 @@ def create_app(
         if linked:
             view["report"] = build_report(linked)
         view["cv"] = {language: cv_view(job_id, language) for language in CV_LANGUAGES}
+        gaps = workspace.read(job_id, "gaps")
+        if gaps:
+            view["gaps"] = gaps
         return view
 
     def check_language(language: str) -> str:
@@ -242,7 +265,7 @@ def create_app(
 
     def cv_head(job_id: str, language: str) -> tuple[str | None, dict | None]:
         """The newest CV file for a language; later steps always derive from earlier ones."""
-        for step in ("approved", "tailored", "draft"):
+        for step in ("approved", "planned", "tailored", "draft"):
             data = workspace.read(job_id, f"cv-{step}-{check_language(language)}")
             if data is not None:
                 return step, data
@@ -255,14 +278,16 @@ def create_app(
             "final_pdf": workspace.path(job_id, f"cv-final-{language}").exists(),
         }
         draft = workspace.read(job_id, f"cv-draft-{language}")
-        tailored = workspace.read(job_id, f"cv-tailored-{language}")
         if draft:
             view["language_fallbacks"] = _describe_fallbacks(draft)
-        if tailored:
-            tailoring = tailored["tailoring"]
+        if head and "tailoring" in head:
+            tailoring = head["tailoring"]
             view["tailoring"] = {key: tailoring.get(key) for key in ("model", "accepted", "rejected", "usage")}
-            view["rewrites"] = rewritten_lines(tailored)
-            view["rejected"] = rejected_lines(tailored)
+            view["rewrites"] = rewritten_lines(head)
+            view["rejected"] = rejected_lines(head)
+        if head and "plan" in head:
+            undone = set(head["plan"]["undone"])
+            view["changes"] = [{**item, "undone": item["id"] in undone} for item in head["plan"]["changes"]]
         if head_step == "approved":
             view["approved_at"] = head["approval"]["approved_at"]
         return view
@@ -271,6 +296,86 @@ def create_app(
         if not Path(profile_path).exists():
             raise CVError(f"缺少简历 profile：{profile_path}")
         return json.loads(Path(profile_path).read_text(encoding="utf-8"))
+
+    def save_profile(profile: dict) -> None:
+        """Replace the profile, keeping the previous one in profile-history/ first."""
+        path = Path(profile_path)
+        history = path.parent / "profile-history"
+        history.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        with (history / f"cv-profile-{stamp}.json").open("xb") as backup:
+            backup.write(path.read_bytes())
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
+    # The page exists to help the user present their best CV for each job, not to grade them.
+    # Everything up to the CV review happens by itself: the requirements DeepSeek (or the
+    # heading rules) finds all count, and the CV in the posting's language is drafted, reworded
+    # and adjusted to them. The user can undo any change; approving the CV is never automatic.
+    def prepare_cv(job_id: str, language: str) -> None:
+        """Draft, reword and adjust one language's CV for this job. When DeepSeek cannot reword
+        or adjust, the CV stays at the last step that worked and the page offers that step."""
+        job = require(job_id, "decided")
+        head = build_draft(load_profile(), facts_db, check_language(language), job=job)
+        workspace.write(job_id, f"cv-draft-{language}", head)
+        try:
+            # Thinking off: on a real CV it gave the same result in 2 s instead of 8 s (2026-09).
+            head = tailor_draft(head, facts_db, job=job, chat=chat, effort="none")
+            workspace.write(job_id, f"cv-tailored-{language}", head)
+        except CVError:
+            pass
+        try:
+            workspace.write(job_id, f"cv-planned-{language}", plan_draft(head, job, chat=chat))
+        except CVError:
+            pass
+
+    def cv_languages() -> list[str]:
+        """Languages the user's resume is written in; only those get CVs."""
+        try:
+            return profile_languages(load_profile())
+        except (CVError, OSError, ValueError):
+            return ["en"]
+
+    def job_cv_language(jd_text: str) -> str:
+        """The posting's language when the resume has it, otherwise the resume's own language."""
+        available = cv_languages()
+        wanted = _job_language(jd_text)
+        return wanted if wanted in available else available[0]
+
+    def prepare_cv_quietly(job_id: str) -> None:
+        """The CV for this posting in a language the resume is written in. Without a profile
+        or confirmed facts yet, the CV panel's Prepare button shows what is missing."""
+        try:
+            prepare_cv(job_id, job_cv_language(require(job_id, "input")["jd"]["text"]))
+        except (CVError, FactStoreError, OSError, ValueError):
+            pass
+
+    def match_automatically(job_id: str) -> None:
+        """Optional talking points: the confirmed fact that best speaks to each requirement."""
+        if not Path(facts_db).exists():
+            raise FactStoreError("还没有事实库；请先导入并确认事实")
+        matches = propose_matches(require(job_id, "decided"), facts_db, chat=chat)
+        workspace.write(job_id, "matches", matches)
+        links, no_match = first_candidates(matches)
+        linked = apply_match_decisions(matches, facts_db, links, no_match, decided_by="auto")
+        workspace.write(job_id, "linked", linked)
+
+    def prepare_automatically(job_id: str, excluded: frozenset[str] = frozenset()) -> None:
+        """Count every found requirement the user has not excluded, then prepare the CV."""
+        candidates = require(job_id, "candidates")
+        ids = {item["id"] for item in candidates["requirement_candidates"]}
+        if not ids - excluded:
+            return
+        workspace.write(job_id, "decided", apply_requirement_decisions(candidates, ids - excluded, excluded & ids))
+        prepare_cv_quietly(job_id)
+
+    def create_prepared_job(review_input: dict) -> str:
+        candidates = propose_requirements(review_input, chat=chat)
+        job_id = workspace.create_job(review_input)
+        workspace.write(job_id, "candidates", candidates)
+        prepare_automatically(job_id)
+        return job_id
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -338,11 +443,7 @@ def create_app(
                 return {"job_id": existing, "existing": True}
             selected = selected_posting(request.board, request.job_id, request.provider)
             selected["jd"]["company"] = selected["jd"].get("company") or listing["company"]
-            review_input = prepare_review_input(selected)
-            candidates = propose_requirements(review_input)
-            job_id = workspace.create_job(review_input)
-            workspace.write(job_id, "candidates", candidates)
-            return {"job_id": job_id, "existing": False}
+            return {"job_id": create_prepared_job(prepare_review_input(selected)), "existing": False}
 
     @app.get("/api/jobs")
     def jobs() -> dict:
@@ -351,11 +452,7 @@ def create_app(
     @app.post("/api/jobs")
     def new_job(request: NewJobRequest) -> dict:
         selected = prepare_pasted_jd(request.text, request.title, request.company, request.url, request.location)
-        review_input = prepare_review_input(selected)
-        candidates = propose_requirements(review_input)
-        job_id = workspace.create_job(review_input)
-        workspace.write(job_id, "candidates", candidates)
-        return {"job_id": job_id}
+        return {"job_id": create_prepared_job(prepare_review_input(selected))}
 
     @app.get("/api/jobs/{job_id}")
     def job(job_id: str) -> dict:
@@ -363,8 +460,19 @@ def create_app(
 
     @app.post("/api/jobs/{job_id}/requirements/add")
     def add_requirement(job_id: str, request: AddRequirementRequest) -> dict:
+        decided = workspace.read(job_id, "decided") or {}
+        excluded = frozenset(
+            item["id"] for item in decided.get("requirement_candidates", []) if item.get("status") == "excluded"
+        )
         added = add_manual_requirements(require(job_id, "candidates"), [request.text])
         workspace.write(job_id, "candidates", added)
+        prepare_automatically(job_id, excluded)
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/requirements/find")
+    def find_requirements(job_id: str) -> dict:
+        workspace.write(job_id, "candidates", propose_requirements(require(job_id, "input"), chat=chat))
+        prepare_automatically(job_id)
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/requirements/decide")
@@ -373,11 +481,12 @@ def create_app(
             require(job_id, "candidates"), set(request.confirm), set(request.exclude)
         )
         workspace.write(job_id, "decided", decided)
+        prepare_cv_quietly(job_id)
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/matches/propose")
     def propose_job_matches(job_id: str) -> dict:
-        workspace.write(job_id, "matches", propose_matches(require(job_id, "decided"), facts_db))
+        match_automatically(job_id)
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/matches/decide")
@@ -391,7 +500,7 @@ def create_app(
     @app.post("/api/jobs/{job_id}/cv/{language}/draft")
     def cv_draft(job_id: str, language: str) -> dict:
         draft = build_draft(
-            load_profile(), facts_db, check_language(language), job=workspace.read(job_id, "linked")
+            load_profile(), facts_db, check_language(language), job=workspace.read(job_id, "decided")
         )
         workspace.write(job_id, f"cv-draft-{language}", draft)
         return job_view(job_id)
@@ -399,8 +508,52 @@ def create_app(
     @app.post("/api/jobs/{job_id}/cv/{language}/tailor")
     def cv_tailor(job_id: str, language: str) -> dict:
         draft = require(job_id, f"cv-draft-{check_language(language)}")
-        tailored = tailor_draft(draft, facts_db, job=workspace.read(job_id, "linked"), chat=chat)
+        tailored = tailor_draft(draft, facts_db, job=workspace.read(job_id, "decided"), chat=chat)
         workspace.write(job_id, f"cv-tailored-{language}", tailored)
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/gaps")
+    def check_gaps(job_id: str) -> dict:
+        """What this job asks for that the CV does not show yet, with suggestions."""
+        language = job_cv_language(require(job_id, "input")["jd"]["text"])
+        draft = workspace.read(job_id, f"cv-draft-{language}")
+        if draft is None:
+            raise WorkspaceError("请先准备这个岗位的简历，再检查缺口")
+        workspace.write(job_id, "gaps", find_gaps(require(job_id, "decided"), draft, facts_db, chat))
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/accept")
+    def accept_suggestion(job_id: str, requirement_id: str) -> dict:
+        """The user says the suggested line is true: it becomes a confirmed fact on the CV."""
+        gaps = require(job_id, "gaps")
+        updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
+        if profile is not None:
+            save_profile(profile)
+        workspace.write(job_id, "gaps", updated)
+        prepare_cv(job_id, gaps["language"])
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/decline")
+    def decline_suggestion(job_id: str, requirement_id: str) -> dict:
+        workspace.write(job_id, "gaps", decline_gap(require(job_id, "gaps"), requirement_id))
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/prepare")
+    def cv_prepare(job_id: str, language: str) -> dict:
+        prepare_cv(job_id, language)
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/plan")
+    def cv_plan(job_id: str, language: str) -> dict:
+        """Adjust (again) for this job, starting from the reworded CV, or the draft if none."""
+        base = workspace.read(job_id, f"cv-tailored-{check_language(language)}") or require(job_id, f"cv-draft-{language}")
+        workspace.write(job_id, f"cv-planned-{language}", plan_draft(base, require(job_id, "decided"), chat=chat))
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/change")
+    def cv_change(job_id: str, language: str, request: ChangeRequest) -> dict:
+        planned = require(job_id, f"cv-planned-{check_language(language)}")
+        workspace.write(job_id, f"cv-planned-{language}", set_change(planned, request.change_id, request.undone))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/cv/{language}/approve")

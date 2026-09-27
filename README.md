@@ -1,6 +1,8 @@
 # 岗位匹配与申请材料审核工作台
 
-当前命令行流程在本机 SQLite 中保存带版本、分类和标签的候选人事实；从 Greenhouse、Lever、Ashby 公开招聘板获取岗位，或手动粘贴 JD；确认 JD 要求后按需检索少量事实候选；最后由用户绑定双侧原文并生成待审核建议。仓库不包含真实候选人资料。
+目的：帮助候选人针对每个岗位，用自己已确认的真实经历拿出最好的一版简历（先放什么、删什么、怎样按岗位的说法改写），而不是评判候选人是否符合岗位。系统不会加入事实以外的内容，最终简历由用户审核批准。
+
+本机 SQLite 保存带版本、分类和标签的候选人事实；岗位来自 Greenhouse、Lever、Ashby 公开招聘板或手动粘贴的 JD。网页是主要入口；命令行用于开发和测试。仓库不包含真实候选人资料。
 
 架构、业务不变量和当前限制见 [development.md](development.md)。
 
@@ -30,7 +32,7 @@ python3 facts.py confirm fact-xxxxxxxxxxxx@1
 
 事实较多时可从一个 JSON 文件批量导入，格式见 [examples/synthetic_facts_import.json](examples/synthetic_facts_import.json)：每条必须有 `type` 和 `text`，`tags` 和 `id` 可选，其他字段会被拒绝。
 
-`id` 是自定义的可读 ID（如 `fact-usc-coursework`，只能用 `fact-` 开头的字母、数字和连字符），简历 profile 用它引用事实，见 [examples/synthetic_cv_facts.json](examples/synthetic_cv_facts.json)。带 `id` 的条目：ID 不存在则新建；内容未变则不改动；内容改变则为该事实新建一个 `pending` 版本，需要重新确认。因此可以直接修改 JSON 文件后重新导入。新 ID 的内容若与已有事实完全相同会被拒绝，以免同一事实出现两份。
+`id` 是自定义的可读 ID（如 `fact-uni-coursework`，只能用 `fact-` 开头的字母、数字和连字符），简历 profile 用它引用事实，见 [examples/synthetic_cv_facts.json](examples/synthetic_cv_facts.json)。带 `id` 的条目：ID 不存在则新建；内容未变则不改动；内容改变则为该事实新建一个 `pending` 版本，需要重新确认。因此可以直接修改 JSON 文件后重新导入。新 ID 的内容若与已有事实完全相同会被拒绝，以免同一事实出现两份。
 
 ```sh
 python3 facts.py import .local/my-facts.json
@@ -213,15 +215,21 @@ python3 -m venv .venv
 
 - **Facts**：查看全部事实，勾选后一次确认多个 pending 版本。全部确认后自动转到 Find jobs。
 - **Find jobs**：关注公司的全部公开岗位按“提到你多少个已确认技能标签”排序，最多的在前；同分时较新的在前。同一职位在多个城市发布只显示一行。可按标题、地点筛选，可勾选“Hide senior roles”（隐藏 Senior、Staff、Principal、Lead、Manager、Director 等标题；“Member of Technical Staff” 保留）。点 **Start** 会重新读取该岗位并新建到 My jobs；同一岗位再点只会打开已有的那一个。
-- **My jobs**：已开始的岗位；也可以粘贴任意来源的 JD 新建岗位，要求会自动提取。
-- **每个岗位**：1. 确认或排除要求、补充漏掉的原文；2. 查找匹配事实，选择一条或“无匹配”，查看证据；3. 中英文简历：生成草稿、可选 DeepSeek 改写、查看改动对照和预览，勾选“已逐行核对”后批准，再生成并下载最终 PDF。
+- **My jobs**：已开始的岗位；也可以粘贴任意来源的 JD 新建岗位。
+- **每个岗位**（Start 或粘贴后自动完成，2026-09 实测约 5 秒）：
+  1. **What this job asks for**：DeepSeek 按行号挑出 JD 中的要求行，程序逐字复制原文，因此不会编造要求；全部自动计入。可以把某行改为 “Not a requirement”、补充漏掉的原文或让 DeepSeek 重新找；保存后简历自动重新准备。
+  2. **Your CV for this job**：简历只用你的简历本身所用的语言（按 profile 中姓名填写的语言判断；只填英文名就只有英文简历，中文 JD 也用英文简历）。自动生成草稿、按岗位措辞改写（每行通过事实检查）、再由 DeepSeek 提出结构调整：栏目顺序、项目和条目顺序、删去对这个岗位没有帮助的条目。每项改动都列出理由，可以单独撤销或恢复，不需要再调用 DeepSeek。勾选“已阅读简历和全部改动”后批准，再生成并下载最终 PDF。另一种语言可一键准备。
+  3. **Not on your CV yet**：只列出没有任何已确认事实能说明的要求（已满足的不显示）。每条缺口 DeepSeek 最多建议一处补充：给某行技能加上工具名，或在某段经历/项目下加一行。**只有你点 “True for me” 才会加入**：技能会成为该技能行的新确认版本，新的一行会成为新确认事实并写入 profile（旧 profile 先备份到 `profile-history/`），然后重新准备简历；点 “Not true” 则保留为缺口，不会进入简历。年限、资深程度、学历或个人特质类要求不给建议；含数字、领导类用词或与简历已有内容重复的建议会被丢弃。
 
 说明：
 
 - 关注的公司和下载的岗位保存在 `.local/listings.db`（与事实库分开；删除它只会丢掉公司列表和下载的岗位）。第一次创建时预置 `starter_boards.json` 里的 30 家公司，之后删掉的公司不会自动回来。在页面下方 Companies 里粘贴 `boards.greenhouse.io/…`、`jobs.lever.co/…` 或 `jobs.ashbyhq.com/…` 链接即可添加公司。
 - 打开 Find jobs 时，超过 24 小时未更新的公司会自动重新下载（每次 4 家并行，2026-09 实测 30 家约 6 秒）；没有后台定时任务。只向公开招聘板发送不含个人信息的 GET 请求；排序完全在本机进行。
 - 排序数字是词面计数，不是匹配度或录取概率。实测 “AI” 出现在 79% 的岗位里，所以数字只适合比较先后。技能标签与岗位的匹配结果会保存在 `listings.db`，只有岗位文字或已确认技能变化时才重新计算（约 9 千个岗位首次约 5 秒，之后约 0.05 秒）。
-- 每个岗位保存在 `.local/jobs/<岗位编号>/`，每一步一个文件。重做某一步时，这一步和之后的文件会移到该岗位的 `history/`，不会被覆盖或删除。
+- 每个岗位保存在 `.local/jobs/<岗位编号>/`，每一步一个文件。重做某一步时，这一步和之后的文件会移到该岗位的 `history/`，不会被覆盖或删除。简历只依赖要求（`decided`），与 talking points 无关，所以生成 talking points 不会影响简历。
+- 结构调整的限制：教育经历始终保留且位置不变；工作经历保持时间顺序且每段至少保留一行；只能排序和删去已有行，不能新增或跨条目移动。简历文件保存全部行，撤销任何一项改动只是换一种显示方式。
+- 所有 DeepSeek 请求都用 temperature 0。即便如此，边界要求（如 “architect distributed systems”）在不同次检查中仍可能被判为已满足或缺口；缺口列表按岗位保存，只有点 “Check again” 才会重新判断。
+- 发给 DeepSeek 的只有：JD 原文行、简历各行文字（已确认事实或其改写）和岗位要求；不发送姓名、联系方式、学校、公司或项目名称。DeepSeek 不可用时退回标题规则提取要求，简历停在最后成功的一步并提示可重试。
 - 只接受发往 127.0.0.1/localhost 的请求；所有接口都需要页面启动时生成的随机令牌（预览和下载链接把同一令牌放在地址里）。其他网站无法读取你的事实，也无法触发 DeepSeek 调用。
 - 可用 `--facts-db`、`--jobs`、`--profile`、`--port` 修改路径和端口；`listings.db` 放在事实库所在目录。
 - 网页测试需要虚拟环境：`.venv/bin/python -m unittest`；直接用 `python3` 运行时网页测试会自动跳过。

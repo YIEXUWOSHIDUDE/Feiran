@@ -99,8 +99,14 @@ def chat_json(
     effort: str = DEFAULT_EFFORT,
     api_key: str | None = None,
     post: Callable[[dict[str, Any], str], dict[str, Any]] = _post,
+    temperature: float = 0,
 ) -> dict[str, Any]:
-    """Ask for one JSON object; retry once on the documented empty-content case."""
+    """Ask for one JSON object; retry once on the documented empty-content case.
+
+    Temperature 0 by default: every use here is a structured task (picking lines, matching,
+    planning, checked rewording), and the same question should get the same answer. At the
+    API default the same job gave 11 gaps in one run and 4 in the next (2026-09).
+    """
     if effort not in EFFORTS:
         raise DeepSeekError(f"reasoning effort 必须是：{', '.join(EFFORTS)}")
     payload = {
@@ -108,6 +114,7 @@ def chat_json(
         "messages": messages,
         "response_format": {"type": "json_object"},
         "reasoning_effort": effort,
+        "temperature": temperature,
         "max_tokens": MAX_TOKENS,
         "stream": False,
     }
