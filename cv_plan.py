@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from cv import CVError, _job_summary
+from cv import CVError, _job_summary, requirement_briefs
 from cv_layout import describe_changes, guarded_layout, original_layout
 from deepseek_client import DEFAULT_MODEL, DeepSeekError, chat_json
 
@@ -20,8 +20,8 @@ from deepseek_client import DEFAULT_MODEL, DeepSeekError, chat_json
 PLAN_VERSION = 1
 MAX_REASON_CHARACTERS = 200
 PLAN_RULES = """You arrange a one-page resume for one job application and reply in json only.
-You get the job title, its requirements, and the resume as sections of entries, each with line
-ids and texts. Put the evidence most relevant to this job first and leave out what does not
+You get the job title, its requirements (each "required", "preferred" or "unclear"; required ones
+matter most), and the resume as sections of entries, each with line ids and texts. Put the evidence most relevant to this job first and leave out what does not
 help this job:
 - "sections": section names in the order to show them. Leave out a section that does not help
   this job. Education always stays, in its current place.
@@ -85,7 +85,7 @@ def plan_draft(
     }
     request = {
         "job_title": job_summary["title"],
-        "job_requirements": [item["text"] for item in job["selected_requirements"]],
+        "job_requirements": requirement_briefs(job),
         "resume": [
             {"section": section["kind"], "entries": [
                 {"entry": entry["entry"], "lines": [{"id": fact_id, "text": texts[fact_id]} for fact_id in entry["lines"]]}

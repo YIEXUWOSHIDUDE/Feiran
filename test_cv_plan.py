@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 
@@ -52,6 +53,19 @@ class CVPlanTests(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_the_planner_is_told_which_requirements_are_only_preferred(self):
+        data = {"jd": {"text": "Requirements:\n- Experience with Python\nNice to have:\n- Writing unit tests for services",
+                       "title": "Backend Intern", "source": None, "captured_at": "2026-09-26T00:00:00+00:00"},
+                "facts": [], "selected_requirements": []}
+        proposed = propose_requirements(data)
+        job = apply_requirement_decisions(proposed, {item["id"] for item in proposed["requirement_candidates"]}, set())
+        planner = FakePlanner(CUT_API)
+        plan_draft(self.draft, job, chat=planner)
+        self.assertEqual(json.loads(planner.messages[-1]["content"])["job_requirements"], [
+            {"text": "Experience with Python", "strength": "required"},
+            {"text": "Writing unit tests for services", "strength": "preferred"},
+        ])
 
     def test_plan_orders_and_cuts_with_reasons_and_sends_no_names(self):
         planner = FakePlanner(CUT_API)

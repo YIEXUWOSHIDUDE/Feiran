@@ -69,6 +69,56 @@ class ClaimCheckTests(unittest.TestCase):
         # Testing is not in the source in any language, so it is still a new claim.
         self.assertEqual(added, ["原事实中没有这个技术或技能词：测试"])
 
+    def test_changes_of_meaning_are_rejected_even_without_new_words_of_a_known_kind(self):
+        # The first four come from the 2026-09 review: each passed the older checks.
+        cases = [
+            ("Built 2 services in 3 weeks.", "Built 3 services in 2 weeks."),
+            ("Built a prototype used by 2 testers.", "Built a production system used by 2 million customers."),
+            ("Studied deployment; did not deploy the services.", "Deployed the services to production."),
+            ("Managed a class project.", "Led the engineering organization."),
+            ("Studied deployment; did not deploy the services.", "将这些服务部署到生产环境。"),
+            # Each of these is caught by one rule alone.
+            ("Built a tool used by 2 testers.", "Built a tool used by 2 million testers."),
+            ("Did not deploy the services.", "Deployed the services."),
+            ("Helped build the billing service.", "Built the billing service."),
+            ("Coursework (in progress): Algorithms", "Coursework: Algorithms"),
+            ("Managed the release checklist.", "Led the release checklist."),
+            # Found in review by Codex (gpt-6-astra, 2026-09-27).
+            ("Built 2 services in 3 weeks.", "Built 3 backend services in 2 calendar weeks."),
+            ("Built 2 services in 3 weeks.", "2 周内完成 3 个服务。"),
+            ("Built the service but did not deploy it.", "Built and deployed the service without downtime."),
+            ("不使用第三方库构建解析器。", "使用第三方库构建解析器。"),
+            ("为2亿用户提供服务。", "Served 2 billion users."),
+        ]
+        for source, rewrite in cases:
+            with self.subTest(rewrite=rewrite):
+                self.assertNotEqual(check_rewrite(rewrite, source), [])
+
+    def test_rewordings_and_translations_that_keep_the_meaning_still_pass(self):
+        cases = [
+            ("Built 2 services in 3 weeks.", "In 3 weeks, built 2 services."),
+            ("Built 2 services in 3 weeks.", "3 周内完成 2 个服务。"),
+            ("Built a prototype used by 2 testers.", "Built a prototype that 2 testers used."),
+            ("Built a prototype used by 2 testers.", "开发了供 2 名测试人员使用的原型。"),
+            ("Studied deployment; did not deploy the services.", "Studied deployment but did not deploy the services."),
+            ("Studied deployment; did not deploy the services.", "学习了部署，但没有部署这些服务。"),
+            ("Built the parser without third-party libraries.", "不依赖第三方库构建解析器。"),
+            ("Managed a class project.", "Managed a course project."),
+            ("Managed a class project.", "管理一个课程项目。"),
+            ("Led REST API design with 2 teammates.", "带领 2 名队友设计 REST API。"),
+            ("Trained machine learning models for classification.", "训练用于分类的机器学习模型。"),
+            ("训练用于分类的机器学习模型。", "Trained machine learning models for classification."),
+            ("Not only built but also tested the parser.", "Built and tested the parser."),
+            ("Built tools for customers.", "为客户构建工具。"),
+            ("Built tools for clients.", "为客户构建工具。"),
+            ("Built 3 backend services in 2 weeks.", "In 2 weeks, built 3 services."),
+            ("Did not use third-party libraries.", "Built without using third-party libraries."),
+            ("不断优化查询性能。", "Continuously optimized query performance."),
+        ]
+        for source, rewrite in cases:
+            with self.subTest(rewrite=rewrite):
+                self.assertEqual(check_rewrite(rewrite, source), [])
+
     def test_malformed_lines_are_rejected(self):
         for text in ["  ", "Designed REST APIs.\nAnd more.", "Designed REST APIs, see https://example.com.", "x" * 301]:
             with self.subTest(text=text[:24]):

@@ -72,7 +72,7 @@ from workspace import DEFAULT_ROOT, Workspace, WorkspaceError
 WEB_DIR = Path(__file__).parent / "web"
 DEFAULT_PROFILE = Path(".local/cv-profile.json")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
-CANDIDATE_FIELDS = ("id", "text", "section", "status", "extraction_method")
+CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by", "extraction_method")
 CV_LANGUAGES = ("en", "zh")
 QUERY_TOKEN_PATHS = ("/preview/", "/download/")
 
@@ -380,13 +380,23 @@ def create_app(
         linked = apply_match_decisions(matches, facts_db, links, no_match, decided_by="auto")
         workspace.write(job_id, "linked", linked)
 
-    def prepare_automatically(job_id: str, excluded: frozenset[str] = frozenset()) -> None:
-        """Count every found requirement the user has not excluded, then prepare the CV."""
+    def prepare_automatically(job_id: str, kept: dict[str, str] | None = None) -> None:
+        """Keep the user's own decisions (requirement ID -> status), count every other found
+        requirement, then prepare the CV. What is counted this way is recorded as decided
+        automatically, never as reviewed."""
         candidates = require(job_id, "candidates")
         ids = {item["id"] for item in candidates["requirement_candidates"]}
+        kept = {key: status for key, status in (kept or {}).items() if key in ids}
+        confirmed = {key for key, status in kept.items() if status == "confirmed"}
+        excluded = {key for key, status in kept.items() if status == "excluded"}
         if not ids - excluded:
             return
-        workspace.write(job_id, "decided", apply_requirement_decisions(candidates, ids - excluded, excluded & ids))
+        decided = candidates
+        if confirmed or excluded:
+            decided = apply_requirement_decisions(decided, confirmed, excluded)
+        if ids - confirmed - excluded:
+            decided = apply_requirement_decisions(decided, ids - confirmed - excluded, set(), decided_by="auto")
+        workspace.write(job_id, "decided", decided)
         prepare_cv_quietly(job_id)
 
     def create_prepared_job(review_input: dict) -> str:
@@ -520,12 +530,17 @@ def create_app(
     @app.post("/api/jobs/{job_id}/requirements/add")
     def add_requirement(job_id: str, request: AddRequirementRequest) -> dict:
         decided = workspace.read(job_id, "decided") or {}
-        excluded = frozenset(
-            item["id"] for item in decided.get("requirement_candidates", []) if item.get("status") == "excluded"
-        )
-        added = add_manual_requirements(require(job_id, "candidates"), [request.text])
+        # What the user decided stays; only they ever exclude a line.
+        kept = {
+            item["id"]: item["status"] for item in decided.get("requirement_candidates", [])
+            if item.get("decided_by") == "user" or item.get("status") == "excluded"
+        }
+        candidates = require(job_id, "candidates")
+        added = add_manual_requirements(candidates, [request.text])
         workspace.write(job_id, "candidates", added)
-        prepare_automatically(job_id, excluded)
+        for item in added["requirement_candidates"][len(candidates["requirement_candidates"]):]:
+            kept[item["id"]] = "confirmed"  # the user added it as a requirement
+        prepare_automatically(job_id, kept)
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/requirements/find")

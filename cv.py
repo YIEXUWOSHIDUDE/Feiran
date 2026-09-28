@@ -217,6 +217,12 @@ def _job_summary(job: Any) -> dict[str, Any] | None:
     }
 
 
+def requirement_briefs(job: dict[str, Any]) -> list[dict[str, str]]:
+    """Each counted requirement as a model sees it: its words and whether it is required,
+    preferred or unclear. Requirements saved before strengths were kept count as unclear."""
+    return [{"text": item["text"], "strength": item.get("strength") or "unclear"} for item in job["selected_requirements"]]
+
+
 def build_draft(
     profile: Any,
     facts_db: Path,
@@ -629,7 +635,9 @@ Rules:
    add no numbers, metrics, technologies, tools, team sizes, results or impact.
 2. Keep the strength of every claim. "Developed", "implemented" or "participated" must never
    become "led", "owned", "managed", "spearheaded" or "responsible for"; in Chinese do not use
-   主导、带领、领导、牵头、负责 or 统筹 unless the line itself says so.
+   主导、带领、领导、牵头、负责 or 统筹 unless the line itself says so. Keep every qualifier and
+   negation ("prototype", "course project", "helped", "in progress", "internal", "not",
+   "without") and add no scale or audience words such as "production", "customers" or "million".
 3. Keep technology names, product names and numbers exactly as written; do not translate them.
 4. You may reorder and reword so the parts relevant to the job requirements come first, using
    only content already in the line.
@@ -685,7 +693,7 @@ def tailor_draft(
     request = {
         "target_language": language,
         "job_title": job_summary["title"] if job_summary else None,
-        "job_requirements": [item["text"] for item in job["selected_requirements"]] if job_summary else [],
+        "job_requirements": requirement_briefs(job) if job_summary else [],
         "lines": requested,
     }
     messages = [

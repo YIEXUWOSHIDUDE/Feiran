@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from cv import build_draft
-from facts import list_facts
+from facts import list_facts, revise_fact
 from gaps import SUGGEST_RULES, accept_gap, decline_gap, find_gaps
 from matching import MATCH_RULES
 from requirement_flow import apply_requirement_decisions, propose_requirements
@@ -80,6 +80,8 @@ class GapTests(unittest.TestCase):
                          ("bullet", "Example Corp", ["integration tests"]))
         for private in ("Alex Example", "alex@example.com", "Example Corp", "Example University"):
             self.assertFalse(any(private in sent for sent in chat.sent))
+        self.assertEqual({item["strength"] for item in gaps["gaps"]}, {"required"})
+        self.assertEqual({item["strength"] for item in json.loads(chat.sent[-1])["gaps"]}, {"required"})
 
     def test_suggestions_that_claim_numbers_or_leadership_are_dropped(self):
         def overclaiming(ids):
@@ -122,6 +124,74 @@ class GapTests(unittest.TestCase):
                          [("confirmed", "experience", ["integration tests"])])
         self.assertEqual(profile["sections"][1]["entries"][0]["facts"][-1], added[0]["id"])
         self.assertEqual(PROFILE, original)  # the caller's profile is not changed in place
+
+    def test_a_new_line_goes_under_its_own_employer_even_after_the_layout_changes(self):
+        gaps, _ = self.gaps()
+        requirement = next(item["requirement_id"] for item in gaps["gaps"] if "integration" in item["text"])
+        moved = copy.deepcopy(PROFILE)
+        moved["sections"][1]["entries"].insert(0, {"title": "Other Co", "dates": "2024", "facts": []})
+        _, profile = accept_gap(gaps, requirement, self.database, moved)
+        entries = profile["sections"][1]["entries"]
+        self.assertEqual(entries[0]["facts"], [])
+        self.assertEqual(len(entries[1]["facts"]), 3)  # Example Corp, now second
+
+    def test_a_suggestion_whose_entry_or_line_changed_since_is_refused(self):
+        gaps, _ = self.gaps()
+        bullet = next(item["requirement_id"] for item in gaps["gaps"] if "integration" in item["text"])
+        skill = next(item["requirement_id"] for item in gaps["gaps"] if "Docker" in item["text"])
+        renamed = copy.deepcopy(PROFILE)
+        renamed["sections"][1]["entries"][0]["title"] = "Example Corporation"
+        with self.assertRaisesRegex(ValueError, "重新检查缺口"):
+            accept_gap(gaps, bullet, self.database, renamed)
+        twice = copy.deepcopy(PROFILE)  # two entries that look the same: no way to tell which
+        twice["sections"][1]["entries"].append({**twice["sections"][1]["entries"][0], "facts": []})
+        with self.assertRaisesRegex(ValueError, "重新检查缺口"):
+            accept_gap(gaps, bullet, self.database, twice)
+        revise_fact(self.database, "fact-skills-languages", text="Languages: Python, Java, Go")
+        with self.assertRaisesRegex(ValueError, "重新检查缺口"):
+            accept_gap(gaps, skill, self.database, PROFILE)
+        self.assertEqual([fact["text"] for fact in list_facts(self.database)
+                          if fact["text"] == "Wrote integration tests for internal services."], [])
+
+    def test_accepting_again_after_an_interrupted_save_adds_nothing_twice(self):
+        # Each step can be repeated: if saving stops before the gap is marked added, the gap
+        # stays open and accepting it again finishes the job without duplicates.
+        gaps, _ = self.gaps()
+        bullet = next(item["requirement_id"] for item in gaps["gaps"] if "integration" in item["text"])
+        skill = next(item["requirement_id"] for item in gaps["gaps"] if "Docker" in item["text"])
+        _, saved = accept_gap(gaps, bullet, self.database, PROFILE)
+        accept_gap(gaps, skill, self.database, saved)
+        updated, again = accept_gap(gaps, bullet, self.database, saved)
+        updated, _ = accept_gap(updated, skill, self.database, saved)
+        texts = [fact["text"] for fact in list_facts(self.database)]
+        skills = next(fact for fact in list_facts(self.database) if fact["id"] == "fact-skills-languages")
+        self.assertIsNone(again)  # the saved profile already lists the line
+        self.assertEqual(texts.count("Wrote integration tests for internal services."), 1)
+        self.assertEqual((skills["version"], skills["status"]), (2, "confirmed"))
+        self.assertEqual({item["requirement_id"]: item["status"] for item in updated["gaps"]}[skill], "added")
+
+    def test_accepting_never_confirms_a_version_the_user_has_not_seen(self):
+        # Found in review by Codex: a pending version with the suggested text may carry other,
+        # unreviewed tags, so it is left for the Facts page instead of being confirmed here.
+        gaps, _ = self.gaps()
+        skill = next(item["requirement_id"] for item in gaps["gaps"] if "Docker" in item["text"])
+        revise_fact(self.database, "fact-skills-languages", text="Languages: Python, Java, Docker, Kubernetes",
+                    tags=["Python", "Java", "Docker", "Kubernetes", "AWS"])
+        with self.assertRaisesRegex(ValueError, "Facts"):
+            accept_gap(gaps, skill, self.database, PROFILE)
+        skills = next(fact for fact in list_facts(self.database) if fact["id"] == "fact-skills-languages")
+        self.assertEqual(skills["status"], "pending")
+
+    def test_a_line_found_under_another_entry_is_not_counted_as_added(self):
+        # Found in review by Codex: after an interrupted save the line was moved elsewhere, so
+        # the entry the suggestion was for still lacks it.
+        gaps, _ = self.gaps()
+        bullet = next(item["requirement_id"] for item in gaps["gaps"] if "integration" in item["text"])
+        _, saved = accept_gap(gaps, bullet, self.database, PROFILE)
+        line = saved["sections"][1]["entries"][0]["facts"].pop()
+        saved["sections"][1]["entries"].append({"title": "Other Co", "dates": "2024", "facts": [line]})
+        with self.assertRaisesRegex(ValueError, "重新检查缺口"):
+            accept_gap(gaps, bullet, self.database, saved)
 
     def test_a_declined_or_unsuggested_gap_stays_off_the_cv(self):
         gaps, _ = self.gaps()

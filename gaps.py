@@ -9,12 +9,12 @@ like any other. Only requirement texts and CV line texts are sent, never names o
 
 import copy
 import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from claims import LINK, NUMBER, _leadership
+from cv import CVError, _localized
 from cv_layout import original_layout
 from deepseek_client import DEFAULT_MODEL, DeepSeekError
 from facts import add_fact, confirm_fact, load_current_facts, revise_fact, tag_pattern
@@ -44,7 +44,22 @@ Reply as {"suggestions": [{"requirement": "<gap id>", "kind": "skill", "line": "
 "text": "...", "tags": ["..."]}, {"requirement": "<gap id>", "kind": "none"}]}"""
 
 
-def _resume(draft: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, tuple[str, str]]]:
+def _entry_key(kind: str, fields: dict[str, Any]) -> str:
+    """An entry told apart by what it shows, not by its position: a suggestion made for one
+    employer must never land under another after the layout changes."""
+    return json.dumps([kind, *(fields.get(field) for field in ("title", "subtitle", "location", "dates"))],
+                      ensure_ascii=False)
+
+
+def _profile_entry_key(kind: str, entry: Any, language: str) -> str | None:
+    try:
+        return _entry_key(kind, {field: _localized(entry.get(field), language, field, [])
+                                 for field in ("title", "subtitle", "location", "dates")})
+    except (AttributeError, CVError):
+        return None
+
+
+def _resume(draft: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, tuple[str, str, str]]]:
     """The CV as ids and line texts, the skills lines by fact ID, and bullet entries by ID."""
     texts = {
         line["fact_id"]: line.get("source_text") or line["text"]
@@ -67,7 +82,8 @@ def _resume(draft: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str]
     for i, section in enumerate(draft["sections"]):
         if section["kind"] in BULLET_TYPES:
             for j, entry in enumerate(section["entries"]):
-                entries[f"s{i}e{j}"] = (section["kind"], entry.get("title") or section["title"])
+                entries[f"s{i}e{j}"] = (section["kind"], entry.get("title") or section["title"],
+                                        _entry_key(section["kind"], entry))
     return resume, skills, entries
 
 
@@ -80,7 +96,7 @@ def _existing_lines(draft: dict[str, Any]) -> list[str]:
 
 
 def _suggestion(
-    item: Any, skills: dict[str, str], entries: dict[str, tuple[str, str]], existing: list[str]
+    item: Any, skills: dict[str, str], entries: dict[str, tuple[str, str, str]], existing: list[str]
 ) -> dict[str, Any] | None:
     """Keep a suggestion only if it points at a real line or entry, adds something the CV does
     not already say, and claims nothing more than plain use."""
@@ -113,8 +129,8 @@ def _suggestion(
             tag.strip() for tag in (item.get("tags") if isinstance(item.get("tags"), list) else [])
             if isinstance(tag, str) and tag.strip() and tag_pattern(tag.strip()).search(text)
         ]
-        kind, where = entries[item["entry"]]
-        return {"kind": "bullet", "entry": item["entry"], "fact_type": BULLET_TYPES[kind],
+        kind, where, key = entries[item["entry"]]
+        return {"kind": "bullet", "entry": item["entry"], "entry_key": key, "fact_type": BULLET_TYPES[kind],
                 "text": text, "tags": list(dict.fromkeys(tags))[:MAX_TAGS], "where": where}
     return None
 
@@ -130,7 +146,8 @@ def find_gaps(
     matches = propose_matches(decided, facts_db, chat=chat, effort=effort)
     covered = {item["requirement_id"] for item in matches["match_candidates"]}
     gaps = [
-        {"requirement_id": item["id"], "text": item["text"], "suggestion": None, "status": "open"}
+        {"requirement_id": item["id"], "text": item["text"], "strength": item.get("strength") or "unclear",
+         "suggestion": None, "status": "open"}
         for item in decided["selected_requirements"] if item["id"] not in covered
     ]
     suggesting: dict[str, Any] = {}
@@ -138,7 +155,7 @@ def find_gaps(
         resume, skills, entries = _resume(draft)
         request = {
             "job_title": decided["jd"].get("title"),
-            "gaps": [{"id": gap["requirement_id"], "text": gap["text"]} for gap in gaps],
+            "gaps": [{"id": gap["requirement_id"], "text": gap["text"], "strength": gap["strength"]} for gap in gaps],
             "resume": resume,
         }
         messages = [
@@ -184,6 +201,11 @@ def accept_gap(
     A skill becomes a new confirmed version of that skills line, already on the CV. A bullet
     becomes a new confirmed fact and a new profile (returned) lists it under its entry; the
     caller's profile is not changed in place.
+
+    A suggestion applies only to what it was made for: the skills line with the same text, or
+    the entry with the same name, role, place and dates wherever it now sits. Every step
+    can be repeated, so if saving stops before the caller records the gap as added, accepting
+    it again finishes the job without adding anything twice.
     """
     updated = copy.deepcopy(gaps)
     gap = _gap(updated, requirement_id)
@@ -198,18 +220,38 @@ def accept_gap(
     if suggestion["kind"] == "skill":
         fact_id = suggestion["fact_id"]
         current = load_current_facts(facts_db, [fact_id]).get(fact_id)
-        if current is None or current["status"] != "confirmed" or current["text"] != suggestion["where"]:
+        if current is not None and current["text"] == suggestion["new_text"]:
+            # Added before. A pending version with this text may carry other tags nobody has
+            # reviewed, so it is confirmed on the Facts page, never here.
+            if current["status"] != "confirmed":
+                raise ValueError("这行技能有一个尚未确认的新版本，请先在 Facts 页面核对确认，再重新检查缺口")
+        elif current is not None and current["status"] == "confirmed" and current["text"] == suggestion["where"]:
+            revised, _ = revise_fact(facts_db, fact_id, text=suggestion["new_text"],
+                                     tags=[*current["tags"], *suggestion["items"]])
+            confirm_fact(facts_db, fact_id, revised["version"])
+        else:
             raise ValueError("这行技能已经改变，请重新检查缺口")
-        revised, _ = revise_fact(facts_db, fact_id, text=suggestion["new_text"],
-                                 tags=[*current["tags"], *suggestion["items"]])
-        confirm_fact(facts_db, fact_id, revised["version"])
     else:
+        places = [
+            (i, j) for i, section in enumerate(profile["sections"]) for j, entry in enumerate(section.get("entries", []))
+            if suggestion.get("entry_key") is not None
+            and _profile_entry_key(section.get("kind"), entry, gaps["language"]) == suggestion["entry_key"]
+        ]
+        if len(places) != 1:
+            raise ValueError(f"建议所属的条目（{suggestion['where']}）已经改变，请重新检查缺口")
         fact, _ = add_fact(facts_db, suggestion["text"], suggestion["fact_type"], suggestion["tags"])
         confirm_fact(facts_db, fact["id"], fact["version"])
         fact_id = fact["id"]
-        section, entry = (int(number) for number in re.fullmatch(r"s(\d+)e(\d+)", suggestion["entry"]).groups())
-        new_profile = copy.deepcopy(profile)
-        new_profile["sections"][section]["entries"][entry].setdefault("facts", []).append(fact_id)
+        section, entry = places[0]
+        elsewhere = {
+            known for i, other in enumerate(profile["sections"]) for j, listed in enumerate(other.get("entries", []))
+            if (i, j) != (section, entry) for known in listed.get("facts") or []
+        }
+        if fact_id in elsewhere:
+            raise ValueError(f"这一行已在简历的其他条目下，不在 {suggestion['where']}；请重新检查缺口")
+        if fact_id not in (profile["sections"][section]["entries"][entry].get("facts") or []):
+            new_profile = copy.deepcopy(profile)
+            new_profile["sections"][section]["entries"][entry].setdefault("facts", []).append(fact_id)
     gap.update(status="added", fact_id=fact_id)
     return updated, new_profile
 

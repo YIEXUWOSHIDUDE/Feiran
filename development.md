@@ -238,6 +238,18 @@ v3 根据 2026-09 下载的 8,787 个公开岗位补充了各公司常用的要�
 
 同时修复了中文翻译被误拒：事实检查原来只按字面比对，把“前端”“后端”（英文原句中的 frontend、backend 的翻译）和单复数不同的 “API/APIs” 当成新增技能，导致这些行退回英文。`claims.EQUIVALENTS` 列出常见中英技术词的对应关系，并把英文单复数视为同一词；原句在任何语言中都没有的词仍会被拒绝。论文标题保持英文原题，这也是中文简历的常见做法。
 
+## 证据与审核的可靠性（2026-09-27，第一轮）
+
+依据一份外部改进计划（保持现有方向：自动准备、用户审核批准；不增加 agent 或服务），先做了三项确定性修正：
+
+- **事实检查**（`claims.check_rewrite`）：原来只检查新增数字、技术词和领导词，计划中的四个歪曲例子全部通过。现在另外拒绝：数字挪到别的对象（“2 services in 3 weeks” → “3 services in 2 weeks”，比较“数字 + 其后名词”）；原文有而改写没有的否定（not/never/without，中文用“没有、未、不是”等明确词判断原文，改写只要含“不、没、未、无、非”等即算保留，避免误拒正确翻译）；丢掉的限定词（prototype、course/class project、helped、contributed、partially、studied、in progress、internal 等，含中文对应）；新增的范围词（million、production、customers、enterprise、organization、revenue 等）；领导词按词比对（原文 “Managed” 不再支持改写中的 “Led”）。“机器学习”中的“学习”、“未来”中的“未”不算。测试含上述拒绝例子和应通过的改写、翻译；用户职位文件夹中已保存的 27 条真实 DeepSeek 改写在新规则下仍全部通过。改写提示也加入了保留限定与否定、不加范围词的要求。
+- **缺口建议绑定**（`gaps.accept_gap`）：新行建议按条目内容（栏目、名称、角色、地点、日期）而非位置 `s1e0` 找到所属条目；条目改名、消失或出现两个相同条目时拒绝并提示重新检查；技能建议要求该技能行文字未变。每一步都可重复：事实按内容去重、已确认的版本再确认无副作用、profile 中已有该事实就不再添加、已改好的技能行直接确认，缺口状态最后才写为 added，因此中途失败后再点一次即可完成且不重复。旧的缺口文件没有条目标识，新行建议需要重新检查。
+- **要求的来源与强度**（`requirement_flow`）：每条候选要求记录 `strength`（required/preferred/unclear）与 `section`（所在标题）。强度依次按该行自身用词（a plus、preferred、nice to have、must、required…）、DeepSeek 给的 kind、所在标题判断；都没有就是 unclear，不再默认为必需。`apply_requirement_decisions` 记录 `decided_by`：网页自动计入为 auto，用户保存或手动添加为 user；补充漏掉的行时保留用户已做的决定。`selected_requirements` 带上 strength 与 decided_by，改写、结构调整和缺口建议的请求都附带强度（旧文件缺省为 unclear）；页面显示每行的强度与“自动计入/经你审核”，缺口显示非必需要求的强度。另把 “must-have skills”“nice-to-have skills” 加入要求标题。
+
+之后请 Codex（gpt-6-astra，high，只读）审查这些改动，它用合成输入复现了 7 个问题，均已修正并加为测试：数字换位只看数字后第一个词（“3 backend services in 2 calendar weeks” 和中文“2 周内完成 3 个服务”可绕过；现在取数字后名词短语的中心词，并按“时间/百分比/数量”类别比较，跨语言也能发现时间与数量互换）；否定只看有没有否定词（新增的 “without downtime” 掩盖了删掉的 “did not deploy”；现在英文逐个比对被否定的词，翻译中已知译名须紧跟否定，“not only … but also” 不算否定，中文原文的“不”计入但排除“不断、不同、不仅”等）；billion 与“亿”相差十倍；“客户”同时属于 customer 与 client 两组导致误拒（现在一个词只要任一所属组在原文有支持即可）；缺口重试会确认别人未审核过标签的待确认版本（现在拒绝并提示先在 Facts 页核对）；事实已在其他条目下时被当作添加成功（现在拒绝）；“优先队列”被当作“优先”，“not required” 被当作必需。修正后 188 个测试通过，27 条真实改写仍全部通过。
+
+尚未做（计划第 4–7 项）：各步骤失败原因持久化并显示；区分“有证据”与“在这份简历中显示”；语义复核的测试集与 DeepSeek/Jev 对比；文档整体更新。
+
 ## 上传简历（2026-09-27）
 
 用户问为什么不能上传简历。此前事实和 profile 只能手写 JSON 再用命令行导入。用户选择“上传，联系方式留在本机”：

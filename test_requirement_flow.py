@@ -233,19 +233,36 @@ Planning meetings with the team
 
     def test_deepseek_chooses_lines_by_number_and_their_text_is_copied_exactly(self):
         finder = FakeFinder([
-            {"line": 7, "kind": "preferred"}, {"line": 4, "kind": "required"}, {"line": 5},
+            {"line": 7, "kind": "preferred"}, {"line": 4, "kind": "required"}, {"line": 5}, {"line": 2},
             {"line": 1, "kind": "required"}, {"line": 99, "kind": "required"}, {"line": "4"},
         ])
         candidates, details = find_requirements_with_model(BOARD_JD, finder, title="ML Engineer")
         sent = json.loads(finder.messages[-1]["content"])
+        # Without a strength from DeepSeek, the heading decides; with no sign at all it stays
+        # unclear instead of silently becoming required.
         self.assertEqual(
-            [(item["text"], item["section"]) for item in candidates],
-            [("Mastery of Python", "Required"), ("Strong SQL skills", "Required"), ("Experience with Kubernetes", "Preferred")],
+            [(item["text"], item["strength"], item["section"]) for item in candidates],
+            [("Build ML services.", "unclear", "About the role"),
+             ("Mastery of Python", "required", "Must-Have Skills"), ("Strong SQL skills", "required", "Must-Have Skills"),
+             ("Experience with Kubernetes", "preferred", "Nice-to-Have Skills")],
         )
         self.assertEqual({item["extraction_method"] for item in candidates}, {"deepseek-lines-v1"})
         self.assertEqual(set(sent), {"job_title", "lines"})
         self.assertEqual(sent["lines"][3], {"n": 4, "text": "Mastery of Python"})
         self.assertEqual(details["model"], "deepseek-flash")
+
+    def test_heading_rules_keep_whether_a_line_is_required_preferred_or_unclear(self):
+        jd = (BOARD_JD + "Qualifications\nFamiliarity with Go\nRequirements\nExperience with Airflow is a plus\n"
+              "A degree is not required\n任职要求\n熟悉优先队列和图算法\n有开源经验者优先\n")
+        strengths = {item["text"]: item["strength"] for item in extract_requirement_candidates(jd)}
+        self.assertEqual(strengths, {
+            "Mastery of Python": "required", "Strong SQL skills": "required",
+            "Experience with Kubernetes": "preferred", "Familiarity with Go": "unclear",
+            "Experience with Airflow is a plus": "preferred",
+            # Found in review by Codex: "not required" is not required, and 优先队列 is a
+            # priority queue, not "preferred".
+            "A degree is not required": "unclear", "熟悉优先队列和图算法": "required", "有开源经验者优先": "preferred",
+        })
 
     def test_heading_rules_take_over_when_deepseek_fails_or_finds_nothing(self):
         for finder, reason in (
@@ -334,9 +351,22 @@ Benefits: Health insurance and a laptop
             "id": first_id,
             "text": "Experience building services with Python",
             "fact_id": None,
+            "strength": "required",
+            "decided_by": "user",
         }])
         self.assertEqual([item["status"] for item in decided["requirement_candidates"]], ["confirmed", "excluded"])
         self.assertEqual(build_report(decided)["items"][0]["evidence_status"], "未知")
+
+    def test_requirements_counted_automatically_are_not_recorded_as_reviewed(self):
+        proposed = propose_requirements(review_input())
+        first_id, second_id = [item["id"] for item in proposed["requirement_candidates"]]
+        automatic = apply_requirement_decisions(proposed, {first_id, second_id}, set(), decided_by="auto")
+        reviewed = apply_requirement_decisions(automatic, set(), {second_id})
+        self.assertEqual([item["decided_by"] for item in automatic["selected_requirements"]], ["auto", "auto"])
+        self.assertEqual([(item["status"], item["decided_by"]) for item in reviewed["requirement_candidates"]],
+                         [("confirmed", "auto"), ("excluded", "user")])
+        with self.assertRaises(RequirementError):
+            apply_requirement_decisions(proposed, {first_id}, set(), decided_by="someone")
 
     def test_pending_candidates_do_not_enter_review(self):
         proposed = propose_requirements(review_input())

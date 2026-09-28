@@ -177,6 +177,26 @@ class WebTests(unittest.TestCase):
         )
         self.assertIn(bad_id.status_code, (400, 404))
 
+    def test_requirements_counted_automatically_stay_marked_so_until_the_user_decides(self):
+        job_id = self.create_job()
+        automatic = self.job(job_id)
+        self.client.post(f"/api/jobs/{job_id}/requirements/add", json={"text": "有开源项目经历"}, headers=self.headers)
+        ids = {item["text"]: item["id"] for item in self.job(job_id)["candidates"]}
+        self.client.post(f"/api/jobs/{job_id}/requirements/decide", headers=self.headers, json={
+            "confirm": [ids["熟悉Python，了解SQL"], ids["有开源项目经历"]], "exclude": [ids["每周至少实习4天"]]})
+        self.client.post(f"/api/jobs/{job_id}/requirements/add", json={"text": "参与后端服务开发与测试"}, headers=self.headers)
+        later = self.job(job_id)
+        by_text = lambda view: {item["text"]: (item["status"], item["decided_by"]) for item in view["candidates"]}
+        self.assertEqual(set(by_text(automatic).values()), {("confirmed", "auto")})
+        self.assertEqual({item["text"]: item["strength"] for item in automatic["candidates"]},
+                         {"本科及以上学历，计算机相关专业": "required", "熟悉Python，了解SQL": "required", "每周至少实习4天": "required"})
+        self.assertEqual(by_text(later), {
+            "本科及以上学历，计算机相关专业": ("confirmed", "auto"),  # left out of the review: counted automatically
+            "熟悉Python，了解SQL": ("confirmed", "user"), "有开源项目经历": ("confirmed", "user"),
+            "每周至少实习4天": ("excluded", "user"), "参与后端服务开发与测试": ("confirmed", "user"),
+        })
+        self.assertEqual({item["text"]: item["strength"] for item in later["selected_requirements"]}["有开源项目经历"], "unclear")
+
     def decided_job(self):
         job_id = self.create_job()
         ids = {item["text"]: item["id"] for item in self.job(job_id)["candidates"]}

@@ -474,6 +474,20 @@ function progress(steps) {
     el("span", { class: `pill ${steps.includes(step) ? "done" : ""}` }, label)));
 }
 
+const STRENGTH_LABELS = { required: "Required", preferred: "Preferred (nice to have)", unclear: "Not marked required or preferred" };
+
+function strengthLabel(strength) {
+  return STRENGTH_LABELS[strength] || STRENGTH_LABELS.unclear;
+}
+
+// Who decided a line counts: the page by itself, or the user.
+function decidedLabel(item) {
+  if (item.extraction_method === "manual-quote-v1") return "added by you";
+  if (item.decided_by === "user") return "reviewed by you";
+  if (item.decided_by === "auto") return "counted automatically, not reviewed";
+  return "";
+}
+
 function requirementsPanel(view, refresh) {
   const choices = new Map();
   const rows = (view.candidates || []).map((item) => {
@@ -483,7 +497,7 @@ function requirementsPanel(view, refresh) {
     confirm.addEventListener("change", () => choices.set(item.id, "confirmed"));
     exclude.addEventListener("change", () => choices.set(item.id, "excluded"));
     return el("tr", {},
-      el("td", {}, item.text, el("div", { class: "muted" }, item.extraction_method === "manual-quote-v1" ? "added by you" : (item.section || ""))),
+      el("td", {}, item.text, el("div", { class: "muted" }, [strengthLabel(item.strength), item.section, decidedLabel(item)].filter(Boolean).join(" · "))),
       el("td", { class: "choice" }, el("label", {}, confirm, " Requirement")),
       el("td", { class: "choice" }, el("label", {}, exclude, " Not a requirement")),
     );
@@ -516,11 +530,13 @@ function requirementsPanel(view, refresh) {
     el("div", { class: "toolbar" }, save, findAgain),
   ];
   const counted = (view.selected_requirements || []).length;
+  const automatic = (view.selected_requirements || []).filter((item) => item.decided_by === "auto").length;
+  const summary = `${counted} requirement(s)${automatic ? `, ${automatic} counted automatically and not reviewed by you` : ""} — open to review or change`;
   // Once requirements count, the CV is what matters; the list folds away until needed.
   return el("section", { class: "panel step-panel requirements-panel" },
     el("h2", {}, "1. What this job asks for"),
-    el("p", { class: "muted" }, foundBy, " All of them count, and your CV below is adjusted to them. If a line is not really a requirement, choose Not a requirement and Save."),
-    counted ? el("details", {}, el("summary", {}, `${counted} requirement(s) — open to review or change`), body) : body,
+    el("p", { class: "muted" }, foundBy, " All of them count, and your CV below is adjusted to them. If a line is not really a requirement, choose Not a requirement and Save; saving also marks the list as reviewed by you."),
+    counted ? el("details", {}, el("summary", {}, summary), body) : body,
   );
 }
 
@@ -672,7 +688,8 @@ function gapsPanel(view, refresh) {
           actionButton("True for me — add it", post(`/${gap.requirement_id}/accept`)),
           actionButton("Not true", post(`/${gap.requirement_id}/decline`), true)));
     }
-    return el("div", { class: `requirement ${gap.status}` }, el("div", { class: "requirement-text" }, gap.text), detail);
+    const strength = gap.strength && gap.strength !== "required" ? el("span", { class: "muted auto" }, ` · ${strengthLabel(gap.strength)}`) : "";
+    return el("div", { class: `requirement ${gap.status}` }, el("div", { class: "requirement-text" }, gap.text, strength), detail);
   });
   const notes = [];
   if (gaps && gaps.suggesting && gaps.suggesting.fallback_reason) {
