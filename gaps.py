@@ -188,8 +188,7 @@ def _suggestion(
         if not items:
             return None
         items = items[:MAX_ITEMS]
-        return {"kind": "skill", "fact_id": fact_id, "items": items, "where": line,
-                "new_text": f"{line}, {', '.join(items)}"}
+        return {"kind": "skill", "fact_id": fact_id, "items": items, "where": line, "new_text": _joined(line, items)}
     if item.get("kind") == "bullet" and isinstance(item.get("entry"), str) and item["entry"] in entries:
         text = " ".join(item.get("text").split()) if isinstance(item.get("text"), str) else ""
         entry = entries[item["entry"]]
@@ -601,6 +600,16 @@ def accept_gap(
         if len(places) != 1:
             raise ValueError(f"建议所属的条目（{suggestion['where']}）已经改变，请重新检查缺口")
         section, entry = places[0]
+        # Added before, whatever skill words it was stored with (a retry after a save that
+        # stopped halfway may no longer have them): nothing more to write.
+        listed = profile["sections"][section]["entries"][entry].get("facts") or []
+        there = load_current_facts(facts_db, listed)
+        before = next((fact_id for fact_id in listed if (there.get(fact_id) or {}).get("text") == suggestion["text"]), None)
+        if before is not None:
+            if there[before]["status"] != "confirmed":
+                raise ValueError("这一行已在该条目下，但尚未确认，请先在 Facts 页面核对确认")
+            gap.update(status="added", fact_id=before)
+            return updated, None
         elsewhere = {
             known for i, other in enumerate(profile["sections"]) for j, listed in enumerate(other.get("entries", []))
             if (i, j) != (section, entry) for known in listed.get("facts") or []
@@ -623,6 +632,18 @@ def accept_gap(
 
 
 SKILL_SEPARATORS = re.compile(r"[,，、;；]")
+
+
+def _skill_items(line: str) -> str:
+    """The items of a skills line, after its label (Languages: … or 编程语言：…)."""
+    return re.split(r"[:：]", line, maxsplit=1)[-1]
+
+
+def _joined(line: str, items: list[str]) -> str:
+    """A skills line with items added in its own style: 、 or ， in a Chinese line."""
+    listed = _skill_items(line)
+    separator = "、" if "、" in listed else "，" if "，" in listed else ", "
+    return separator.join([line, *items])
 
 
 def places(cv: dict[str, Any]) -> list[dict[str, Any]]:
@@ -657,7 +678,7 @@ def write_line(
     text = " ".join(text.split()) if isinstance(text, str) else ""
     gap = _gap(gaps, requirement_id)
     if place["kind"] == "skill":
-        known = {item.strip().casefold() for item in SKILL_SEPARATORS.split(place["where"].split(":", 1)[-1])}
+        known = {item.strip().casefold() for item in SKILL_SEPARATORS.split(_skill_items(place["where"]))}
         items: list[str] = []
         for item in (part.strip() for part in SKILL_SEPARATORS.split(text)):
             if item and item.casefold() not in known:
@@ -668,7 +689,7 @@ def write_line(
         if len(items) > MAX_ITEMS or any(len(item) > MAX_ITEM_CHARACTERS for item in items):
             raise ValueError(f"一次最多加 {MAX_ITEMS} 项，每项最多 {MAX_ITEM_CHARACTERS} 个字符")
         suggestion = {"kind": "skill", "fact_id": place["fact_id"], "items": items, "where": place["where"],
-                      "new_text": f"{place['where']}, {', '.join(items)}"}
+                      "new_text": _joined(place["where"], items)}
     else:
         if not text:
             raise ValueError("请写要加入简历的一行")

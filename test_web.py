@@ -643,6 +643,26 @@ class WebTests(unittest.TestCase):
                                    json={"place": place, "text": "Something else."})
         self.assertEqual(refused.status_code, 400)
 
+    def test_a_line_that_is_saved_is_not_reported_as_refused_when_the_cv_cannot_be_prepared(self):
+        # Found in review by Codex: the line and the profile were saved, then preparing the CV
+        # failed on another fact waiting for confirmation, and the page showed a refusal.
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": "Requirements:\n- Hands-on Docker and Kubernetes"},
+                                  headers=self.headers).json()["job_id"]
+        self.chat.evidence = lambda request: [{"id": item["id"], "verdict": "none"} for item in request["requirements"]]
+        self.chat.gap_suggestions = lambda ids: []
+        gaps = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]
+        revise_fact(self.database, "fact-intern-tests", text="Wrote unit tests for the billing code.")  # now pending
+        place = next(place["id"] for place in gaps["places"] if place["kind"] == "bullet")
+        written = self.client.post(f"/api/jobs/{job_id}/gaps/{gaps['requirements'][0]['requirement_id']}/write",
+                                   headers=self.headers, json={"place": place, "text": "Deployed the internal tool with Docker."})
+        self.assertEqual(written.status_code, 200, written.text)
+        view = written.json()
+        self.assertEqual(view["gaps"]["requirements"][0]["suggestion_status"], "added")
+        draft_stage = next(stage for stage in view["cv"]["en"]["stages"] if stage["stage"] == "draft")
+        self.assertEqual((draft_stage["status"], draft_stage["reason_code"]), ("failed", "facts_not_confirmed"))
+
     def test_without_the_evidence_check_nothing_counts_as_shown_and_the_page_says_why(self):
         import_facts(self.database, CV_FACTS)
         confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])

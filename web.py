@@ -513,6 +513,15 @@ def create_app(
             stages.append(_stage_failure("layout", exc))
         record_stages(job_id, language, stages)
 
+    def prepare_again(job_id: str, language: str) -> None:
+        """Prepare the CV again after a line was saved. The line stays saved even when the CV
+        cannot be prepared (for example while another fact waits for confirmation): the CV
+        panel says why, so the save is never reported as refused."""
+        try:
+            prepare_cv(job_id, language)
+        except (CVError, FactStoreError):
+            pass
+
     def cv_languages() -> list[str]:
         """Languages the user's resume is written in; only those get CVs."""
         try:
@@ -791,7 +800,7 @@ def create_app(
         if profile is not None:
             save_profile(profile)
         workspace.write(job_id, "gaps", updated)
-        prepare_cv(job_id, gaps["language"])
+        prepare_again(job_id, gaps["language"])
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/write")
@@ -805,7 +814,7 @@ def create_app(
         if profile is not None:
             save_profile(profile)
         workspace.write(job_id, "gaps", updated)
-        prepare_cv(job_id, gaps["language"])
+        prepare_again(job_id, gaps["language"])
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/decline")

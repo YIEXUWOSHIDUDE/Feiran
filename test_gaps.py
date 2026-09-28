@@ -6,7 +6,7 @@ import unittest
 from cv import build_draft, tailor_draft
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError
-from facts import add_fact, confirm_fact, list_facts, revise_fact
+from facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
 from gaps import EVIDENCE_RULES, SUGGEST_RULES, accept_gap, coverage, decline_gap, find_gaps, places, write_line
 from requirement_flow import apply_requirement_decisions, propose_requirements
 from test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
@@ -340,6 +340,39 @@ class GapTests(unittest.TestCase):
         self.assertIn("Docker", skills["tags"])
         self.assertIsNone(profile)
         self.assertEqual(next(item for item in updated["requirements"] if item["requirement_id"] == docker)["status"], "added")
+
+    def test_writing_the_same_line_again_after_an_interrupted_save_adds_it_once(self):
+        # Found in review by Codex: the first try stored the line with the suggestion's skill
+        # words, the retry without them, and the two were told apart by those words.
+        gaps, _ = self.gaps()
+        tests = next(item["requirement_id"] for item in gaps["requirements"] if "integration" in item["text"])
+        entry = next(place for place in places(self.draft) if place["kind"] == "bullet")
+        line = "Wrote integration tests for deployed services."
+        _, saved = write_line(gaps, tests, entry["id"], line, self.draft, self.database, PROFILE)  # the gap is never saved
+        rechecked, _ = self.gaps(lambda ids: [])
+        _, again = write_line(rechecked, tests, entry["id"], line, self.draft, self.database, saved)
+        self.assertIsNone(again)  # the saved profile already lists it
+        self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line), 1)
+        # The same line waiting for confirmation under that entry is left for the Facts page.
+        pending, _ = add_fact(self.database, "Deployed the billing code.", "experience", [])
+        waiting = copy.deepcopy(saved)
+        waiting["sections"][1]["entries"][0]["facts"].append(pending["id"])
+        with self.assertRaisesRegex(ValueError, "Facts"):
+            write_line(rechecked, tests, entry["id"], "Deployed the billing code.", self.draft, self.database, waiting)
+        self.assertEqual(next(fact for fact in list_facts(self.database) if fact["id"] == pending["id"])["status"], "pending")
+
+    def test_skills_are_added_in_the_style_of_a_chinese_line(self):
+        # Found in review by Codex: the full-width colon kept the label on the first skill.
+        import_facts(self.database, [{"id": "fact-skills-zh", "type": "skill", "text": "编程语言：Python、Java", "tags": ["Python"]}])
+        confirm_facts(self.database, [("fact-skills-zh", 1)])
+        profile = copy.deepcopy(PROFILE)
+        profile["sections"][2]["entries"][0]["facts"] = ["fact-skills-zh"]
+        draft = build_draft(profile, self.database, "en")
+        gaps = find_gaps(decided_job(), draft, self.database, FakeDeepSeek(lambda ids: [], lambda request: []))
+        docker = next(item["requirement_id"] for item in gaps["requirements"] if "Docker" in item["text"])
+        write_line(gaps, docker, "skill:fact-skills-zh", "python，Go", draft, self.database, profile)
+        skills = next(fact for fact in list_facts(self.database) if fact["id"] == "fact-skills-zh")
+        self.assertEqual(skills["text"], "编程语言：Python、Java、Go")
 
     def test_a_line_of_ones_own_is_refused_when_empty_already_there_or_its_place_is_gone(self):
         gaps, _ = self.gaps(lambda ids: [])
