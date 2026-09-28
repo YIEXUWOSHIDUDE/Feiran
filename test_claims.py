@@ -90,6 +90,8 @@ class ClaimCheckTests(unittest.TestCase):
             ("不使用第三方库构建解析器。", "使用第三方库构建解析器。"),
             ("为2亿用户提供服务。", "Served 2 billion users."),
             ("没有部署服务。", "部署服务且没有停机。"),  # found in review of PR #1 by Codex
+            ("Did not deploy the service.", "Did not test but deployed the service."),  # found in review of PR #2
+            ("没有部署服务。", "没有测试但部署服务。"),
         ]
         for source, rewrite in cases:
             with self.subTest(rewrite=rewrite):

@@ -209,7 +209,7 @@ class WebTests(unittest.TestCase):
         paper = {"id": "fact-paper", "type": "achievement", "tags": ["parser"],
                  "text": "Alex Example and Sam Lee. Parser design. https://alex.example.com/paper. alex@example.com"}
         demo = {"id": "fact-demo", "type": "experience", "tags": ["parser"],
-                "text": "Showed the Example Corp parser demo at https://alex.example.com/demo."}
+                "text": "Showed the parser demo to the Example University robotics club."}
         import_facts(self.database, CV_FACTS + [paper, demo])
         confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS + [paper, demo]])
         profile = json.loads(json.dumps(PROFILE))
@@ -229,6 +229,23 @@ class WebTests(unittest.TestCase):
         for private in ("Alex", "alex.example.com", "alex@example.com", "Example University", "Example Corp", "Los Angeles"):
             self.assertNotIn(private, sent)
         self.assertIn("Alex Example and Sam Lee. Parser design.", preview)  # the CV itself is unchanged
+        # Found in review of PR #2 by Codex: the Chinese CV masked only the Chinese names, and a
+        # fact from an earlier CV named an employer the current CV no longer lists.
+        history = self.profile_path.parent / "profile-history"
+        history.mkdir(exist_ok=True)
+        (history / "cv-profile-20260101T000000000000.json").write_text(json.dumps(
+            {**PROFILE, "sections": [{"kind": "experience", "entries": [{"title": "Acme Corporation", "facts": []}]}]}), encoding="utf-8")
+        old = {"id": "fact-acme", "type": "experience", "tags": ["Python"], "text": "Built Python tools at Acme Corporation."}
+        import_facts(self.database, [old])
+        confirm_facts(self.database, [("fact-acme", 1)])
+        self.chat.sent.clear()
+        self.client.post(f"/api/jobs/{job_id}/cv/zh/prepare", headers=self.headers)
+        self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers)
+        self.client.post(f"/api/jobs/{job_id}/matches/propose", headers=self.headers)
+        later = "\n".join(self.chat.sent)
+        self.assertTrue(later)
+        for private in ("Alex", "Example University", "Acme Corporation"):
+            self.assertNotIn(private, later)
 
     @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
     def test_a_cancelled_or_forgotten_upload_leaves_no_personal_data_behind(self):
@@ -245,6 +262,22 @@ class WebTests(unittest.TestCase):
         cancelled = self.client.delete(f"/api/cv/uploads/{upload['upload_id']}", headers=self.headers)
         self.assertEqual(cancelled.status_code, 200)
         self.assertEqual(list(uploads.glob("*.json")), [])
+
+    def test_a_failed_retry_says_the_earlier_result_is_kept(self):
+        # Found in review of PR #2 by Codex: a failed "Adjust again" said the usual layout was
+        # used while the earlier adjusted layout was still shown.
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.chat.plan = {"sections": ["education", "experience", "skills"], "entries": [], "reasons": []}
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+        self.chat.plan = None
+        again = self.client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+        cv = self.job(job_id)["cv"]["en"]
+        layout = next(stage for stage in cv["stages"] if stage["stage"] == "layout")
+        self.assertEqual(again.status_code, 400)
+        self.assertEqual((cv["head"], layout["status"], layout["output_available"]), ("planned", "fallback", True))
+        self.assertIn("earlier adjusted layout", layout["message"])
 
     def test_the_cv_says_which_stage_did_not_work_and_why(self):
         import_facts(self.database, CV_FACTS)

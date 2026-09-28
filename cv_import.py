@@ -213,7 +213,8 @@ class _Links:
                 after = _compact(" ".join(lines[index + 1])) if index + 1 < len(lines) else ""
                 label = next((_compact(label) for label in item["labels"]
                               if here.count(_compact(label)) > placed.get((index, _compact(label)), 0)
-                              or (_compact(label) in here + after and _compact(label) not in after)), None)
+                              or (_compact(label) not in here and _compact(label) in here + after
+                                  and _compact(label) not in after)), None)
                 if label is not None:  # on this line, or wrapping onto the next
                     placed[(index, label)] = placed.get((index, label), 0) + 1
                     item["line"], start = index + 1, index

@@ -47,14 +47,16 @@ def private_terms(cv: dict[str, Any]) -> list[str]:
     if "header" in cv:  # a draft: each field already in one language
         header = cv["header"]
         names = _texts(header.get("name"))
-        contact = [item.get("text") for item in header.get("details", [])] + [
-            value for item in header.get("links", []) for value in (item.get("text"), item.get("url"))]
+        contact = [item.get("text") for item in header.get("details", [])]
+        links = [(item.get("text"), item.get("url")) for item in header.get("links", [])]
     else:
         names = _texts(cv.get("name"))
         details = cv.get("contact") if isinstance(cv.get("contact"), dict) else {}
-        contact = [*_texts(details.get("location")), details.get("phone"), details.get("email")] + [
-            value for item in details.get("links") or [] if isinstance(item, dict)
-            for value in (item.get("label"), item.get("url"))]
+        contact = [*_texts(details.get("location")), details.get("phone"), details.get("email")]
+        links = [(item.get("label"), item.get("url")) for item in details.get("links") or [] if isinstance(item, dict)]
+    # A label like "GitHub" names a service, not the user; "github.com/alex" names the user.
+    contact += [url for _, url in links] + [
+        label for label, _ in links if isinstance(label, str) and any(mark in label for mark in "/.@")]
     titles = [
         text for section in cv.get("sections") or [] if isinstance(section, dict) and section.get("kind") in PRIVATE_SECTIONS
         for entry in section.get("entries") or [] if isinstance(entry, dict) for text in _texts(entry.get("title"))

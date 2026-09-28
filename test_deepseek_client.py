@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from deepseek_client import API_URL, DeepSeekError, _post, chat_json
+from deepseek_client import API_URL, DeepSeekError, _post, chat_json, load_api_key
 
 
 MESSAGES = [
@@ -66,6 +66,20 @@ class DeepSeekClientTests(unittest.TestCase):
                 chat_json(MESSAGES, post=post)
         self.assertEqual(post.calls, [])
         self.assertEqual(raised.exception.reason, "missing_key")
+
+    def test_a_malformed_key_never_appears_in_an_error(self):
+        # Found in review of PR #2 by Codex: a key with a newline surfaced in a ValueError.
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-synthetic-secret\n"}):
+            self.assertEqual(load_api_key(), "sk-synthetic-secret")
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-synthetic\nsecret"}):
+            with self.assertRaises(DeepSeekError) as raised:
+                load_api_key()
+        self.assertEqual(raised.exception.reason, "key_rejected")
+        self.assertNotIn("synthetic", str(raised.exception))
+        with patch("deepseek_client.urllib.request.urlopen", side_effect=ValueError("Invalid header value b'Bearer sk-x y'")):
+            with self.assertRaises(DeepSeekError) as header:
+                _post({"model": "deepseek-flash"}, "sk-x y")
+        self.assertNotIn("sk-x", str(header.exception))
 
     def test_each_failure_says_what_kind_it_is_so_the_page_can_explain_it(self):
         with self.assertRaises(DeepSeekError) as unusable:

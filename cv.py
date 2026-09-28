@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from claims import check_rewrite
 from cv_layout import shown_sections
@@ -679,12 +679,14 @@ def tailor_draft(
     chat: Callable[..., dict[str, Any]] = chat_json,
     model: str = DEFAULT_MODEL,
     effort: str = DEFAULT_EFFORT,
+    private: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Rewrite bullet, skill and coursework lines for one job, keeping only checked rewrites.
 
     Only line text, the job title and its confirmed requirements are sent: never the name,
     contact details, entry titles or publications. A line that itself holds any of them (such
-    as a link or an employer's name) is not sent and stays as confirmed. A rewrite that fails
+    as a link or an employer's name) is not sent and stays as confirmed; ``private`` lists them,
+    by default from the draft itself (its language only). A rewrite that fails
     check_rewrite is recorded with its reasons while the line keeps the confirmed fact word
     for word.
     """
@@ -694,7 +696,7 @@ def tailor_draft(
         raise CVError("草稿已经改写过；请从 cv.py draft 生成的原始草稿开始")
     current = _verify_draft(draft, facts_db)
     job_summary = _job_summary(job)
-    private = private_terms(draft)
+    private = list(private_terms(draft) if private is None else private)
     requested = [
         {"fact_id": line["fact_id"], "section": section["kind"], "text": line["text"]}
         for section in draft["sections"] if section["kind"] in TAILOR_KINDS

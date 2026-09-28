@@ -11,7 +11,7 @@ import copy
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from claims import LINK, NUMBER, _leadership
 from cv import CVError, _localized
@@ -60,14 +60,13 @@ def _profile_entry_key(kind: str, entry: Any, language: str) -> str | None:
         return None
 
 
-def _resume(draft: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, tuple[str, str, str]]]:
+def _resume(draft: dict[str, Any], private: list[str]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, tuple[str, str, str]]]:
     """The CV as ids and line texts (masked for DeepSeek), the skills lines by fact ID, and
     bullet entries by ID."""
     texts = {
         line["fact_id"]: line.get("source_text") or line["text"]
         for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
     }
-    private = private_terms(draft)
     layout = original_layout(draft)
     resume = [
         {"section": section["kind"], "entries": [
@@ -145,9 +144,12 @@ def find_gaps(
     facts_db: Path,
     chat: Callable[..., dict[str, Any]],
     effort: str = "none",
+    private: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """The requirements no confirmed fact covers, each with at most one checked suggestion."""
-    matches = propose_matches(decided, facts_db, chat=chat, effort=effort, private=private_terms(draft))
+    """The requirements no confirmed fact covers, each with at most one checked suggestion.
+    ``private`` lists what requests must mask, by default taken from the draft itself."""
+    private = list(private_terms(draft) if private is None else private)
+    matches = propose_matches(decided, facts_db, chat=chat, effort=effort, private=private)
     covered = {item["requirement_id"] for item in matches["match_candidates"]}
     gaps = [
         {"requirement_id": item["id"], "text": item["text"], "strength": item.get("strength") or "unclear",
@@ -156,7 +158,7 @@ def find_gaps(
     ]
     suggesting: dict[str, Any] = {}
     if gaps:
-        resume, skills, entries = _resume(draft)
+        resume, skills, entries = _resume(draft, private)
         request = {
             "job_title": decided["jd"].get("title"),
             "gaps": [{"id": gap["requirement_id"], "text": gap["text"], "strength": gap["strength"]} for gap in gaps],

@@ -124,6 +124,7 @@ REASONS = {
 STAGES = ("draft", "rewording", "layout")
 STAGE_FAILED = {"draft": "Not prepared", "rewording": "Not reworded", "layout": "Not adjusted for this job"}
 STAGE_KEPT = {"rewording": "Your confirmed wording is used.", "layout": "Your usual layout is used."}
+STAGE_KEPT_EARLIER = {"rewording": "The earlier rewording below is kept.", "layout": "The earlier adjusted layout below is kept."}
 
 
 def _reason(exc: Exception) -> str:
@@ -138,13 +139,15 @@ def _stage(stage: str, status: str, message: str, reason_code: str | None = None
     return {"stage": stage, "status": status, "reason_code": reason_code, "message": message, "output_available": output}
 
 
-def _stage_failure(stage: str, exc: Exception) -> dict:
-    """A stage that did not work: a fallback when the earlier result stays usable, else failed."""
+def _stage_failure(stage: str, exc: Exception, earlier: bool = False) -> dict:
+    """A stage that did not work: a fallback when a result stays usable, else failed. ``earlier``
+    says a retry failed while this stage's earlier result is still shown."""
     code = _reason(exc)
     explanation = REASONS.get(code) or str(exc)  # domain messages hold no key or response text
     if stage == "draft":
         return _stage(stage, "failed", f"{STAGE_FAILED[stage]}: {explanation}", code, output=False)
-    return _stage(stage, "fallback", f"{STAGE_FAILED[stage]}: {explanation} {STAGE_KEPT[stage]}", code)
+    kept = STAGE_KEPT_EARLIER[stage] if earlier else STAGE_KEPT[stage]
+    return _stage(stage, "fallback", f"{STAGE_FAILED[stage]}{' again' if earlier else ''}: {explanation} {kept}", code)
 
 
 def _reworded(head: dict) -> dict:
@@ -399,6 +402,19 @@ def create_app(
     # Everything up to the CV review happens by itself: the requirements DeepSeek (or the
     # heading rules) finds all count, and the CV in the posting's language is drafted, reworded
     # and adjusted to them. The user can undo any change; approving the CV is never automatic.
+    def known_private_terms() -> list[str]:
+        """What requests must mask: the name, contact details, schools and employers of the
+        current CV in every language, and of every earlier one, since an older fact can still
+        name a past employer."""
+        path = Path(profile_path)
+        terms: set[str] = set()
+        for source in [path, *sorted((path.parent / "profile-history").glob("*.json"))]:
+            try:
+                terms.update(private_terms(json.loads(source.read_text(encoding="utf-8"))))
+            except (OSError, ValueError, AttributeError):
+                continue
+        return sorted(terms, key=len, reverse=True)
+
     def record_stages(job_id: str, language: str, stages: list[dict]) -> None:
         """How the latest preparation went, tied to the draft it produced (None if none)."""
         draft = workspace.read(job_id, f"cv-draft-{language}")
@@ -441,15 +457,16 @@ def create_app(
             raise
         workspace.write(job_id, f"cv-draft-{language}", head)
         stages = [_stage("draft", "done", "Built from your confirmed facts.")]
+        private = known_private_terms()
         try:
             # Thinking off: on a real CV it gave the same result in 2 s instead of 8 s (2026-09).
-            head = tailor_draft(head, facts_db, job=job, chat=chat, effort="none")
+            head = tailor_draft(head, facts_db, job=job, chat=chat, effort="none", private=private)
             workspace.write(job_id, f"cv-tailored-{language}", head)
             stages.append(_reworded(head))
         except CVError as exc:
             stages.append(_stage_failure("rewording", exc))
         try:
-            planned = plan_draft(head, job, chat=chat)
+            planned = plan_draft(head, job, chat=chat, private=private)
             workspace.write(job_id, f"cv-planned-{language}", planned)
             stages.append(_adjusted(planned))
         except CVError as exc:
@@ -481,8 +498,7 @@ def create_app(
         """Optional talking points: the confirmed fact that best speaks to each requirement."""
         if not Path(facts_db).exists():
             raise FactStoreError("还没有事实库；请先导入并确认事实")
-        private = private_terms(load_profile()) if Path(profile_path).exists() else []
-        matches = propose_matches(require(job_id, "decided"), facts_db, chat=chat, private=private)
+        matches = propose_matches(require(job_id, "decided"), facts_db, chat=chat, private=known_private_terms())
         workspace.write(job_id, "matches", matches)
         links, no_match = first_candidates(matches)
         linked = apply_match_decisions(matches, facts_db, links, no_match, decided_by="auto")
@@ -705,9 +721,11 @@ def create_app(
     def cv_tailor(job_id: str, language: str) -> dict:
         draft = require(job_id, f"cv-draft-{check_language(language)}")
         try:
-            tailored = tailor_draft(draft, facts_db, job=workspace.read(job_id, "decided"), chat=chat)
+            tailored = tailor_draft(draft, facts_db, job=workspace.read(job_id, "decided"), chat=chat,
+                                    private=known_private_terms())
         except CVError as exc:
-            update_stage(job_id, language, _stage_failure("rewording", exc))
+            earlier = workspace.read(job_id, f"cv-tailored-{language}") is not None
+            update_stage(job_id, language, _stage_failure("rewording", exc, earlier))
             raise
         workspace.write(job_id, f"cv-tailored-{language}", tailored)
         update_stage(job_id, language, _reworded(tailored), not_run=("layout",))
@@ -720,7 +738,8 @@ def create_app(
         draft = workspace.read(job_id, f"cv-draft-{language}")
         if draft is None:
             raise WorkspaceError("请先准备这个岗位的简历，再检查缺口")
-        workspace.write(job_id, "gaps", find_gaps(require(job_id, "decided"), draft, facts_db, chat))
+        workspace.write(job_id, "gaps", find_gaps(require(job_id, "decided"), draft, facts_db, chat,
+                                                  private=known_private_terms()))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/accept")
@@ -749,9 +768,10 @@ def create_app(
         """Adjust (again) for this job, starting from the reworded CV, or the draft if none."""
         base = workspace.read(job_id, f"cv-tailored-{check_language(language)}") or require(job_id, f"cv-draft-{language}")
         try:
-            planned = plan_draft(base, require(job_id, "decided"), chat=chat)
+            planned = plan_draft(base, require(job_id, "decided"), chat=chat, private=known_private_terms())
         except CVError as exc:
-            update_stage(job_id, language, _stage_failure("layout", exc))
+            earlier = workspace.read(job_id, f"cv-planned-{language}") is not None
+            update_stage(job_id, language, _stage_failure("layout", exc, earlier))
             raise
         workspace.write(job_id, f"cv-planned-{language}", planned)
         update_stage(job_id, language, _adjusted(planned))

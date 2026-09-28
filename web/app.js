@@ -592,9 +592,13 @@ function stageList(stages) {
 function cvBlock(view, language, refresh) {
   const cv = view.cv[language];
   const title = CV_TITLES[language];
+  // A failed retry still records why; refresh either way so the page shows it.
   const post = (action) => async () => {
-    await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`, { method: "POST" });
-    await refresh();
+    try {
+      await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`, { method: "POST" });
+    } finally {
+      await refresh();
+    }
   };
   if (!cv.head) {
     return el("div", { class: "cv-block" }, el("h3", {}, title),
