@@ -215,7 +215,7 @@ python3 -m venv .venv
 .venv/bin/python web.py
 ```
 
-- **Facts**：查看全部事实，勾选后一次确认多个 pending 版本。全部确认后自动转到 Find jobs。
+- **Facts**：上传 PDF 简历，核对姓名和联系方式后保存。每一行成为一条待确认事实（与已有事实完全相同的行直接复用），简历的结构成为你的 profile（旧 profile 先备份到 `profile-history/`）。姓名、邮箱、电话和链接只在本机读取，不发给 DeepSeek；DeepSeek 按行号看其余各行，只判断哪些是标题、条目和要点，文字由程序照原文复制。然后勾选并一次确认多个 pending 版本。全部确认后自动转到 Find jobs。
 - **Find jobs**：关注公司的全部公开岗位按“提到你多少个已确认技能标签”排序，最多的在前；同分时较新的在前。同一职位在多个城市发布只显示一行。可按标题、地点筛选，可勾选“Hide senior roles”（隐藏 Senior、Staff、Principal、Lead、Manager、Director 等标题；“Member of Technical Staff” 保留）。点 **Start** 会重新读取该岗位并新建到 My jobs；同一岗位再点只会打开已有的那一个。
 - **My jobs**：已开始的岗位；也可以粘贴任意来源的 JD 新建岗位。
 - **每个岗位**（Start 或粘贴后自动完成，2026-09 实测约 5 秒）：

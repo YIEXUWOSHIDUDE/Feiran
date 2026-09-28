@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -33,9 +34,10 @@ from cv import (
     rewritten_lines,
     tailor_draft,
 )
+from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, structure_cv
 from cv_plan import plan_draft, set_change
 from deepseek_client import chat_json
-from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, list_facts, parse_fact_refs
+from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs
 from gaps import accept_gap, decline_gap, find_gaps
 from job_search import (
     SearchError,
@@ -134,6 +136,21 @@ class StartListingRequest(BaseModel):
 class ChangeRequest(BaseModel):
     change_id: str
     undone: bool = True
+
+
+class ContactLink(BaseModel):
+    label: str = ""
+    url: str
+
+
+class SaveCVRequest(BaseModel):
+    """The name and contact details as the user checked them; they never came from DeepSeek."""
+
+    name: str
+    location: str = ""
+    phone: str = ""
+    email: str = ""
+    links: list[ContactLink] = []
 
 
 def _job_language(text: str) -> str:
@@ -300,11 +317,13 @@ def create_app(
     def save_profile(profile: dict) -> None:
         """Replace the profile, keeping the previous one in profile-history/ first."""
         path = Path(profile_path)
-        history = path.parent / "profile-history"
-        history.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-        with (history / f"cv-profile-{stamp}.json").open("xb") as backup:
-            backup.write(path.read_bytes())
+        if path.exists():
+            history = path.parent / "profile-history"
+            history.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+            with (history / f"cv-profile-{stamp}.json").open("xb") as backup:
+                backup.write(path.read_bytes())
+        path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
         temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary.replace(path)
@@ -393,6 +412,46 @@ def create_app(
     def confirm(request: ConfirmRequest) -> dict:
         confirmed = confirm_facts(facts_db, parse_fact_refs(request.refs))
         return {"changed_count": sum(changed for _, changed in confirmed)}
+
+    # An uploaded CV is read here; DeepSeek only sees its lines without the name and contact
+    # details. What it proposes waits in cv-uploads/ until the user checks the details and saves.
+    uploads = Path(profile_path).parent / "cv-uploads"
+
+    def propose_cv(data: bytes) -> dict:
+        pdf = read_pdf(data)
+        proposal = structure_cv(pdf["lines"], chat, links=pdf["links"])
+        upload_id = secrets.token_hex(8)
+        uploads.mkdir(parents=True, exist_ok=True)
+        (uploads / f"{upload_id}.json").write_text(json.dumps(proposal, ensure_ascii=False), encoding="utf-8")
+        known = {fact["text"] for fact in list_facts(facts_db)} if Path(facts_db).exists() else set()
+        for section in proposal["sections"]:
+            for entry in section["entries"]:
+                for fact in entry["facts"]:
+                    fact["known"] = fact["text"] in known
+        return {"upload_id": upload_id, "has_profile": Path(profile_path).exists(), **proposal}
+
+    @app.post("/api/cv/upload")
+    async def upload_cv(request: Request) -> dict:
+        data = bytearray()
+        async for chunk in request.stream():
+            data += chunk
+            if len(data) > MAX_PDF_BYTES:
+                raise CVImportError(f"PDF 不能超过 {MAX_PDF_BYTES // 1_000_000} MB")
+        return await run_in_threadpool(propose_cv, bytes(data))
+
+    @app.post("/api/cv/uploads/{upload_id}/save")
+    def save_uploaded_cv(upload_id: str, request: SaveCVRequest) -> dict:
+        """Import the CV's lines as pending facts and make it the CV layout, old one backed up."""
+        path = uploads / f"{upload_id}.json"
+        if not re.fullmatch(r"[0-9a-f]{16}", upload_id) or not path.exists():
+            raise CVImportError("找不到这次上传；请重新上传 PDF")
+        proposal = json.loads(path.read_text(encoding="utf-8"))
+        profile, items, reused = build_profile(proposal, request.model_dump(), facts_db)
+        if items:
+            import_facts(facts_db, items)
+        save_profile(profile)
+        path.unlink()
+        return {"imported": len(items), "reused": reused}
 
     def started_jobs() -> dict[str, str]:
         """Official posting link -> the newest job already made from it."""

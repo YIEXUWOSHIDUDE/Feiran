@@ -6,6 +6,7 @@ from pathlib import Path
 
 from deepseek_client import DeepSeekError
 from facts import confirm_facts, import_facts
+from cv_import import STRUCTURE_RULES
 from cv_plan import PLAN_RULES
 from gaps import SUGGEST_RULES
 from matching import MATCH_RULES
@@ -14,6 +15,7 @@ from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
 from test_listings import FakeBoards, posting
 
 HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
+HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
 if HAS_FASTAPI:
     from fastapi.testclient import TestClient
 
@@ -37,8 +39,15 @@ class FakeDeepSeek(FakeChat):
         self.requirement_lines = None
         self.plan = None
         self.gap_suggestions = None
+        self.cv_structure = None
+        self.sent = []
 
     def __call__(self, messages, model, effort):
+        self.sent.append(messages[-1]["content"])
+        if messages[0]["content"] == STRUCTURE_RULES:
+            if self.cv_structure is None:
+                raise DeepSeekError("测试中不联网")
+            return {"model": "deepseek-flash", "content": self.cv_structure, "usage": {}}
         if messages[0]["content"] == SUGGEST_RULES:
             if self.gap_suggestions is None:
                 raise DeepSeekError("测试中不联网")
@@ -380,6 +389,48 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len(saved["sections"][1]["entries"][0]["facts"]), 3)
         self.assertEqual(len(backups), 1)
         self.assertEqual(json.loads(backups[0].read_text(encoding="utf-8")), PROFILE)
+
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_an_uploaded_cv_becomes_pending_facts_and_the_cv_after_the_user_checks_the_contact(self):
+        from test_cv_import import minimal_pdf
+
+        self.profile_path.unlink()  # a new user: no CV yet
+        pdf = minimal_pdf([
+            (72, 740, "ALEX EXAMPLE"), (72, 726, "Los Angeles, CA | 000-000-0000 | alex@example.com"),
+            (72, 700, "EXPERIENCE"), (72, 686, "Example Corp"), (430, 686, "Chengdu, China"),
+            (72, 672, "Software Intern"), (430, 672, "Jun 2025 - Aug 2025"),
+            (72, 658, "- Built REST APIs for an internal tool."), (72, 630, "SKILLS"), (72, 616, "Languages: Python, Java"),
+        ])
+        self.chat.cv_structure = {"sections": [
+            {"kind": "experience", "heading": 3, "entries": [
+                {"title": [4, 1], "location": [4, 2], "subtitle": [5, 1], "dates": [5, 2],
+                 "facts": [{"lines": [6], "tags": ["REST APIs"]}]}]},
+            {"kind": "skills", "heading": 7, "entries": [{"facts": [{"lines": [8], "tags": ["Python", "Java"]}]}]},
+        ]}
+        wrong = self.client.post("/api/cv/upload", content=b"hello", headers=self.headers)
+        upload = self.client.post("/api/cv/upload", content=pdf, headers={**self.headers, "Content-Type": "application/pdf"})
+        proposal = upload.json()
+        contact = {"name": "Alex Example", "location": "Los Angeles, CA", "phone": "000-000-0000",
+                   "email": "alex@example.com", "links": [{"label": "github.com/alex-example", "url": "github.com/alex-example"}]}
+        saved = self.client.post(f"/api/cv/uploads/{proposal['upload_id']}/save", json=contact, headers=self.headers)
+        again = self.client.post(f"/api/cv/uploads/{proposal['upload_id']}/save", json=contact, headers=self.headers)
+        facts = self.client.get("/api/facts", headers=self.headers).json()["facts"]
+        profile = json.loads(self.profile_path.read_text(encoding="utf-8"))
+        self.assertEqual(wrong.status_code, 400)
+        self.assertEqual(upload.status_code, 200, upload.text)
+        self.assertEqual((proposal["private"]["name"], proposal["private"]["email"], proposal["has_profile"]),
+                         ("Alex Example", "alex@example.com", False))
+        self.assertEqual([fact["text"] for section in proposal["sections"] for entry in section["entries"] for fact in entry["facts"]],
+                         ["Built REST APIs for an internal tool.", "Languages: Python, Java"])
+        self.assertFalse(any(private in sent for sent in self.chat.sent
+                             for private in ("ALEX", "alex@example.com", "000-000-0000")))
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json(), {"imported": 2, "reused": 0})
+        self.assertEqual(again.status_code, 400)  # each upload is saved once
+        self.assertEqual({(fact["text"], fact["status"]) for fact in facts},
+                         {("Built REST APIs for an internal tool.", "pending"), ("Languages: Python, Java", "pending")})
+        self.assertEqual((profile["name"], profile["contact"]["links"][0]["url"]), ("Alex Example", "https://github.com/alex-example"))
+        self.assertEqual(profile["sections"][0]["entries"][0]["title"], "Example Corp")
 
 
 if __name__ == "__main__":

@@ -215,7 +215,7 @@ Start it, open http://127.0.0.1:8765/ in the browser, and press Ctrl+C to stop:
 .venv/bin/python web.py
 ```
 
-- **Facts**: see all facts and confirm several pending versions at once. Once every fact is confirmed, the page moves to Find jobs.
+- **Facts**: upload your CV as a PDF, check your name and contact details, and save. Each line becomes a pending fact (a line identical to a fact you already have reuses it), and the CV's layout becomes your profile (the old one is first backed up to `profile-history/`). Your name, email, phone and links are read on your computer and never sent to DeepSeek; DeepSeek sees the other lines by number and says which are headings, entries and bullets, and the program copies the text itself. Then confirm pending facts, several at once. Once every fact is confirmed, the page moves to Find jobs.
 - **Find jobs**: all open jobs of the companies you follow, ranked by how many of your confirmed skill tags they mention, most first; ties go to the newest posting. One role posted in several cities is one row. Filter by title and location, or tick "Hide senior roles" (hides Senior, Staff, Principal, Lead, Manager, Director and similar titles; "Member of Technical Staff" stays). **Start** reads the job again and adds it to My jobs; clicking it again opens the same job instead of making a second one.
 - **My jobs**: the jobs you started; you can also paste a JD from any source to create a job.
 - **Each job** (done automatically after Start or pasting; about 5 seconds in 2026-09):
