@@ -160,6 +160,12 @@ class GapTests(unittest.TestCase):
         gaps, _ = self.gaps(copying)
         suggestions = {item["text"]: item["suggestion"] for item in gaps["requirements"]}
         self.assertIsNone(suggestions["Writing integration tests for services"])
+        # Found in review by Codex: in a short line one changed verb weighs too much for the ratio.
+        def verb(ids):
+            return [{"requirement": ids["Writing integration tests for services"], "kind": "bullet", "entry": "s1e0",
+                     "text": "Added unit tests for billing code.", "tags": ["testing"]}]
+        gaps, _ = self.gaps(verb)
+        self.assertIsNone({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"])
         # Found in review by Codex: naming the same work while adding a tool is not a copy.
         self.assertEqual(suggestions["Hands-on Docker and Kubernetes"]["text"], "Documented REST APIs for the internal tool with OpenAPI.")
 

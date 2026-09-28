@@ -69,8 +69,9 @@ most one addition per gap, in the same language as the resume lines:
   such as a tool name; never put an item into a line whose label it does not fit, such as a concept
   into a list of programming languages.
 - "bullet": one new bullet under an existing experience or project entry (give the entry id), only
-  when that entry's own lines already show closely related work, so the new line adds a tool or
-  practice to that same work. Write it like the other bullets there, describing plain hands-on use.
+  when that entry's own lines already show closely related work, so the new line adds a practice
+  to that same work. Write it like the other bullets there, describing plain hands-on use. When
+  the addition is only a tool for work a line already describes, suggest the tool as a skill.
 - "none": when no honest addition fits: years of experience, seniority, leadership, a degree, work
   authorization or personal traits; a quality or scale rather than a tool or practice, such as
   efficient, scalable, stable, real-time or large-scale; experience that needs a project of its own,
@@ -91,13 +92,18 @@ NEAR_COPY = 0.85  # how alike, word by word in order, a new line may be to one a
 
 
 def _near_copy(text: str, existing: list[str]) -> bool:
-    """Whether a new line is an existing one with a word or two changed. Naming the same work
-    while adding a tool or practice is not: that is what a new line is for, so only the order
-    of nearly all the words gives a copy away. Chinese is compared character by character."""
+    """Whether a new line is an existing one with a word or two changed, or with only its first
+    word (its verb) changed. Naming the same work while adding a tool or practice is not: that
+    is what a new line is for, so only the order of nearly all the words gives a copy away.
+    Chinese is compared character by character."""
     def tokens(value: str) -> list[str]:
         return re.findall(r"[\u4e00-\u9fff]|[^\W_\u4e00-\u9fff]+", value.casefold())
     words = tokens(text)
-    return any(SequenceMatcher(None, words, tokens(known), autojunk=False).ratio() >= NEAR_COPY for known in existing)
+    for known in map(tokens, existing):
+        if (len(words) > 1 and words[1:] == known[1:]) \
+                or SequenceMatcher(None, words, known, autojunk=False).ratio() >= NEAR_COPY:
+            return True
+    return False
 
 
 def _entry_key(kind: str, fields: dict[str, Any]) -> str:
