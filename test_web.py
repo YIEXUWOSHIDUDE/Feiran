@@ -263,6 +263,19 @@ class WebTests(unittest.TestCase):
         self.assertEqual(cancelled.status_code, 200)
         self.assertEqual(list(uploads.glob("*.json")), [])
 
+    def test_nothing_is_sent_when_the_private_details_cannot_be_read(self):
+        # Found in review by Codex: an unreadable profile gave an empty list of private words,
+        # which replaced the CV's own, so an employer went out verbatim.
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+        self.profile_path.write_text("{ not json", encoding="utf-8")
+        self.chat.sent.clear()
+        retry = self.client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+        self.assertEqual(retry.status_code, 400)
+        self.assertEqual(self.chat.sent, [])
+
     def test_a_failed_retry_says_the_earlier_result_is_kept(self):
         # Found in review of PR #2 by Codex: a failed "Adjust again" said the usual layout was
         # used while the earlier adjusted layout was still shown.

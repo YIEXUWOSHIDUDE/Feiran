@@ -70,7 +70,7 @@ def plan_draft(
     private: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Return a copy of the draft with a per-job layout and the list of changes it makes.
-    ``private`` lists what the request must mask, by default taken from the draft itself."""
+    ``private`` adds words the request must mask to those of the draft itself."""
     if not isinstance(draft, dict) or "approval" in draft:
         raise CVError("已批准的简历不能再调整结构；请重新准备简历")
     if "plan" in draft:
@@ -82,7 +82,7 @@ def plan_draft(
         layout = original_layout(draft)
     except ValueError as exc:
         raise CVError(str(exc)) from exc
-    private = list(private_terms(draft) if private is None else private)  # a line may hold the name or an employer
+    private = sorted({*private_terms(draft), *(private or ())}, key=len, reverse=True)  # a line may hold the name or an employer
     texts = {
         line["fact_id"]: mask(line.get("source_text") or line["text"], private)
         for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]

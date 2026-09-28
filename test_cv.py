@@ -480,5 +480,22 @@ class CVCommandLineTests(unittest.TestCase):
             self.assertTrue((root / "cv-en.pdf").exists() and (root / "cv-zh.pdf").exists())
 
 
+
+class PrivateLineTests(unittest.TestCase):
+    def test_a_line_naming_the_employer_is_never_sent_whatever_extra_words_are_given(self):
+        # The caller's words add to the draft's own; an empty list must not drop them.
+        billing = {"id": "fact-intern-billing", "type": "experience", "text": "Built the Example Corp billing tool.", "tags": []}
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            import_facts(database, [billing])
+            confirm_facts(database, [("fact-intern-billing", 1)])
+            profile = copy.deepcopy(PROFILE)
+            profile["sections"][1]["entries"][0]["facts"].append("fact-intern-billing")
+            chat = FakeChat()
+            tailored = tailor_draft(build_draft(profile, database, "en"), database, chat=chat, private=[])
+        self.assertNotIn("Example Corp", chat.messages[-1]["content"])
+        self.assertEqual(line_for(tailored, "fact-intern-billing")["text"], "Built the Example Corp billing tool.")
+
+
 if __name__ == "__main__":
     unittest.main()

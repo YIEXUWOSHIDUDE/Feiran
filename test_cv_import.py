@@ -200,6 +200,20 @@ class CVImportTests(unittest.TestCase):
         self.assertEqual((alpha["links"], beta["links"]),
                          ({"GitHub": "https://example.com/alpha"}, {"GitHub": "https://example.com/beta"}))
 
+    def test_split_link_text_still_counts_each_occurrence_once(self):
+        # Found in review by Codex: with the text read as "Git" + "Hub", the shorter reading let
+        # a second link reuse the first line.
+        lines = [["ALEX EXAMPLE"], ["alex@example.com"], ["PROJECTS"], ["Alpha", "Python"], ["• See GitHub for source."],
+                 ["Beta", "Go"], ["• See GitHub for source."]]
+        links = [{"url": "https://example.com/alpha", "pieces": ["Git", "Hub"], "context": "• See GitHub for source."},
+                 {"url": "https://example.com/beta", "pieces": ["Git", "Hub"], "context": "• See GitHub for source."}]
+        answer = {"sections": [{"kind": "projects", "heading": 3, "entries": [
+            {"title": [4, 1], "location": [4, 2], "facts": [{"lines": [5], "tags": []}]},
+            {"title": [6, 1], "location": [6, 2], "facts": [{"lines": [7], "tags": []}]}]}]}
+        alpha, beta = structure_cv(lines, FakeStructurer(answer), links=links)["sections"][0]["entries"]
+        self.assertEqual((alpha["links"], beta["links"]),
+                         ({"GitHub": "https://example.com/alpha"}, {"GitHub": "https://example.com/beta"}))
+
     def test_uploading_an_old_cv_again_never_undoes_a_later_correction(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "workbench.db"

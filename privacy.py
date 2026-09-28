@@ -8,6 +8,7 @@ them; the CV itself keeps each line word for word.
 
 import re
 from typing import Any, Iterable
+from urllib.parse import parse_qsl, urlsplit
 
 
 EMAIL = re.compile(r"(?:mailto:)?[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -21,6 +22,22 @@ PHONE = re.compile(r"\+?[\d\s().-]+")
 PHONE_LIKE = re.compile(r"\+?\(?\d[\d\s().-]{8,}\d")
 DATE_LIKE = re.compile(r"(?:19|20)\d\d\s*[./-]\s*\d{1,2}\b|\b(?:19|20)\d\d\b\D+\b(?:19|20)\d\d\b")
 PRIVATE_SECTIONS = ("education", "experience")  # their entry titles are schools and employers
+# Link labels that name a service or a kind of page rather than the user; any other label,
+# such as a handle, is private.
+GENERIC_LABELS = {
+    "github", "gitlab", "bitbucket", "linkedin", "portfolio", "website", "personal website", "homepage",
+    "home page", "blog", "google scholar", "scholar", "orcid", "researchgate", "kaggle", "leetcode", "medium",
+    "twitter", "x", "stack overflow", "stackoverflow", "hugging face", "huggingface", "behance", "dribbble",
+    "resume", "cv", "demo", "projects", "email", "phone", "个人主页", "主页", "博客", "领英",
+}
+URL_WORDS = {"in", "pub", "u", "user", "users", "profile", "people", "citations", "www", "hl", "en"}
+
+
+def _handles(url: str) -> list[str]:
+    """The parts of a personal link that name the user: github.com/octocat -> octocat."""
+    parts = urlsplit(url if "://" in url else f"https://{url}")
+    words = [word for word in parts.path.split("/")] + [value for _, value in parse_qsl(parts.query)]
+    return [word for word in words if len(word) >= 3 and word.casefold() not in URL_WORDS]
 
 
 def is_phone(text: str) -> bool:
@@ -54,9 +71,11 @@ def private_terms(cv: dict[str, Any]) -> list[str]:
         details = cv.get("contact") if isinstance(cv.get("contact"), dict) else {}
         contact = [*_texts(details.get("location")), details.get("phone"), details.get("email")]
         links = [(item.get("label"), item.get("url")) for item in details.get("links") or [] if isinstance(item, dict)]
-    # A label like "GitHub" names a service, not the user; "github.com/alex" names the user.
-    contact += [url for _, url in links] + [
-        label for label, _ in links if isinstance(label, str) and any(mark in label for mark in "/.@")]
+    for label, url in links:
+        if isinstance(url, str) and url.strip():
+            contact += [url, *_handles(url.strip())]
+        if isinstance(label, str) and label.strip().casefold() not in GENERIC_LABELS:
+            contact.append(label)
     titles = [
         text for section in cv.get("sections") or [] if isinstance(section, dict) and section.get("kind") in PRIVATE_SECTIONS
         for entry in section.get("entries") or [] if isinstance(entry, dict) for text in _texts(entry.get("title"))

@@ -169,6 +169,24 @@ def _plain(text: str) -> str:
     return "".join(character for character in text if not character.isspace() and character not in "|•●◦▪")
 
 
+def _free_span(here: str, after: str, labels: list[str], claimed: list[tuple[int, int]]) -> tuple[int, int] | None:
+    """Where one of the labels sits on this line (text without spaces) that no other link has
+    claimed; text running on into the next line counts from where it starts here."""
+    def free(span: tuple[int, int]) -> bool:
+        return not any(start < span[1] and span[0] < end for start, end in claimed)
+
+    for label in filter(None, labels):
+        position = here.find(label)
+        while position >= 0:
+            if free(span := (position, position + len(label))):
+                return span
+            position = here.find(label, position + 1)
+        position = (here + after).find(label, max(0, len(here) - len(label) + 1))
+        if 0 <= position < len(here) and free(span := (position, len(here))):
+            return span
+    return None
+
+
 def _same_line(line: str, context: str) -> bool:
     return bool(line) and (line in context or context in line)
 
@@ -204,19 +222,16 @@ class _Links:
         # after the previous link's line that shows its text, has not used up that text on other
         # links and, when the PDF tells, reads like the link's own visual line. Two links reading
         # "GitHub" then stay with their own project, past a plain "GitHub Actions" in between.
-        start, placed = 0, {}
+        start, claimed = 0, {}
         for item in self.items:
             for index in range(start, len(lines)):
                 if item["context"] and not _same_line(_plain(" ".join(lines[index])), item["context"]):
                     continue
                 here = _compact(" ".join(lines[index]))
                 after = _compact(" ".join(lines[index + 1])) if index + 1 < len(lines) else ""
-                label = next((_compact(label) for label in item["labels"]
-                              if here.count(_compact(label)) > placed.get((index, _compact(label)), 0)
-                              or (_compact(label) not in here and _compact(label) in here + after
-                                  and _compact(label) not in after)), None)
-                if label is not None:  # on this line, or wrapping onto the next
-                    placed[(index, label)] = placed.get((index, label), 0) + 1
+                span = _free_span(here, after, [_compact(label) for label in item["labels"]], claimed.setdefault(index, []))
+                if span is not None:
+                    claimed[index].append(span)
                     item["line"], start = index + 1, index
                     break
 

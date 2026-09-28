@@ -147,8 +147,8 @@ def find_gaps(
     private: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """The requirements no confirmed fact covers, each with at most one checked suggestion.
-    ``private`` lists what requests must mask, by default taken from the draft itself."""
-    private = list(private_terms(draft) if private is None else private)
+    ``private`` adds words requests must mask to those of the draft itself."""
+    private = sorted({*private_terms(draft), *(private or ())}, key=len, reverse=True)
     matches = propose_matches(decided, facts_db, chat=chat, effort=effort, private=private)
     covered = {item["requirement_id"] for item in matches["match_candidates"]}
     gaps = [

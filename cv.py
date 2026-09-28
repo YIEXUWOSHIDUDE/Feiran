@@ -685,8 +685,8 @@ def tailor_draft(
 
     Only line text, the job title and its confirmed requirements are sent: never the name,
     contact details, entry titles or publications. A line that itself holds any of them (such
-    as a link or an employer's name) is not sent and stays as confirmed; ``private`` lists them,
-    by default from the draft itself (its language only). A rewrite that fails
+    as a link or an employer's name) is not sent and stays as confirmed; ``private`` adds words
+    to mask to the draft's own (its language only). A rewrite that fails
     check_rewrite is recorded with its reasons while the line keeps the confirmed fact word
     for word.
     """
@@ -696,7 +696,7 @@ def tailor_draft(
         raise CVError("草稿已经改写过；请从 cv.py draft 生成的原始草稿开始")
     current = _verify_draft(draft, facts_db)
     job_summary = _job_summary(job)
-    private = list(private_terms(draft) if private is None else private)
+    private = sorted({*private_terms(draft), *(private or ())}, key=len, reverse=True)
     requested = [
         {"fact_id": line["fact_id"], "section": section["kind"], "text": line["text"]}
         for section in draft["sections"] if section["kind"] in TAILOR_KINDS

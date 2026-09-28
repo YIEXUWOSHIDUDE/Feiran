@@ -92,6 +92,8 @@ class ClaimCheckTests(unittest.TestCase):
             ("没有部署服务。", "部署服务且没有停机。"),  # found in review of PR #1 by Codex
             ("Did not deploy the service.", "Did not test but deployed the service."),  # found in review of PR #2
             ("没有部署服务。", "没有测试但部署服务。"),
+            ("Have not yet deployed the service.", "Deployed the service without downtime."),  # review of the fixes
+            ("没有同时部署服务。", "部署服务且没有停机。"),
         ]
         for source, rewrite in cases:
             with self.subTest(rewrite=rewrite):
@@ -121,6 +123,7 @@ class ClaimCheckTests(unittest.TestCase):
             ("Did not use third-party libraries.", "Third-party libraries were not used."),
             ("没有部署服务。", "没有部署这些服务。"),
             ("没有部署服务。", "Did not deploy the services."),
+            ("Have not yet deployed the service.", "Did not yet deploy the service."),
         ]
         for source, rewrite in cases:
             with self.subTest(rewrite=rewrite):

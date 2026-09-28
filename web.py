@@ -120,6 +120,9 @@ REASONS = {
     "no_facts": "There are no facts yet. Upload your CV on the Facts page.",
     "facts_not_confirmed": "Some lines of your CV are not confirmed yet. Confirm them on the Facts page.",
     "facts_missing": "Your CV lists facts that are no longer stored. Upload your CV again on the Facts page.",
+    "profile_unreadable": "Your CV layout file could not be read. Upload your CV again on the Facts page.",
+    "private_unreadable": "Your CV layout or one of its backups could not be read, so it is not clear what must "
+                          "stay private. Nothing was sent to DeepSeek. Upload your CV again on the Facts page.",
 }
 STAGES = ("draft", "rewording", "layout")
 STAGE_FAILED = {"draft": "Not prepared", "rewording": "Not reworded", "layout": "Not adjusted for this job"}
@@ -382,7 +385,10 @@ def create_app(
     def load_profile() -> dict:
         if not Path(profile_path).exists():
             raise CVError(f"缺少简历 profile：{profile_path}", reason="no_profile")
-        return json.loads(Path(profile_path).read_text(encoding="utf-8"))
+        try:
+            return json.loads(Path(profile_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CVError(f"无法读取简历 profile：{profile_path}", reason="profile_unreadable") from exc
 
     def save_profile(profile: dict) -> None:
         """Replace the profile, keeping the previous one in profile-history/ first."""
@@ -409,10 +415,13 @@ def create_app(
         path = Path(profile_path)
         terms: set[str] = set()
         for source in [path, *sorted((path.parent / "profile-history").glob("*.json"))]:
+            if not source.exists():
+                continue
             try:
                 terms.update(private_terms(json.loads(source.read_text(encoding="utf-8"))))
-            except (OSError, ValueError, AttributeError):
-                continue
+            except (OSError, ValueError, AttributeError) as exc:
+                # Unsure what is private: send nothing rather than guess.
+                raise CVError(f"无法读取 {source.name}，不确定哪些内容需要遮盖", reason="private_unreadable") from exc
         return sorted(terms, key=len, reverse=True)
 
     def record_stages(job_id: str, language: str, stages: list[dict]) -> None:

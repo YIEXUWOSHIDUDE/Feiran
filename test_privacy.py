@@ -19,6 +19,15 @@ class PrivacyTests(unittest.TestCase):
         masked = mask("Built CI with GitHub Actions; code at github.com/alex-example", private_terms(profile))
         self.assertEqual(masked, "Built CI with GitHub Actions; code at [link]")
 
+    def test_a_handle_is_private_as_a_label_or_inside_a_link(self):
+        # Found in review by Codex: a label such as "octocat" is a handle, not a service name.
+        profile = {"name": "Alex Example", "sections": [], "contact": {"links": [
+            {"label": "octocat", "url": "https://github.com/octocat"},
+            {"label": "LinkedIn", "url": "https://www.linkedin.com/in/alex-example-123"},
+            {"label": "alexdev", "url": "https://alex.example.dev"}]}}
+        masked = mask("Published tools as octocat on GitHub; profile alex-example-123; blog alexdev.", private_terms(profile))
+        self.assertEqual(masked, "Published tools as [private] on GitHub; profile [private]; blog [private].")
+
 
 if __name__ == "__main__":
     unittest.main()

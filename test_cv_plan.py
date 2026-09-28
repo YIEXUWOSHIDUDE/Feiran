@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -5,6 +6,7 @@ import unittest
 from cv import CVError, approve_draft, build_draft, is_final_approval, render_html, rewritten_lines, tailor_draft
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError
+from facts import confirm_facts, import_facts
 from requirement_flow import apply_requirement_decisions, propose_requirements
 from test_cv import PROFILE, FakeChat, make_store
 
@@ -66,6 +68,17 @@ class CVPlanTests(unittest.TestCase):
             {"text": "Experience with Python", "strength": "required"},
             {"text": "Writing unit tests for services", "strength": "preferred"},
         ])
+
+    def test_the_planner_never_sees_the_drafts_own_private_words_whatever_extra_words_are_given(self):
+        billing = {"id": "fact-intern-billing", "type": "experience", "text": "Built the Example Corp billing tool.", "tags": []}
+        import_facts(self.database, [billing])
+        confirm_facts(self.database, [("fact-intern-billing", 1)])
+        profile = copy.deepcopy(PROFILE)
+        profile["sections"][1]["entries"][0]["facts"].append("fact-intern-billing")
+        planner = FakePlanner(CUT_API)
+        plan_draft(build_draft(profile, self.database, "en"), decided_job(), chat=planner, private=[])
+        self.assertIn("billing tool", planner.messages[-1]["content"])
+        self.assertNotIn("Example Corp", planner.messages[-1]["content"])
 
     def test_plan_orders_and_cuts_with_reasons_and_sends_no_names(self):
         planner = FakePlanner(CUT_API)
