@@ -9,11 +9,11 @@ from deepseek_client import DeepSeekError
 from facts import confirm_facts, import_facts, revise_fact
 from cv_import import STRUCTURE_RULES
 from cv_plan import PLAN_RULES
-from gaps import SUGGEST_RULES
+from gaps import EVIDENCE_RULES, SUGGEST_RULES
 from matching import MATCH_RULES
 from requirement_flow import FIND_RULES
 from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
-from test_gaps import resume_ids
+from test_gaps import resume_ids, sent_lines
 from test_listings import FakeBoards, posting
 
 HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
@@ -32,15 +32,17 @@ FACTS = [
 
 class FakeDeepSeek(FakeChat):
     """Tailors like FakeChat. For requirement finding it picks the lines listed in
-    requirement_lines, and for CV planning it returns ``plan``; while either is None that
-    request fails like an unreachable API. Fact matching always fails that way, so the
-    tag-matching fallback is what these tests see."""
+    requirement_lines, for CV planning it returns ``plan``, for the evidence check the verdicts
+    ``evidence`` gives for a request, and for gap suggestions what ``gap_suggestions`` gives;
+    while one is None that request fails like an unreachable API. Fact matching always fails
+    that way, so the tag-matching fallback is what these tests see."""
 
     def __init__(self, rewrites=None):
         super().__init__(rewrites)
         self.requirement_lines = None
         self.plan = None
         self.gap_suggestions = None
+        self.evidence = None
         self.cv_structure = None
         self.tailor_error = None
         self.sent = []
@@ -55,6 +57,11 @@ class FakeDeepSeek(FakeChat):
             if self.cv_structure is None:
                 raise DeepSeekError("测试中不联网", reason="unreachable")
             return {"model": "deepseek-flash", "content": self.cv_structure, "usage": {}}
+        if messages[0]["content"] == EVIDENCE_RULES:
+            if self.evidence is None:
+                raise DeepSeekError("测试中不联网", reason="unreachable")
+            request = json.loads(messages[-1]["content"])
+            return {"model": "deepseek-flash", "content": {"requirements": self.evidence(request)}, "usage": {}}
         if messages[0]["content"] == SUGGEST_RULES:
             if self.gap_suggestions is None:
                 raise DeepSeekError("测试中不联网", reason="unreachable")
@@ -222,13 +229,15 @@ class WebTests(unittest.TestCase):
         self.profile_path.write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
         self.chat.plan = {"sections": ["education", "experience", "skills", "publications"], "entries": [], "reasons": []}
         self.chat.gap_suggestions = lambda ids: []
+        self.chat.evidence = lambda request: [{"id": item["id"], "verdict": "none"} for item in request["requirements"]]
         job_id = self.client.post("/api/jobs", headers=self.headers,
                                   json={"title": "Parser Intern", "text": "Requirements:\n- Parser design\n- Kubernetes operations"}).json()["job_id"]
         self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers)
         self.client.post(f"/api/jobs/{job_id}/matches/propose", headers=self.headers)
         sent = "\n".join(self.chat.sent)
         preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}").text
-        self.assertTrue(any(SUGGEST_RULES == message for message in self.chat.systems))  # gap suggestions were asked for
+        # The evidence check and gap suggestions were both asked for.
+        self.assertTrue({EVIDENCE_RULES, SUGGEST_RULES} <= set(self.chat.systems))
         self.assertIn("Parser design", sent)  # the rest of the line still counts
         for private in ("Alex", "alex.example.com", "alex@example.com", "Example University", "Example Corp", "Los Angeles"):
             self.assertNotIn(private, sent)
@@ -549,37 +558,83 @@ class WebTests(unittest.TestCase):
         self.assertEqual((view["cv"]["en"]["head"], view["cv"]["zh"]["head"]), ("tailored", None))
 
 
-    def test_gaps_show_only_what_the_cv_lacks_and_a_line_true_for_you_joins_the_cv(self):
+    def test_each_requirement_says_what_the_cv_shows_and_a_line_true_for_you_joins_the_cv(self):
         import_facts(self.database, CV_FACTS)
         confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
-        text = "Requirements:\n- Hands-on Docker and Kubernetes\n- 3+ years of backend experience\n- Writing integration tests"
+        text = ("Requirements:\n- Hands-on Docker and Kubernetes\n- 3+ years of backend experience\n- Writing integration tests"
+                "\n- Experience with Go")
         job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": text}, headers=self.headers).json()["job_id"]
-        self.chat.gap_suggestions = lambda ids: [
-            {"requirement": ids["Hands-on Docker and Kubernetes"], "kind": "skill", "line": "fact-skills-languages", "items": ["Docker"]},
-            {"requirement": ids["3+ years of backend experience"], "kind": "none"},
-            {"requirement": ids["Writing integration tests"], "kind": "bullet", "entry": "s1e0",
-             "text": "Wrote integration tests for the internal tool.", "tags": ["integration tests"]},
-        ]
+        suggestions = {
+            "Hands-on Docker and Kubernetes": {"kind": "skill", "line": "fact-skills-languages", "items": ["Docker"]},
+            "Experience with Go": {"kind": "skill", "line": "fact-skills-languages", "items": ["Go"]},
+            "3+ years of backend experience": {"kind": "none"},
+            "Writing integration tests": {"kind": "bullet", "entry": "s1e0",
+                                          "text": "Wrote integration tests for the internal tool.", "tags": ["integration tests"]},
+        }
+        self.chat.gap_suggestions = lambda ids: [{"requirement": ids[text], **suggestion}
+                                                 for text, suggestion in suggestions.items() if text in ids]
+
+        def judged(request):
+            """Shown by any line naming it; the years only in part, by the internship's dates."""
+            lines = sent_lines(request)
+            ids = {item["text"]: item["id"] for item in request["requirements"]}
+            answer = [{"id": ids["3+ years of backend experience"], "verdict": "related",
+                       "lines": [lines["Software Intern (2025)"]], "missing": "3+ years"},
+                      {"id": ids["Experience with Go"], "verdict": "none"}]
+            for requirement, words in (("Hands-on Docker and Kubernetes", "Docker"), ("Writing integration tests", "integration tests")):
+                naming = [[ref] for line, ref in lines.items() if words in line]
+                answer.append({"id": ids[requirement], "verdict": "supported", "sets": naming} if naming
+                              else {"id": ids[requirement], "verdict": "none"})
+            return answer
+
+        self.chat.evidence = judged
         found = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers)
-        ids = {item["text"]: item["requirement_id"] for item in found.json()["gaps"]["gaps"]}
-        docker, years, tests = ids["Hands-on Docker and Kubernetes"], ids["3+ years of backend experience"], ids["Writing integration tests"]
+        self.assertEqual(found.status_code, 200, found.text)
+        shown = {item["text"]: item for item in found.json()["gaps"]["requirements"]}
+        self.assertEqual({text: item["status"] for text, item in shown.items()}, {
+            "Hands-on Docker and Kubernetes": "none", "3+ years of backend experience": "related", "Writing integration tests": "none",
+            "Experience with Go": "none"})
+        self.assertEqual(shown["3+ years of backend experience"]["missing"], "3+ years")
+        self.assertFalse(found.json()["gaps"]["stale"])
+        docker, years, tests, go = (shown[text]["requirement_id"] for text in (
+            "Hands-on Docker and Kubernetes", "3+ years of backend experience", "Writing integration tests", "Experience with Go"))
         self.client.post(f"/api/jobs/{job_id}/gaps/{docker}/accept", headers=self.headers)
         self.client.post(f"/api/jobs/{job_id}/gaps/{tests}/accept", headers=self.headers)
+        self.client.post(f"/api/jobs/{job_id}/gaps/{go}/decline", headers=self.headers)
         declined = self.client.post(f"/api/jobs/{job_id}/gaps/{years}/decline", headers=self.headers).json()
         preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}").text
         saved = json.loads(self.profile_path.read_text(encoding="utf-8"))
         backups = list((self.profile_path.parent / "profile-history").glob("*.json"))
-        self.assertEqual(found.status_code, 200, found.text)
-        # Matching fell back to skill words, and the page is told so in plain words.
-        self.assertEqual(found.json()["gaps"]["matching"]["fallback_code"], "unreachable")
-        self.assertIn("could not be reached", found.json()["gaps"]["matching"]["message"])
-        self.assertEqual({item["requirement_id"]: item["status"] for item in declined["gaps"]["gaps"]},
-                         {docker: "added", years: "declined", tests: "added"})
+        self.assertEqual({item["requirement_id"]: item["suggestion_status"] for item in declined["gaps"]["requirements"]},
+                         {docker: "added", years: "declined", tests: "added", go: "declined"})
         self.assertIn("Python, Java, Docker", preview)
         self.assertIn("Wrote integration tests for the internal tool.", preview)
         self.assertEqual(len(saved["sections"][1]["entries"][0]["facts"]), 3)
         self.assertEqual(len(backups), 1)
         self.assertEqual(json.loads(backups[0].read_text(encoding="utf-8")), PROFILE)
+        # The facts and the CV changed, so the check is out of date; checked again, the added
+        # lines are what shows each requirement, and the line said to be untrue is not offered again.
+        self.assertTrue(declined["gaps"]["stale"])
+        again = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]
+        self.assertEqual({item["text"]: item["status"] for item in again["requirements"]}, {
+            "Hands-on Docker and Kubernetes": "shown", "3+ years of backend experience": "related", "Writing integration tests": "shown",
+            "Experience with Go": "none"})
+        self.assertEqual(next(item for item in again["requirements"] if item["requirement_id"] == go)["suggestion_status"], "declined")
+        self.assertFalse(again["stale"])
+
+    def test_without_the_evidence_check_nothing_counts_as_shown_and_the_page_says_why(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": "Requirements:\n- Experience with Python"},
+                                  headers=self.headers).json()["job_id"]
+        gaps = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]
+        self.assertEqual([item["status"] for item in gaps["requirements"]], ["unchecked"])
+        self.assertEqual(gaps["evidence_check"]["fallback_code"], "unreachable")
+        self.assertIn("could not be reached", gaps["evidence_check"]["message"])
+        # A check saved in the older format is only marked out of date, so the page checks again.
+        path = self.client.app.state.workspace.path(job_id, "gaps")
+        path.write_text(json.dumps({"gaps_version": 1, "language": "en", "gaps": []}), encoding="utf-8")
+        self.assertEqual(self.job(job_id)["gaps"], {"outdated": True})
 
     @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
     def test_an_uploaded_cv_becomes_pending_facts_and_the_cv_after_the_user_checks_the_contact(self):

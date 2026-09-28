@@ -56,7 +56,8 @@ class FakeMatcher:
             raise self.error
         sent = {fact["text"]: fact["id"] for fact in json.loads(messages[-1]["content"])["facts"]}
         ids = {fact["id"]: sent[fact["text"]] for fact in list_facts(self.database) if fact["text"] in sent}
-        matches = [{**item, "facts": [ids.get(fact_id, fact_id) for fact_id in item["facts"]]} for item in self.matches]
+        matches = [{**item, "facts": [ids.get(fact_id, fact_id) if isinstance(fact_id, str) else fact_id
+                                      for fact_id in item["facts"]]} for item in self.matches]
         return {"model": "deepseek-flash", "content": {"matches": matches},
                 "usage": {"prompt_tokens": 40, "completion_tokens": 8}}
 
@@ -96,6 +97,17 @@ class MatchingTests(unittest.TestCase):
             {key: (value["status"], value["decided_by"]) for key, value in linked["match_decisions"].items()},
             {ids[0]: ("linked", "auto"), ids[1]: ("no_match", "auto")},
         )
+
+    def test_an_answer_in_the_wrong_shape_is_ignored_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "workbench.db"
+            python, _, _ = self.facts_for_model(database)
+            data, ids = decided_requirements()
+            matcher = FakeMatcher([{"requirement": [ids[0]], "facts": [python["id"]]},
+                                   {"requirement": ids[0], "facts": [{"id": python["id"]}, python["id"]]}], database=database)
+            proposed = propose_matches(data, database, chat=matcher)
+        self.assertEqual([item["fact_id"] for item in proposed["match_candidates"]], [python["id"]])
+        self.assertEqual(proposed["fact_matching"]["method"], "deepseek-facts-v1")
 
     def test_word_matching_takes_over_when_deepseek_fails(self):
         with tempfile.TemporaryDirectory() as directory:

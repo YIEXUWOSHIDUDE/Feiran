@@ -39,7 +39,7 @@ from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, str
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs
-from gaps import accept_gap, decline_gap, find_gaps
+from gaps import GAPS_VERSION, accept_gap, coverage, decline_gap, find_gaps
 from job_search import (
     SearchError,
     fetch_board,
@@ -345,8 +345,20 @@ def create_app(
         view["cv"] = {language: cv_view(job_id, language) for language in CV_LANGUAGES}
         gaps = workspace.read(job_id, "gaps")
         if gaps:
-            view["gaps"] = {**gaps, "matching": _explained(gaps.get("matching")), "suggesting": _explained(gaps.get("suggesting"))}
+            view["gaps"] = gaps_view(job_id, gaps)
         return view
+
+    def gaps_view(job_id: str, gaps: dict) -> dict:
+        """What the CV shows for each requirement, worked out from the CV as it is now. A check
+        in an older format, or for a CV that no longer exists, is only marked out of date, so
+        the page checks again."""
+        _, head = cv_head(job_id, gaps.get("language", "en"))
+        if gaps.get("gaps_version") != GAPS_VERSION or head is None:
+            return {"outdated": True}
+        confirmed = [(fact["id"], fact["version"]) for fact in list_facts(facts_db) if fact["status"] == "confirmed"] \
+            if Path(facts_db).exists() else []
+        return {**coverage(gaps, head, confirmed), "language": gaps["language"], "created_at": gaps["created_at"],
+                "evidence_check": _explained(gaps.get("evidence_check")), "suggesting": _explained(gaps.get("suggesting"))}
 
     def check_language(language: str) -> str:
         if language not in CV_LANGUAGES:
@@ -755,13 +767,14 @@ def create_app(
 
     @app.post("/api/jobs/{job_id}/gaps")
     def check_gaps(job_id: str) -> dict:
-        """What this job asks for that the CV does not show yet, with suggestions."""
+        """What the CV, as it is now, has behind each requirement, with suggestions for what
+        nothing shows. A suggestion declined before stays declined."""
         language = job_cv_language(require(job_id, "input")["jd"]["text"])
-        draft = workspace.read(job_id, f"cv-draft-{language}")
-        if draft is None:
+        _, head = cv_head(job_id, language)
+        if head is None:
             raise WorkspaceError("请先准备这个岗位的简历，再检查缺口")
-        workspace.write(job_id, "gaps", find_gaps(require(job_id, "decided"), draft, facts_db, chat,
-                                                  private=known_private_terms()))
+        workspace.write(job_id, "gaps", find_gaps(require(job_id, "decided"), head, facts_db, chat,
+                                                  private=known_private_terms(), previous=workspace.read(job_id, "gaps")))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/accept")
