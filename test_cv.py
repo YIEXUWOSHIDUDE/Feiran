@@ -254,9 +254,15 @@ FACT_IDS = {item["text"]: item["id"] for item in FACTS}
 
 
 def stand_ins_for(lines, key="id"):
-    """The ID a request gave each of FACTS's lines, found by text as DeepSeek would see it."""
-    sent = {line["text"]: line[key] for line in lines}
-    return {item["id"]: sent[item["text"]] for item in FACTS if item["text"] in sent}
+    """The ID a request gave each of FACTS's lines, found by text as DeepSeek would see it; a
+    skills line that has grown since still starts with its text."""
+    ids = {}
+    for item in FACTS:
+        line = next((line for line in lines if line["text"] == item["text"]), None) \
+            or next((line for line in lines if line["text"].startswith(item["text"])), None)
+        if line:
+            ids[item["id"]] = line[key]
+    return ids
 
 
 def swap_ids(value, ids):

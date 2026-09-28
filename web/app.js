@@ -686,50 +686,114 @@ function suggestionText(suggestion) {
   return el("span", {}, `New line under ${suggestion.where}: `, el("strong", {}, `“${suggestion.text}”`));
 }
 
+// What the CV shows for each requirement, most useful to act on first. Worked out on the
+// server from the CV as it is shown now, so undoing a cut changes it at once.
+const COVERAGE_GROUPS = [
+  ["not_shown", "Your facts show it, but this CV leaves it out"],
+  ["related", "Related only"],
+  ["none", "No evidence in your confirmed facts"],
+  ["unchecked", "Not checked"],
+];
+const COVERAGE_COUNTS = { shown: "shown", not_shown: "left out", related: "related only", none: "no evidence", unchecked: "not checked" };
+const LEFT_OUT = {
+  cut: "cut for this job",
+  reworded: "reworded in a way that no longer shows it",
+  not_on_cv: "in your confirmed facts, but not on your CV",
+};
+const WAY_BACK = { cut: "Put it back", reworded: "Use your own wording" };
+
+function evidenceLine(view, language, line, refresh) {
+  const undo = line.undo
+    ? actionButton(WAY_BACK[line.why] || "Undo", async () => {
+      await api(`/api/jobs/${view.job_id}/cv/${language}/change`, {
+        method: "POST", body: JSON.stringify({ change_id: line.undo, undone: true }),
+      });
+      await refresh();
+    }, true)
+    : null;
+  return el("li", {}, `“${line.text}”`,
+    line.shown ? null : el("span", { class: "muted" }, ` — ${LEFT_OUT[line.why] || "not shown"}`), undo);
+}
+
+function suggestionBlock(item, post) {
+  if (item.suggestion_status === "added") return el("p", { class: "ok-text" }, "Added to your facts and to this CV.");
+  if (item.suggestion_status === "declined") return el("p", { class: "muted" }, "Not true for you — kept off your CV.");
+  if (!item.suggestion) return el("p", { class: "muted" }, "No honest line to suggest (for example years, seniority or a degree).");
+  return el("div", {},
+    el("p", {}, suggestionText(item.suggestion)),
+    el("div", { class: "toolbar" },
+      actionButton("True for me — add it", post(`/${item.requirement_id}/accept`)),
+      actionButton("Not true", post(`/${item.requirement_id}/decline`), true)));
+}
+
+function coverageRow(view, language, item, refresh, post) {
+  const strength = item.strength && item.strength !== "required" ? el("span", { class: "muted auto" }, ` · ${strengthLabel(item.strength)}`) : "";
+  const lines = item.evidence.length
+    ? el("ul", { class: "evidence" }, item.evidence.map((line) => evidenceLine(view, language, line, refresh)))
+    : null;
+  const notes = [];
+  if (item.status === "related" && item.missing) notes.push(el("p", { class: "muted" }, `No line shows: ${item.missing}`));
+  if (item.status === "none") notes.push(el("p", { class: "muted" }, "None of your confirmed facts states this; that does not mean you lack it."));
+  const gap = item.status === "related" || item.status === "none";
+  return el("div", { class: `requirement ${item.status} ${gap ? item.suggestion_status : ""}` },
+    el("div", { class: "requirement-text" }, item.text, strength), lines, notes, gap ? suggestionBlock(item, post) : null);
+}
+
 function gapsPanel(view, refresh) {
-  const gaps = view.gaps;
+  const gaps = view.gaps && !view.gaps.outdated ? view.gaps : null;
   const post = (path) => async () => {
     await api(`/api/jobs/${view.job_id}/gaps${path}`, { method: "POST" });
     await refresh();
   };
-  const check = actionButton(gaps ? "Check again" : "Check what is missing", post(""), Boolean(gaps));
-  const items = gaps ? gaps.gaps : [];
-  const open = items.filter((gap) => gap.status === "open").length;
-  const rows = items.map((gap) => {
-    let detail;
-    if (gap.status === "added") detail = el("p", { class: "ok-text" }, "Added to your facts and to this CV.");
-    else if (gap.status === "declined") detail = el("p", { class: "muted" }, "Not true for you — kept off your CV.");
-    else if (!gap.suggestion) detail = el("p", { class: "muted" }, "No honest line to suggest (for example years, seniority or a degree).");
-    else {
-      detail = el("div", {},
-        el("p", {}, suggestionText(gap.suggestion)),
-        el("div", { class: "toolbar" },
-          actionButton("True for me — add it", post(`/${gap.requirement_id}/accept`)),
-          actionButton("Not true", post(`/${gap.requirement_id}/decline`), true)));
-    }
-    const strength = gap.strength && gap.strength !== "required" ? el("span", { class: "muted auto" }, ` · ${strengthLabel(gap.strength)}`) : "";
-    return el("div", { class: `requirement ${gap.status}` }, el("div", { class: "requirement-text" }, gap.text, strength), detail);
-  });
-  const notes = [];
-  if (gaps && gaps.matching && gaps.matching.fallback_reason) {
-    notes.push(el("p", { class: "warning" }, `Checked by matching skill words only: ${gaps.matching.message || gaps.matching.fallback_reason} `,
-      "A related fact may count as covering a requirement here. Use Check again when DeepSeek works."));
+  const check = actionButton(gaps ? "Check again" : "Check now", post(""), Boolean(gaps));
+  const heading = el("h2", {}, "3. What this CV shows for each requirement");
+  const intro = el("p", { class: "muted" },
+    "DeepSeek compares each requirement with your confirmed facts and with this CV as it is shown now, after cuts and rewording. ",
+    "A line that is only about the same thing does not count as showing it. Nothing is added until you click True for me; ",
+    "then it becomes a confirmed fact and the CV is prepared again.");
+  if (!gaps) {
+    return el("section", { class: "panel step-panel gaps-panel" }, heading, intro,
+      el("p", { class: "muted" }, "Checking…"), el("div", { class: "toolbar" }, check));
   }
-  if (gaps && gaps.suggesting && gaps.suggesting.fallback_reason) {
+  const notes = [];
+  if (gaps.stale) notes.push(el("p", { class: "warning" }, "Your CV or facts changed since this check. Checking again…"));
+  const checking = gaps.evidence_check || {};
+  if (checking.fallback_reason) {
+    notes.push(el("p", { class: "warning" }, `Not checked: ${checking.message || checking.fallback_reason} `,
+      "Nothing counts as shown until it is checked. Use Check again."));
+  }
+  if (gaps.suggesting && gaps.suggesting.fallback_reason) {
     notes.push(el("p", { class: "warning" }, `No suggestions this time: ${gaps.suggesting.message || gaps.suggesting.fallback_reason} Use Check again.`));
   }
-  return el("section", { class: "panel step-panel gaps-panel" },
-    el("h2", {}, gaps ? `3. Not on your CV yet (${open})` : "3. Not on your CV yet"),
-    el("p", { class: "muted" },
-      "Requirements none of your confirmed facts shows. For each, DeepSeek may suggest a line you could add if it is true for you. ",
-      "Nothing is added until you click True for me; then it becomes a confirmed fact and the CV is prepared again."),
-    notes,
-    gaps ? (rows.length ? rows : el("p", { class: "ok-text" }, "Your CV already shows something for every requirement.")) : el("p", { class: "muted" }, "Checking…"),
+  const language = gaps.language || view.language;
+  const summary = Object.entries(COVERAGE_COUNTS)
+    .filter(([status]) => gaps.counts[status])
+    .map(([status, label]) => `${gaps.counts[status]} ${label}`).join(" · ");
+  const groups = COVERAGE_GROUPS.map(([status, title]) => {
+    const items = gaps.requirements.filter((item) => item.status === status);
+    return items.length
+      ? el("div", { class: "coverage-group" }, el("h3", {}, `${title} (${items.length})`),
+        items.map((item) => coverageRow(view, language, item, refresh, post)))
+      : null;
+  });
+  const shown = gaps.requirements.filter((item) => item.status === "shown");
+  return el("section", { class: "panel step-panel gaps-panel" }, heading, intro, notes,
+    summary ? el("p", {}, el("strong", {}, summary)) : null,
+    shown.length === gaps.requirements.length && shown.length
+      ? el("p", { class: "ok-text" }, "This CV shows something for every requirement.") : null,
+    groups,
+    shown.length
+      ? el("details", { class: "coverage-group" }, el("summary", {}, `Shown in this CV (${shown.length})`),
+        shown.map((item) => coverageRow(view, language, item, refresh, post)))
+      : null,
     el("div", { class: "toolbar" }, check));
 }
 
 async function renderJob(jobId) {
-  const refresh = async () => {
+  // Requirements are checked against the CV once it exists, after the page shows, so Start
+  // stays quick; and again, at most once per refresh, whenever the facts or the CV's wording
+  // changed since, for example after True for me or Start over.
+  const refresh = async (checked = false) => {
     const view = await api(`/api/jobs/${jobId}`);
     const jd = view.jd;
     app.replaceChildren(
@@ -744,14 +808,14 @@ async function renderJob(jobId) {
       cvPanel(view, refresh),
       gapsPanel(view, refresh),
     );
+    const due = !view.gaps || view.gaps.outdated || view.gaps.stale;
+    if (!checked && due && (view.selected_requirements || []).length && view.cv[view.language].head) {
+      await api(`/api/jobs/${jobId}/gaps`, { method: "POST" });
+      return refresh(true);
+    }
     return view;
   };
-  const view = await refresh();
-  // Gaps are checked once the CV exists, after the page shows, so Start stays quick.
-  if (!view.gaps && (view.selected_requirements || []).length && view.cv[view.language].head) {
-    await api(`/api/jobs/${jobId}/gaps`, { method: "POST" });
-    await refresh();
-  }
+  await refresh();
 }
 
 const routes = { facts: renderFacts, find: renderFind, jobs: renderJobs };
