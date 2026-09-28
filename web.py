@@ -39,7 +39,7 @@ from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, str
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs
-from gaps import GAPS_VERSION, accept_gap, coverage, decline_gap, find_gaps
+from gaps import GAPS_VERSION, accept_gap, coverage, decline_gap, find_gaps, places, write_line
 from job_search import (
     SearchError,
     fetch_board,
@@ -206,6 +206,11 @@ class StartListingRequest(BaseModel):
     job_id: str
 
 
+class WriteLineRequest(BaseModel):
+    place: str
+    text: str
+
+
 class ChangeRequest(BaseModel):
     change_id: str
     undone: bool = True
@@ -358,6 +363,7 @@ def create_app(
         confirmed = [(fact["id"], fact["version"]) for fact in list_facts(facts_db) if fact["status"] == "confirmed"] \
             if Path(facts_db).exists() else []
         return {**coverage(gaps, head, confirmed), "language": gaps["language"], "created_at": gaps["created_at"],
+                "places": [{key: place[key] for key in ("id", "kind", "where")} for place in places(head)],
                 "evidence_check": _explained(gaps.get("evidence_check")), "suggesting": _explained(gaps.get("suggesting"))}
 
     def check_language(language: str) -> str:
@@ -782,6 +788,20 @@ def create_app(
         """The user says the suggested line is true: it becomes a confirmed fact on the CV."""
         gaps = require(job_id, "gaps")
         updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
+        if profile is not None:
+            save_profile(profile)
+        workspace.write(job_id, "gaps", updated)
+        prepare_cv(job_id, gaps["language"])
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/write")
+    def write_own_line(job_id: str, requirement_id: str, request: WriteLineRequest) -> dict:
+        """The user writes what shows a requirement themselves: it becomes a confirmed fact on the CV."""
+        gaps = require(job_id, "gaps")
+        _, head = cv_head(job_id, gaps["language"])
+        if head is None:
+            raise WorkspaceError("请先准备这个岗位的简历")
+        updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile())
         if profile is not None:
             save_profile(profile)
         workspace.write(job_id, "gaps", updated)

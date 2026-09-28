@@ -622,6 +622,27 @@ class WebTests(unittest.TestCase):
         self.assertEqual(next(item for item in again["requirements"] if item["requirement_id"] == go)["suggestion_status"], "declined")
         self.assertFalse(again["stale"])
 
+    def test_a_line_the_user_writes_for_a_requirement_joins_the_cv(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": "Requirements:\n- Hands-on Docker and Kubernetes"},
+                                  headers=self.headers).json()["job_id"]
+        self.chat.evidence = lambda request: [{"id": item["id"], "verdict": "none"} for item in request["requirements"]]
+        self.chat.gap_suggestions = lambda ids: []
+        gaps = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]
+        self.assertEqual({(place["kind"], place["where"]) for place in gaps["places"]},
+                         {("bullet", "Example Corp"), ("skill", "Languages: Python, Java")})
+        place = next(place["id"] for place in gaps["places"] if place["kind"] == "bullet")
+        requirement = gaps["requirements"][0]["requirement_id"]
+        written = self.client.post(f"/api/jobs/{job_id}/gaps/{requirement}/write", headers=self.headers,
+                                   json={"place": place, "text": "Deployed the internal tool with Docker."})
+        self.assertEqual(written.status_code, 200, written.text)
+        self.assertEqual(written.json()["gaps"]["requirements"][0]["suggestion_status"], "added")
+        self.assertIn("Deployed the internal tool with Docker.", self.client.get(f"/preview/{job_id}/en?token={TOKEN}").text)
+        refused = self.client.post(f"/api/jobs/{job_id}/gaps/{requirement}/write", headers=self.headers,
+                                   json={"place": place, "text": "Something else."})
+        self.assertEqual(refused.status_code, 400)
+
     def test_without_the_evidence_check_nothing_counts_as_shown_and_the_page_says_why(self):
         import_facts(self.database, CV_FACTS)
         confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])

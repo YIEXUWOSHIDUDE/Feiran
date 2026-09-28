@@ -7,7 +7,7 @@ from cv import build_draft, tailor_draft
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError
 from facts import add_fact, confirm_fact, list_facts, revise_fact
-from gaps import EVIDENCE_RULES, SUGGEST_RULES, accept_gap, coverage, decline_gap, find_gaps
+from gaps import EVIDENCE_RULES, SUGGEST_RULES, accept_gap, coverage, decline_gap, find_gaps, places, write_line
 from requirement_flow import apply_requirement_decisions, propose_requirements
 from test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
 from test_cv_plan import FakePlanner
@@ -315,6 +315,44 @@ class GapTests(unittest.TestCase):
         self.assertEqual({item["text"]: item["suggestion"] for item in gaps["requirements"] if item["evidence"] != "supported"},
                          dict.fromkeys(["Hands-on Docker and Kubernetes", "3+ years of backend experience",
                                         "Writing integration tests for services"]))
+
+    def test_the_user_can_write_the_line_for_a_requirement_nothing_shows(self):
+        gaps, _ = self.gaps(lambda ids: [])  # no suggestion at all
+        docker = next(item["requirement_id"] for item in gaps["requirements"] if "Docker" in item["text"])
+        entry = next(place for place in places(self.draft) if place["kind"] == "bullet")
+        self.assertEqual(entry["where"], "Example Corp")
+        text = "Deployed 3 services with Docker and Kubernetes."  # the user's own words, numbers included
+        updated, profile = write_line(gaps, docker, entry["id"], text, self.draft, self.database, PROFILE)
+        added = [fact for fact in list_facts(self.database) if fact["text"] == text]
+        self.assertEqual([(fact["status"], fact["fact_type"]) for fact in added], [("confirmed", "experience")])
+        self.assertEqual(profile["sections"][1]["entries"][0]["facts"][-1], added[0]["id"])
+        gap = next(item for item in updated["requirements"] if item["requirement_id"] == docker)
+        self.assertEqual((gap["status"], gap["suggestion"]["written"]), ("added", True))
+
+    def test_the_user_can_add_skills_of_their_own_even_after_declining_the_suggestion(self):
+        gaps, _ = self.gaps()
+        docker = next(item["requirement_id"] for item in gaps["requirements"] if "Docker" in item["text"])
+        place = next(place for place in places(self.draft) if place["kind"] == "skill")
+        updated, profile = write_line(decline_gap(gaps, docker), docker, place["id"], "Docker, java，Docker", self.draft,
+                                      self.database, PROFILE)
+        skills = next(fact for fact in list_facts(self.database) if fact["id"] == "fact-skills-languages")
+        self.assertEqual((skills["text"], skills["version"], skills["status"]), ("Languages: Python, Java, Docker", 2, "confirmed"))
+        self.assertIn("Docker", skills["tags"])
+        self.assertIsNone(profile)
+        self.assertEqual(next(item for item in updated["requirements"] if item["requirement_id"] == docker)["status"], "added")
+
+    def test_a_line_of_ones_own_is_refused_when_empty_already_there_or_its_place_is_gone(self):
+        gaps, _ = self.gaps(lambda ids: [])
+        docker = next(item["requirement_id"] for item in gaps["requirements"] if "Docker" in item["text"])
+        entry = next(place for place in places(self.draft) if place["kind"] == "bullet")
+        cases = [(entry["id"], "   ", "请写"), (entry["id"], "Built REST APIs for an internal tool.", "已经有"),
+                 (entry["id"], "x" * 301, "最多"), ("skill:fact-skills-languages", "Python, java", "已有"),
+                 ("entry:unknown", "Anything true.", "位置")]
+        for place, text, message in cases:
+            with self.subTest(text=text[:20]):
+                with self.assertRaisesRegex(ValueError, message):
+                    write_line(gaps, docker, place, text, self.draft, self.database, PROFILE)
+        self.assertEqual(len(list_facts(self.database)), len(FACTS))  # nothing was stored
 
     def test_a_declined_or_unsuggested_gap_stays_off_the_cv(self):
         gaps, _ = self.gaps()

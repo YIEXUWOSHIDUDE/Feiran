@@ -622,6 +622,71 @@ def accept_gap(
     return updated, new_profile
 
 
+SKILL_SEPARATORS = re.compile(r"[,，、;；]")
+
+
+def places(cv: dict[str, Any]) -> list[dict[str, Any]]:
+    """Where the user can add a line of their own: items for one of the skills lines, or a new
+    line under an experience or project entry. An entry is named by what it shows, so a line
+    can never land under another entry after the layout changes."""
+    found = []
+    for section in cv["sections"]:
+        for entry in section["entries"]:
+            if section["kind"] == "skills":
+                found += [{"id": f"skill:{line['fact_id']}", "kind": "skill", "fact_id": line["fact_id"],
+                           "where": line.get("source_text") or line["text"]} for line in entry["lines"]]
+            elif section["kind"] in BULLET_TYPES:
+                key = _entry_key(section["kind"], entry)
+                found.append({"id": f"entry:{key}", "kind": "bullet", "entry_key": key,
+                              "fact_type": BULLET_TYPES[section["kind"]], "where": entry.get("title") or section["title"]})
+    return found
+
+
+def write_line(
+    gaps: dict[str, Any], requirement_id: str, place_id: str, text: str, cv: dict[str, Any],
+    facts_db: Path, profile: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The user writes what shows a requirement themselves: skills for one of the skills lines,
+    or a new line under an entry, even after saying a suggestion was not true. It is their own
+    words, so it becomes a confirmed fact as written, numbers included; it is only refused when
+    empty, too long, already on the CV, or when its place is gone. Adding works as for a
+    suggestion (see accept_gap), with the same protection against a changed line or entry."""
+    place = next((item for item in places(cv) if item["id"] == place_id), None)
+    if place is None:
+        raise ValueError("这个位置已不在简历中，请刷新页面后重试")
+    text = " ".join(text.split()) if isinstance(text, str) else ""
+    gap = _gap(gaps, requirement_id)
+    if place["kind"] == "skill":
+        known = {item.strip().casefold() for item in SKILL_SEPARATORS.split(place["where"].split(":", 1)[-1])}
+        items: list[str] = []
+        for item in (part.strip() for part in SKILL_SEPARATORS.split(text)):
+            if item and item.casefold() not in known:
+                known.add(item.casefold())
+                items.append(item)
+        if not items:
+            raise ValueError("请写要加入这一行的技能（用逗号分隔），不要与这一行已有的重复")
+        if len(items) > MAX_ITEMS or any(len(item) > MAX_ITEM_CHARACTERS for item in items):
+            raise ValueError(f"一次最多加 {MAX_ITEMS} 项，每项最多 {MAX_ITEM_CHARACTERS} 个字符")
+        suggestion = {"kind": "skill", "fact_id": place["fact_id"], "items": items, "where": place["where"],
+                      "new_text": f"{place['where']}, {', '.join(items)}"}
+    else:
+        if not text:
+            raise ValueError("请写要加入简历的一行")
+        if len(text) > MAX_LINE_CHARACTERS:
+            raise ValueError(f"一行最多 {MAX_LINE_CHARACTERS} 个字符")
+        if any(text.casefold() == known.casefold() for known in _existing_lines(cv)):
+            raise ValueError("简历中已经有这一行")
+        # Skill words from the suggestion it replaces are kept if the user's line still names them.
+        named = [tag for tag in ((gap.get("suggestion") or {}).get("tags") or []) if tag_pattern(tag).search(text)]
+        suggestion = {"kind": "bullet", "entry_key": place["entry_key"], "fact_type": place["fact_type"],
+                      "text": text, "tags": named, "where": place["where"]}
+    if gap["status"] == "added":
+        raise ValueError("这条要求已经添加过一行")
+    updated = copy.deepcopy(gaps)
+    _gap(updated, requirement_id).update(suggestion={**suggestion, "written": True}, status="open")
+    return accept_gap(updated, requirement_id, facts_db, profile)
+
+
 def decline_gap(gaps: dict[str, Any], requirement_id: str) -> dict[str, Any]:
     """The user says the suggestion is not true: it stays a gap and never reaches the CV."""
     updated = copy.deepcopy(gaps)
