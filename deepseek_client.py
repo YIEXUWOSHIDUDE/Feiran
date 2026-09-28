@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -24,14 +25,30 @@ RETRY_HTTP_CODES = {429, 500, 502, 503}
 
 
 class DeepSeekError(Exception):
-    """A DeepSeek request or answer could not be used safely."""
+    """A DeepSeek request or answer could not be used safely.
+
+    ``reason`` says what kind of failure it was, so a page can explain it and suggest what to
+    do: missing_key, key_rejected, rate_limited, unreachable, request_failed or bad_response.
+    """
+
+    def __init__(self, message: str, reason: str = "bad_response") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _checked(key: str) -> str:
+    """A key is printable ASCII without spaces; anything else would fail inside the HTTP
+    library with the key in its message, so it is refused here without quoting it."""
+    if not re.fullmatch(r"[\x21-\x7e]+", key):
+        raise DeepSeekError("DeepSeek API key 格式无效（含空格、换行或非 ASCII 字符）", reason="key_rejected")
+    return key
 
 
 def load_api_key() -> str:
     """Read DEEPSEEK_API_KEY, or the macOS Keychain item the user stored it in."""
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if key:
-        return key
+        return _checked(key)
     if sys.platform == "darwin":
         try:
             found = subprocess.run(
@@ -41,9 +58,10 @@ def load_api_key() -> str:
         except (OSError, subprocess.TimeoutExpired):
             found = None
         if found is not None and found.returncode == 0 and found.stdout.strip():
-            return found.stdout.strip()
+            return _checked(found.stdout.strip())
     raise DeepSeekError(
-        f"缺少 DeepSeek API key：设置 DEEPSEEK_API_KEY，或存入钥匙串 service {KEYCHAIN_SERVICE}"
+        f"缺少 DeepSeek API key：设置 DEEPSEEK_API_KEY，或存入钥匙串 service {KEYCHAIN_SERVICE}",
+        reason="missing_key",
     )
 
 
@@ -59,17 +77,20 @@ def _post(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
             with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
             break
+        except ValueError:  # an invalid header; its message would quote the key
+            raise DeepSeekError("DeepSeek API key 格式无效", reason="key_rejected") from None
         except urllib.error.HTTPError as exc:
             exc.close()
             if exc.code in RETRY_HTTP_CODES and attempt < HTTP_ATTEMPTS:
                 time.sleep(2 ** attempt)
                 continue
-            raise DeepSeekError(f"DeepSeek API 返回 HTTP {exc.code}") from exc
+            reason = {401: "key_rejected", 403: "key_rejected", 429: "rate_limited"}.get(exc.code, "request_failed")
+            raise DeepSeekError(f"DeepSeek API 返回 HTTP {exc.code}", reason=reason) from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as exc:
             if attempt < HTTP_ATTEMPTS:
                 time.sleep(2 ** attempt)
                 continue
-            raise DeepSeekError("无法连接 DeepSeek API") from exc
+            raise DeepSeekError("无法连接 DeepSeek API", reason="unreachable") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
         raise DeepSeekError("DeepSeek API 响应过大")
     try:

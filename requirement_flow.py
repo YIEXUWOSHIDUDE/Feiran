@@ -265,10 +265,10 @@ def _strength(heading: str | None, text: str, said: Any = None) -> str:
         return "unclear"  # "A degree is not required" is not a requirement of either strength
     if PREFERRED_LINE.search(text):
         return "preferred"
-    if said in ("required", "preferred"):
-        return said
     if REQUIRED_LINE.search(text):
         return "required"
+    if said in ("required", "preferred"):
+        return said
     key = _heading_key(heading) if heading else ""
     if PREFERRED_HEADING.search(key):
         return "preferred"
@@ -427,9 +427,9 @@ def propose_requirements(data: Any, chat: Callable[..., dict] | None = None) -> 
             candidates, details = find_requirements_with_model(jd.get("text"), chat, jd.get("title"))
             extraction = {"method": MODEL_METHOD, **details}
             if not candidates:
-                extraction = {"fallback_reason": "DeepSeek 没有找到要求行"}
+                extraction = {"fallback_reason": "DeepSeek 没有找到要求行", "fallback_code": "nothing_found"}
         except (DeepSeekError, RequirementError) as exc:
-            extraction = {"fallback_reason": str(exc)}
+            extraction = {"fallback_reason": str(exc), "fallback_code": getattr(exc, "reason", "bad_response")}
     if not candidates:
         candidates = extract_requirement_candidates(jd.get("text"))
         extraction["method"] = EXTRACTION_METHOD

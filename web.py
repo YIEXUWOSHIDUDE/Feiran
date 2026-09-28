@@ -11,6 +11,7 @@ import re
 import secrets
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -36,7 +37,7 @@ from cv import (
 )
 from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, structure_cv
 from cv_plan import plan_draft, set_change
-from deepseek_client import chat_json
+from deepseek_client import DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs
 from gaps import accept_gap, decline_gap, find_gaps
 from job_search import (
@@ -59,6 +60,7 @@ from listings import (
     remove_source,
 )
 from matching import MatchingError, apply_match_decisions, first_candidates, propose_matches
+from privacy import private_terms
 from requirement_flow import (
     RequirementError,
     add_manual_requirements,
@@ -75,6 +77,7 @@ ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by", "extraction_method")
 CV_LANGUAGES = ("en", "zh")
 QUERY_TOKEN_PATHS = ("/preview/", "/download/")
+UPLOAD_KEEP_SECONDS = 24 * 3600
 
 
 class ConfirmRequest(BaseModel):
@@ -100,6 +103,76 @@ class RequirementDecisionRequest(BaseModel):
 
 FALLBACK_PATH = re.compile(r"sections\[(\d+)\](?:\.entries\[(\d+)\])?\.(title|subtitle|location|dates)")
 FIELD_NAMES = {"title": "name", "subtitle": "role or degree", "location": "location", "dates": "dates"}
+
+
+# What each kind of failure means and what to do about it. The page never quotes DeepSeek's raw
+# error, so neither a key nor response text can reach it.
+REASONS = {
+    "missing_key": "No DeepSeek API key was found. Add it to the Keychain (service deepseek-api-key) "
+                   "or set DEEPSEEK_API_KEY, then try again.",
+    "key_rejected": "DeepSeek refused the API key. Check or replace the key, then try again.",
+    "rate_limited": "DeepSeek is busy right now. Try again in a minute.",
+    "unreachable": "DeepSeek could not be reached. Check the internet connection, then try again.",
+    "request_failed": "DeepSeek returned an error. Try again later.",
+    "bad_response": "DeepSeek's answer could not be used. Try again.",
+    "nothing_found": "DeepSeek found no requirement lines.",
+    "no_profile": "There is no CV yet. Upload your CV on the Facts page.",
+    "no_facts": "There are no facts yet. Upload your CV on the Facts page.",
+    "facts_not_confirmed": "Some lines of your CV are not confirmed yet. Confirm them on the Facts page.",
+    "facts_missing": "Your CV lists facts that are no longer stored. Upload your CV again on the Facts page.",
+    "profile_unreadable": "Your CV layout file could not be read, so it is not clear what must stay private. "
+                          "Nothing was sent to DeepSeek. Upload your CV again on the Facts page.",
+    "backup_unreadable": "A backup of your CV layout ({file} in .local/profile-history) could not be read, so it "
+                         "is not clear what must stay private. Nothing was sent to DeepSeek. Delete or fix that "
+                         "file, then try again.",
+}
+STAGES = ("draft", "rewording", "layout")
+STAGE_FAILED = {"draft": "Not prepared", "rewording": "Not reworded", "layout": "Not adjusted for this job"}
+STAGE_KEPT = {"rewording": "Your confirmed wording is used.", "layout": "Your usual layout is used."}
+STAGE_KEPT_EARLIER = {"rewording": "The earlier rewording below is kept.", "layout": "The earlier adjusted layout below is kept."}
+
+
+def _reason(exc: Exception) -> str:
+    """The kind of failure: DeepSeek's own, or the one a domain error names."""
+    for error in (exc, exc.__cause__):
+        if isinstance(error, DeepSeekError):
+            return error.reason
+    return getattr(exc, "reason", "not_usable")
+
+
+def _stage(stage: str, status: str, message: str, reason_code: str | None = None, output: bool = True) -> dict:
+    return {"stage": stage, "status": status, "reason_code": reason_code, "message": message, "output_available": output}
+
+
+def _stage_failure(stage: str, exc: Exception, earlier: bool = False) -> dict:
+    """A stage that did not work: a fallback when a result stays usable, else failed. ``earlier``
+    says a retry failed while this stage's earlier result is still shown."""
+    code = _reason(exc)
+    # Domain messages hold no key or response text.
+    explanation = (REASONS.get(code) or str(exc)).replace("{file}", getattr(exc, "file", ""))
+    if stage == "draft":
+        return _stage(stage, "failed", f"{STAGE_FAILED[stage]}: {explanation}", code, output=False)
+    kept = STAGE_KEPT_EARLIER[stage] if earlier else STAGE_KEPT[stage]
+    return _stage(stage, "fallback", f"{STAGE_FAILED[stage]}{' again' if earlier else ''}: {explanation} {kept}", code)
+
+
+def _reworded(head: dict) -> dict:
+    changed, kept = len(rewritten_lines(head)), head["tailoring"]["rejected"]
+    note = f"; {kept} kept as confirmed because the rewording failed the fact check" if kept else ""
+    return _stage("rewording", "done", f"Reworded for this job: {changed} line(s) changed{note}.")
+
+
+def _adjusted(planned: dict) -> dict:
+    count = len(planned["plan"]["changes"])
+    return _stage("layout", "done", f"Adjusted for this job: {count} change(s), listed below." if count
+                  else "Adjusted for this job: your usual layout already fits.")
+
+
+def _explained(record: dict | None) -> dict | None:
+    """A fallback record with its reason in plain words for the page."""
+    if isinstance(record, dict) and record.get("fallback_code"):
+        return {**record, "message": REASONS.get(record["fallback_code"]) or record.get("fallback_reason")}
+    return record
 
 
 def _describe_fallbacks(draft: dict) -> list[str]:
@@ -256,7 +329,7 @@ def create_app(
         decided = workspace.read(job_id, "decided")
         requirements = decided or workspace.read(job_id, "candidates")
         if requirements:
-            view["extraction"] = requirements.get("requirement_extraction")
+            view["extraction"] = _explained(requirements.get("requirement_extraction"))
             view["candidates"] = [
                 {field: item.get(field) for field in CANDIDATE_FIELDS}
                 for item in requirements["requirement_candidates"]
@@ -272,7 +345,7 @@ def create_app(
         view["cv"] = {language: cv_view(job_id, language) for language in CV_LANGUAGES}
         gaps = workspace.read(job_id, "gaps")
         if gaps:
-            view["gaps"] = gaps
+            view["gaps"] = {**gaps, "matching": _explained(gaps.get("matching")), "suggesting": _explained(gaps.get("suggesting"))}
         return view
 
     def check_language(language: str) -> str:
@@ -297,6 +370,9 @@ def create_app(
         draft = workspace.read(job_id, f"cv-draft-{language}")
         if draft:
             view["language_fallbacks"] = _describe_fallbacks(draft)
+        status = workspace.read_note(job_id, f"cv-status-{language}")
+        if status and status.get("draft_created_at") == (draft or {}).get("created_at"):
+            view["stages"] = status["stages"]
         if head and "tailoring" in head:
             tailoring = head["tailoring"]
             view["tailoring"] = {key: tailoring.get(key) for key in ("model", "accepted", "rejected", "usage")}
@@ -311,8 +387,11 @@ def create_app(
 
     def load_profile() -> dict:
         if not Path(profile_path).exists():
-            raise CVError(f"缺少简历 profile：{profile_path}")
-        return json.loads(Path(profile_path).read_text(encoding="utf-8"))
+            raise CVError(f"缺少简历 profile：{profile_path}", reason="no_profile")
+        try:
+            return json.loads(Path(profile_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CVError(f"无法读取简历 profile：{profile_path}", reason="profile_unreadable") from exc
 
     def save_profile(profile: dict) -> None:
         """Replace the profile, keeping the previous one in profile-history/ first."""
@@ -321,8 +400,14 @@ def create_app(
             history = path.parent / "profile-history"
             history.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-            with (history / f"cv-profile-{stamp}.json").open("xb") as backup:
-                backup.write(path.read_bytes())
+            raw = path.read_bytes()
+            try:
+                readable = isinstance(json.loads(raw.decode("utf-8")), dict)
+            except ValueError:
+                readable = False
+            # A broken file is kept for the user to look at, but never read as a backup.
+            with (history / f"cv-profile-{stamp}.{'json' if readable else 'broken'}").open("xb") as backup:
+                backup.write(raw)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
         temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -332,22 +417,83 @@ def create_app(
     # Everything up to the CV review happens by itself: the requirements DeepSeek (or the
     # heading rules) finds all count, and the CV in the posting's language is drafted, reworded
     # and adjusted to them. The user can undo any change; approving the CV is never automatic.
+    def known_private_terms() -> list[str]:
+        """What requests must mask: the name, contact details, schools and employers of the
+        current CV in every language, and of every earlier one, since an older fact can still
+        name a past employer."""
+        path = Path(profile_path)
+        terms: set[str] = set()
+        for source in [path, *sorted((path.parent / "profile-history").glob("*.json"))]:
+            if not source.exists():
+                continue
+            try:
+                terms.update(private_terms(json.loads(source.read_text(encoding="utf-8"))))
+            except (OSError, ValueError, AttributeError) as exc:
+                # Unsure what is private: send nothing rather than guess.
+                if source == path:
+                    raise CVError(f"无法读取简历 profile：{source.name}", reason="profile_unreadable") from exc
+                error = CVError(f"无法读取 profile 备份：{source.name}", reason="backup_unreadable")
+                error.file = source.name
+                raise error from exc
+        return sorted(terms, key=len, reverse=True)
+
+    def record_stages(job_id: str, language: str, stages: list[dict]) -> None:
+        """How the latest preparation went, tied to the draft it produced (None if none)."""
+        draft = workspace.read(job_id, f"cv-draft-{language}")
+        workspace.write_note(job_id, f"cv-status-{language}", {
+            "draft_created_at": draft["created_at"] if draft else None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "stages": sorted(stages, key=lambda item: STAGES.index(item["stage"])),
+        })
+
+    def update_stage(job_id: str, language: str, stage: dict, not_run: tuple[str, ...] = ()) -> None:
+        """Replace one stage after a retry; stages built on its old result are marked not run."""
+        draft = workspace.read(job_id, f"cv-draft-{language}")
+        status = workspace.read_note(job_id, f"cv-status-{language}")
+        if not draft or not status or status.get("draft_created_at") != draft["created_at"]:
+            status = {"stages": [_stage("draft", "done", "Built from your confirmed facts.")]}
+        kept = [item for item in status["stages"] if item["stage"] not in (stage["stage"], *not_run)]
+        again = [_stage(name, "skipped", f"{STAGE_FAILED[name]} since the last change; use the button below.")
+                 for name in not_run]
+        record_stages(job_id, language, [*kept, stage, *again])
+
     def prepare_cv(job_id: str, language: str) -> None:
-        """Draft, reword and adjust one language's CV for this job. When DeepSeek cannot reword
-        or adjust, the CV stays at the last step that worked and the page offers that step."""
+        """Draft, reword and adjust one language's CV for this job, recording how each stage
+        went. When DeepSeek cannot reword or adjust, the CV stays at the last stage that worked
+        and the page says why, so a usable CV is never mistaken for a tailored one."""
         job = require(job_id, "decided")
-        head = build_draft(load_profile(), facts_db, check_language(language), job=job)
+        try:
+            if not Path(facts_db).exists():
+                raise CVError("还没有事实库", reason="no_facts")
+            head = build_draft(load_profile(), facts_db, check_language(language), job=job)
+        except (CVError, FactStoreError) as exc:
+            # An earlier CV, if any, stays as it was; the page says it is not up to date.
+            earlier = workspace.read(job_id, f"cv-draft-{language}") is not None
+            failure = _stage_failure("draft", exc)
+            if earlier:
+                failure.update(output_available=True, message=failure["message"] + " The CV below is from the last "
+                               "time it could be prepared.")
+            record_stages(job_id, language, [failure, *(
+                _stage(name, "skipped", f"{STAGE_FAILED[name]}: the CV could not be drafted.", output=earlier)
+                for name in ("rewording", "layout"))])
+            raise
         workspace.write(job_id, f"cv-draft-{language}", head)
+        stages = [_stage("draft", "done", "Built from your confirmed facts.")]
+        private = known_private_terms()
         try:
             # Thinking off: on a real CV it gave the same result in 2 s instead of 8 s (2026-09).
-            head = tailor_draft(head, facts_db, job=job, chat=chat, effort="none")
+            head = tailor_draft(head, facts_db, job=job, chat=chat, effort="none", private=private)
             workspace.write(job_id, f"cv-tailored-{language}", head)
-        except CVError:
-            pass
+            stages.append(_reworded(head))
+        except CVError as exc:
+            stages.append(_stage_failure("rewording", exc))
         try:
-            workspace.write(job_id, f"cv-planned-{language}", plan_draft(head, job, chat=chat))
-        except CVError:
-            pass
+            planned = plan_draft(head, job, chat=chat, private=private)
+            workspace.write(job_id, f"cv-planned-{language}", planned)
+            stages.append(_adjusted(planned))
+        except CVError as exc:
+            stages.append(_stage_failure("layout", exc))
+        record_stages(job_id, language, stages)
 
     def cv_languages() -> list[str]:
         """Languages the user's resume is written in; only those get CVs."""
@@ -374,7 +520,7 @@ def create_app(
         """Optional talking points: the confirmed fact that best speaks to each requirement."""
         if not Path(facts_db).exists():
             raise FactStoreError("还没有事实库；请先导入并确认事实")
-        matches = propose_matches(require(job_id, "decided"), facts_db, chat=chat)
+        matches = propose_matches(require(job_id, "decided"), facts_db, chat=chat, private=known_private_terms())
         workspace.write(job_id, "matches", matches)
         links, no_match = first_candidates(matches)
         linked = apply_match_decisions(matches, facts_db, links, no_match, decided_by="auto")
@@ -427,11 +573,20 @@ def create_app(
     # details. What it proposes waits in cv-uploads/ until the user checks the details and saves.
     uploads = Path(profile_path).parent / "cv-uploads"
 
+    def upload_path(upload_id: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{16}", upload_id):
+            raise CVImportError("找不到这次上传；请重新上传 PDF")
+        return uploads / f"{upload_id}.json"
+
     def propose_cv(data: bytes) -> dict:
         pdf = read_pdf(data)
         proposal = structure_cv(pdf["lines"], chat, links=pdf["links"])
         upload_id = secrets.token_hex(8)
         uploads.mkdir(parents=True, exist_ok=True)
+        # An upload holds contact details; one neither saved nor cancelled is not kept for long.
+        for forgotten in uploads.glob("*.json"):
+            if time.time() - forgotten.stat().st_mtime > UPLOAD_KEEP_SECONDS:
+                forgotten.unlink(missing_ok=True)
         (uploads / f"{upload_id}.json").write_text(json.dumps(proposal, ensure_ascii=False), encoding="utf-8")
         known = {fact["text"] for fact in list_facts(facts_db)} if Path(facts_db).exists() else set()
         for section in proposal["sections"]:
@@ -452,8 +607,8 @@ def create_app(
     @app.post("/api/cv/uploads/{upload_id}/save")
     def save_uploaded_cv(upload_id: str, request: SaveCVRequest) -> dict:
         """Import the CV's lines as pending facts and make it the CV layout, old one backed up."""
-        path = uploads / f"{upload_id}.json"
-        if not re.fullmatch(r"[0-9a-f]{16}", upload_id) or not path.exists():
+        path = upload_path(upload_id)
+        if not path.exists():
             raise CVImportError("找不到这次上传；请重新上传 PDF")
         proposal = json.loads(path.read_text(encoding="utf-8"))
         profile, items, reused = build_profile(proposal, request.model_dump(), facts_db)
@@ -462,6 +617,11 @@ def create_app(
         save_profile(profile)
         path.unlink()
         return {"imported": len(items), "reused": reused}
+
+    @app.delete("/api/cv/uploads/{upload_id}")
+    def cancel_upload(upload_id: str) -> dict:
+        upload_path(upload_id).unlink(missing_ok=True)
+        return {"cancelled": True}
 
     def started_jobs() -> dict[str, str]:
         """Official posting link -> the newest job already made from it."""
@@ -582,8 +742,15 @@ def create_app(
     @app.post("/api/jobs/{job_id}/cv/{language}/tailor")
     def cv_tailor(job_id: str, language: str) -> dict:
         draft = require(job_id, f"cv-draft-{check_language(language)}")
-        tailored = tailor_draft(draft, facts_db, job=workspace.read(job_id, "decided"), chat=chat)
+        try:
+            tailored = tailor_draft(draft, facts_db, job=workspace.read(job_id, "decided"), chat=chat,
+                                    private=known_private_terms())
+        except CVError as exc:
+            earlier = workspace.read(job_id, f"cv-tailored-{language}") is not None
+            update_stage(job_id, language, _stage_failure("rewording", exc, earlier))
+            raise
         workspace.write(job_id, f"cv-tailored-{language}", tailored)
+        update_stage(job_id, language, _reworded(tailored), not_run=("layout",))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps")
@@ -593,7 +760,8 @@ def create_app(
         draft = workspace.read(job_id, f"cv-draft-{language}")
         if draft is None:
             raise WorkspaceError("请先准备这个岗位的简历，再检查缺口")
-        workspace.write(job_id, "gaps", find_gaps(require(job_id, "decided"), draft, facts_db, chat))
+        workspace.write(job_id, "gaps", find_gaps(require(job_id, "decided"), draft, facts_db, chat,
+                                                  private=known_private_terms()))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/accept")
@@ -621,7 +789,14 @@ def create_app(
     def cv_plan(job_id: str, language: str) -> dict:
         """Adjust (again) for this job, starting from the reworded CV, or the draft if none."""
         base = workspace.read(job_id, f"cv-tailored-{check_language(language)}") or require(job_id, f"cv-draft-{language}")
-        workspace.write(job_id, f"cv-planned-{language}", plan_draft(base, require(job_id, "decided"), chat=chat))
+        try:
+            planned = plan_draft(base, require(job_id, "decided"), chat=chat, private=known_private_terms())
+        except CVError as exc:
+            earlier = workspace.read(job_id, f"cv-planned-{language}") is not None
+            update_stage(job_id, language, _stage_failure("layout", exc, earlier))
+            raise
+        workspace.write(job_id, f"cv-planned-{language}", planned)
+        update_stage(job_id, language, _adjusted(planned))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/cv/{language}/change")

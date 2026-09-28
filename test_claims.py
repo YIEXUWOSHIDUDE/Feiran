@@ -89,6 +89,12 @@ class ClaimCheckTests(unittest.TestCase):
             ("Built the service but did not deploy it.", "Built and deployed the service without downtime."),
             ("不使用第三方库构建解析器。", "使用第三方库构建解析器。"),
             ("为2亿用户提供服务。", "Served 2 billion users."),
+            ("没有部署服务。", "部署服务且没有停机。"),  # found in review of PR #1 by Codex
+            ("Did not deploy the service.", "Did not test but deployed the service."),  # found in review of PR #2
+            ("没有部署服务。", "没有测试但部署服务。"),
+            ("Have not yet deployed the service.", "Deployed the service without downtime."),  # review of the fixes
+            ("没有同时部署服务。", "部署服务且没有停机。"),
+            ("Did not deploy the service.", "Not before testing did we deploy the service."),  # 4th review
         ]
         for source, rewrite in cases:
             with self.subTest(rewrite=rewrite):
@@ -114,6 +120,11 @@ class ClaimCheckTests(unittest.TestCase):
             ("Built 3 backend services in 2 weeks.", "In 2 weeks, built 3 services."),
             ("Did not use third-party libraries.", "Built without using third-party libraries."),
             ("不断优化查询性能。", "Continuously optimized query performance."),
+            ("Did not use third-party libraries.", "No third-party libraries were used."),  # found by Codex
+            ("Did not use third-party libraries.", "Third-party libraries were not used."),
+            ("没有部署服务。", "没有部署这些服务。"),
+            ("没有部署服务。", "Did not deploy the services."),
+            ("Have not yet deployed the service.", "Did not yet deploy the service."),
         ]
         for source, rewrite in cases:
             with self.subTest(rewrite=rewrite):

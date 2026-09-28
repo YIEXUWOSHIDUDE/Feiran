@@ -10,9 +10,10 @@ import copy
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from cv import CVError, _job_summary, requirement_briefs
+from privacy import mask, private_terms
 from cv_layout import describe_changes, guarded_layout, original_layout
 from deepseek_client import DEFAULT_MODEL, DeepSeekError, chat_json
 
@@ -66,8 +67,10 @@ def plan_draft(
     chat: Callable[..., dict[str, Any]] = chat_json,
     model: str = DEFAULT_MODEL,
     effort: str = "none",
+    private: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """Return a copy of the draft with a per-job layout and the list of changes it makes."""
+    """Return a copy of the draft with a per-job layout and the list of changes it makes.
+    ``private`` adds words the request must mask to those of the draft itself."""
     if not isinstance(draft, dict) or "approval" in draft:
         raise CVError("已批准的简历不能再调整结构；请重新准备简历")
     if "plan" in draft:
@@ -79,8 +82,9 @@ def plan_draft(
         layout = original_layout(draft)
     except ValueError as exc:
         raise CVError(str(exc)) from exc
+    private = sorted({*private_terms(draft), *(private or ())}, key=len, reverse=True)  # a line may hold the name or an employer
     texts = {
-        line["fact_id"]: line.get("source_text") or line["text"]
+        line["fact_id"]: mask(line.get("source_text") or line["text"], private)
         for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
     }
     request = {

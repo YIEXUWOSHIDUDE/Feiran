@@ -2,9 +2,9 @@ import json
 import os
 import unittest
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
-from deepseek_client import API_URL, DeepSeekError, _post, chat_json
+from deepseek_client import API_URL, DeepSeekError, _post, chat_json, load_api_key
 
 
 MESSAGES = [
@@ -62,9 +62,37 @@ class DeepSeekClientTests(unittest.TestCase):
     def test_missing_key_fails_before_any_request(self):
         post = RecordingPost()
         with patch.dict(os.environ, {}, clear=True), patch("deepseek_client.sys.platform", "linux"):
-            with self.assertRaisesRegex(DeepSeekError, "DEEPSEEK_API_KEY"):
+            with self.assertRaisesRegex(DeepSeekError, "DEEPSEEK_API_KEY") as raised:
                 chat_json(MESSAGES, post=post)
         self.assertEqual(post.calls, [])
+        self.assertEqual(raised.exception.reason, "missing_key")
+
+    def test_a_malformed_key_never_appears_in_an_error(self):
+        # Found in review of PR #2 by Codex: a key with a newline surfaced in a ValueError.
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-synthetic-secret\n"}):
+            self.assertEqual(load_api_key(), "sk-synthetic-secret")
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-synthetic\nsecret"}):
+            with self.assertRaises(DeepSeekError) as raised:
+                load_api_key()
+        self.assertEqual(raised.exception.reason, "key_rejected")
+        self.assertNotIn("synthetic", str(raised.exception))
+        with patch("deepseek_client.urllib.request.urlopen", side_effect=ValueError("Invalid header value b'Bearer sk-x y'")):
+            with self.assertRaises(DeepSeekError) as header:
+                _post({"model": "deepseek-flash"}, "sk-x y")
+        self.assertNotIn("sk-x", str(header.exception))
+
+    def test_each_failure_says_what_kind_it_is_so_the_page_can_explain_it(self):
+        with self.assertRaises(DeepSeekError) as unusable:
+            chat_json(MESSAGES, api_key="k", post=RecordingPost(reply("not json")))
+        self.assertEqual(unusable.exception.reason, "bad_response")
+        with patch("deepseek_client.time.sleep"), patch("deepseek_client.urllib.request.urlopen") as urlopen:
+            urlopen.side_effect = [URLError("offline")] * 3
+            with self.assertRaises(DeepSeekError) as offline:
+                _post({"model": "deepseek-flash"}, "k")
+            urlopen.side_effect = [HTTPError(API_URL, 429, "busy", None, None)] * 3
+            with self.assertRaises(DeepSeekError) as busy:
+                _post({"model": "deepseek-flash"}, "k")
+        self.assertEqual((offline.exception.reason, busy.exception.reason), ("unreachable", "rate_limited"))
 
     @patch("deepseek_client.time.sleep")
     @patch("deepseek_client.urllib.request.urlopen")
@@ -75,6 +103,7 @@ class DeepSeekClientTests(unittest.TestCase):
         with self.assertRaises(DeepSeekError) as raised:
             _post({"model": "deepseek-flash"}, "sk-secret-test-key")
         self.assertIn("401", str(raised.exception))
+        self.assertEqual(raised.exception.reason, "key_rejected")
         self.assertNotIn("sk-secret-test-key", str(raised.exception))
         self.assertEqual(urlopen.call_count, 2)
 

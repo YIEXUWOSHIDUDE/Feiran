@@ -1,11 +1,12 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from deepseek_client import DeepSeekError
-from facts import confirm_facts, import_facts
+from facts import confirm_facts, import_facts, revise_fact
 from cv_import import STRUCTURE_RULES
 from cv_plan import PLAN_RULES
 from gaps import SUGGEST_RULES
@@ -40,27 +41,32 @@ class FakeDeepSeek(FakeChat):
         self.plan = None
         self.gap_suggestions = None
         self.cv_structure = None
+        self.tailor_error = None
         self.sent = []
+        self.systems = []
 
     def __call__(self, messages, model, effort):
         self.sent.append(messages[-1]["content"])
+        self.systems.append(messages[0]["content"])
+        if self.tailor_error and messages[0]["content"].startswith("You rewrite resume lines"):
+            raise self.tailor_error
         if messages[0]["content"] == STRUCTURE_RULES:
             if self.cv_structure is None:
-                raise DeepSeekError("测试中不联网")
+                raise DeepSeekError("测试中不联网", reason="unreachable")
             return {"model": "deepseek-flash", "content": self.cv_structure, "usage": {}}
         if messages[0]["content"] == SUGGEST_RULES:
             if self.gap_suggestions is None:
-                raise DeepSeekError("测试中不联网")
+                raise DeepSeekError("测试中不联网", reason="unreachable")
             ids = {item["text"]: item["id"] for item in json.loads(messages[-1]["content"])["gaps"]}
             return {"model": "deepseek-flash", "content": {"suggestions": self.gap_suggestions(ids)}, "usage": {}}
         if messages[0]["content"] == MATCH_RULES or (messages[0]["content"] == PLAN_RULES and self.plan is None):
-            raise DeepSeekError("测试中不联网")
+            raise DeepSeekError("测试中不联网", reason="unreachable")
         if messages[0]["content"] == PLAN_RULES:
             return {"model": "deepseek-flash", "content": self.plan, "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
         if messages[0]["content"] != FIND_RULES:
             return super().__call__(messages, model, effort)
         if self.requirement_lines is None:
-            raise DeepSeekError("测试中不联网")
+            raise DeepSeekError("测试中不联网", reason="unreachable")
         lines = json.loads(messages[-1]["content"])["lines"]
         picks = [{"line": line["n"], "kind": "required"} for line in lines
                  if line["text"].lstrip("- ") in self.requirement_lines]
@@ -196,6 +202,164 @@ class WebTests(unittest.TestCase):
             "每周至少实习4天": ("excluded", "user"), "参与后端服务开发与测试": ("confirmed", "user"),
         })
         self.assertEqual({item["text"]: item["strength"] for item in later["selected_requirements"]}["有开源项目经历"], "unclear")
+
+    def test_private_details_inside_facts_never_reach_deepseek(self):
+        # Found in review by Codex: a fact copied from an uploaded CV can hold the name or a link,
+        # and every later request built from CV lines must still leave them out.
+        paper = {"id": "fact-paper", "type": "achievement", "tags": ["parser"],
+                 "text": "Alex Example and Sam Lee. Parser design. https://alex.example.com/paper. alex@example.com"}
+        demo = {"id": "fact-demo", "type": "experience", "tags": ["parser"],
+                "text": "Showed the parser demo to the Example University robotics club."}
+        import_facts(self.database, CV_FACTS + [paper, demo])
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS + [paper, demo]])
+        profile = json.loads(json.dumps(PROFILE))
+        profile["sections"][1]["entries"][0]["facts"].append("fact-demo")
+        profile["sections"].append({"kind": "publications", "entries": [{"facts": ["fact-paper"]}]})
+        self.profile_path.write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
+        self.chat.plan = {"sections": ["education", "experience", "skills", "publications"], "entries": [], "reasons": []}
+        self.chat.gap_suggestions = lambda ids: []
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Parser Intern", "text": "Requirements:\n- Parser design\n- Kubernetes operations"}).json()["job_id"]
+        self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers)
+        self.client.post(f"/api/jobs/{job_id}/matches/propose", headers=self.headers)
+        sent = "\n".join(self.chat.sent)
+        preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}").text
+        self.assertTrue(any(SUGGEST_RULES == message for message in self.chat.systems))  # gap suggestions were asked for
+        self.assertIn("Parser design", sent)  # the rest of the line still counts
+        for private in ("Alex", "alex.example.com", "alex@example.com", "Example University", "Example Corp", "Los Angeles"):
+            self.assertNotIn(private, sent)
+        self.assertIn("Alex Example and Sam Lee. Parser design.", preview)  # the CV itself is unchanged
+        # Found in review of PR #2 by Codex: the Chinese CV masked only the Chinese names, and a
+        # fact from an earlier CV named an employer the current CV no longer lists.
+        history = self.profile_path.parent / "profile-history"
+        history.mkdir(exist_ok=True)
+        (history / "cv-profile-20260101T000000000000.json").write_text(json.dumps(
+            {**PROFILE, "sections": [{"kind": "experience", "entries": [{"title": "Acme Corporation", "facts": []}]}]}), encoding="utf-8")
+        old = {"id": "fact-acme", "type": "experience", "tags": ["Python"], "text": "Built Python tools at Acme Corporation."}
+        import_facts(self.database, [old])
+        confirm_facts(self.database, [("fact-acme", 1)])
+        self.chat.sent.clear()
+        self.client.post(f"/api/jobs/{job_id}/cv/zh/prepare", headers=self.headers)
+        self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers)
+        self.client.post(f"/api/jobs/{job_id}/matches/propose", headers=self.headers)
+        later = "\n".join(self.chat.sent)
+        self.assertTrue(later)
+        for private in ("Alex", "Example University", "Acme Corporation"):
+            self.assertNotIn(private, later)
+
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_a_cancelled_or_forgotten_upload_leaves_no_personal_data_behind(self):
+        from test_cv_import import minimal_pdf
+
+        uploads = self.profile_path.parent / "cv-uploads"
+        uploads.mkdir()
+        forgotten = uploads / "0123456789abcdef.json"
+        forgotten.write_text("{}", encoding="utf-8")
+        os.utime(forgotten, (0, 0))  # an upload never saved or cancelled, long ago
+        self.chat.cv_structure = {"sections": [{"kind": "skills", "heading": 2, "entries": [{"facts": [{"lines": [3], "tags": []}]}]}]}
+        pdf = minimal_pdf([(72, 740, "ALEX EXAMPLE"), (72, 700, "SKILLS"), (72, 686, "Languages: Python, Java")])
+        upload = self.client.post("/api/cv/upload", content=pdf, headers={**self.headers, "Content-Type": "application/pdf"}).json()
+        cancelled = self.client.delete(f"/api/cv/uploads/{upload['upload_id']}", headers=self.headers)
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(list(uploads.glob("*.json")), [])
+
+    def test_nothing_is_sent_when_the_private_details_cannot_be_read(self):
+        # Found in review by Codex: an unreadable profile gave an empty list of private words,
+        # which replaced the CV's own, so an employer went out verbatim.
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+        self.profile_path.write_text("{ not json", encoding="utf-8")
+        self.chat.sent.clear()
+        retry = self.client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+        self.assertEqual(retry.status_code, 400)
+        self.assertEqual(self.chat.sent, [])
+        # A broken backup stops requests too, and the page names the file to delete or fix.
+        self.profile_path.write_text(json.dumps(PROFILE, ensure_ascii=False), encoding="utf-8")
+        history = self.profile_path.parent / "profile-history"
+        history.mkdir(exist_ok=True)
+        (history / "cv-profile-20260101T000000000000.json").write_text("[", encoding="utf-8")
+        again = self.client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+        layout = next(stage for stage in self.job(job_id)["cv"]["en"]["stages"] if stage["stage"] == "layout")
+        self.assertEqual((again.status_code, self.chat.sent), (400, []))
+        self.assertIn("cv-profile-20260101T000000000000.json", layout["message"])
+
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_uploading_a_cv_again_repairs_an_unreadable_layout(self):
+        # Found in review by Codex: the broken file went into the backups and kept blocking.
+        from test_cv_import import minimal_pdf
+
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.profile_path.write_text("{ broken", encoding="utf-8")
+        self.chat.cv_structure = {"sections": [{"kind": "skills", "heading": 2, "entries": [{"facts": [{"lines": [3], "tags": []}]}]}]}
+        pdf = minimal_pdf([(72, 740, "ALEX EXAMPLE"), (72, 700, "SKILLS"), (72, 686, "Languages: Python, Java")])
+        upload = self.client.post("/api/cv/upload", content=pdf, headers={**self.headers, "Content-Type": "application/pdf"}).json()
+        saved = self.client.post(f"/api/cv/uploads/{upload['upload_id']}/save", headers=self.headers,
+                                 json={"name": "Alex Example", "links": []})
+        job = self.client.post("/api/jobs", headers=self.headers,
+                               json={"title": "Backend Intern", "text": "Requirements:\n- Experience with Python and SQL"})
+        stages = self.job(job.json()["job_id"])["cv"]["en"]["stages"]
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(stages[0]["status"], "done")
+        self.assertFalse({"profile_unreadable", "backup_unreadable"} & {stage["reason_code"] for stage in stages})
+        self.assertEqual(len(list((self.profile_path.parent / "profile-history").glob("*.broken"))), 1)  # kept aside
+
+    def test_a_failed_retry_says_the_earlier_result_is_kept(self):
+        # Found in review of PR #2 by Codex: a failed "Adjust again" said the usual layout was
+        # used while the earlier adjusted layout was still shown.
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.chat.plan = {"sections": ["education", "experience", "skills"], "entries": [], "reasons": []}
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+        self.chat.plan = None
+        again = self.client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+        cv = self.job(job_id)["cv"]["en"]
+        layout = next(stage for stage in cv["stages"] if stage["stage"] == "layout")
+        self.assertEqual(again.status_code, 400)
+        self.assertEqual((cv["head"], layout["status"], layout["output_available"]), ("planned", "fallback", True))
+        self.assertIn("earlier adjusted layout", layout["message"])
+
+    def test_the_cv_says_which_stage_did_not_work_and_why(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.chat.tailor_error = DeepSeekError("key sk-test-secret was refused", reason="key_rejected")
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+        failed = self.job(job_id)["cv"]["en"]
+        self.chat.tailor_error = None
+        self.chat.plan = {"sections": ["education", "experience", "skills"], "entries": [], "reasons": []}
+        self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+        fixed = self.job(job_id)["cv"]["en"]
+        stages = lambda cv: [(item["stage"], item["status"], item["reason_code"], item["output_available"]) for item in cv["stages"]]
+        self.assertEqual(failed["head"], "draft")
+        self.assertEqual(stages(failed), [("draft", "done", None, True), ("rewording", "fallback", "key_rejected", True),
+                                          ("layout", "fallback", "unreachable", True)])
+        self.assertIn("refused the API key", failed["stages"][1]["message"])
+        self.assertNotIn("sk-test-secret", json.dumps(failed))
+        self.assertEqual(stages(fixed), [("draft", "done", None, True), ("rewording", "done", None, True),
+                                         ("layout", "done", None, True)])
+
+    def test_a_cv_that_cannot_be_drafted_says_what_to_do(self):
+        import_facts(self.database, CV_FACTS)  # imported, not confirmed yet
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+        cv = self.job(job_id)["cv"]["en"]
+        self.assertIsNone(cv["head"])
+        self.assertEqual([(item["stage"], item["status"], item["reason_code"]) for item in cv["stages"]],
+                         [("draft", "failed", "facts_not_confirmed"), ("rewording", "skipped", None), ("layout", "skipped", None)])
+        self.assertIn("Facts page", cv["stages"][0]["message"])
+        # Once a CV exists, a later failure is shown next to it instead of being hidden.
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+        revise_fact(self.database, "fact-skills-languages", text="Languages: Python, Java, Go")
+        again = self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+        cv = self.job(job_id)["cv"]["en"]
+        self.assertEqual(again.status_code, 400)
+        self.assertEqual((cv["head"], cv["stages"][0]["status"], cv["stages"][0]["output_available"]), ("tailored", "failed", True))
+        self.assertIn("last time it could be prepared", cv["stages"][0]["message"])
 
     def decided_job(self):
         job_id = self.create_job()
@@ -402,6 +566,9 @@ class WebTests(unittest.TestCase):
         saved = json.loads(self.profile_path.read_text(encoding="utf-8"))
         backups = list((self.profile_path.parent / "profile-history").glob("*.json"))
         self.assertEqual(found.status_code, 200, found.text)
+        # Matching fell back to skill words, and the page is told so in plain words.
+        self.assertEqual(found.json()["gaps"]["matching"]["fallback_code"], "unreachable")
+        self.assertIn("could not be reached", found.json()["gaps"]["matching"]["message"])
         self.assertEqual({item["requirement_id"]: item["status"] for item in declined["gaps"]["gaps"]},
                          {docker: "added", years: "declined", tests: "added"})
         self.assertIn("Python, Java, Docker", preview)

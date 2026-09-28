@@ -65,6 +65,14 @@ NEGATION_EN = re.compile(r"\b(?:not|never|no|without|none|cannot)\b|n't\b", re.I
 NOT_NEGATION = re.compile(r"\bnot (?:only|just|merely|simply)\b", re.IGNORECASE)  # "not only built but…"
 NEGATION_WORDS = {"not", "never", "no", "without", "none", "cannot"}
 NEGATION_HELPERS = {"be", "been", "being", "have", "has", "had", "to", "a", "an", "the", "any", "yet", "ever", "even"}
+NEGATION_SCOPE = 6  # words after a negation, within its clause, that it can apply to
+# Words that end what a negation applies to: "did not test but deployed" negates only "test".
+NEGATION_ENDS = {"but", "and", "while", "whereas", "although", "though", "however", "instead", "then",
+                 "so", "because", "after", "before"}  # "yet" is a helper: "not yet deployed"
+NEGATION_ENDS_ZH_WORDS = "但|而|却|并且|且|然后|以及|同时|虽然|不过|可是"
+NEGATION_ENDS_ZH = re.compile(rf"[，。；、,.;:：!?！？\s]|{NEGATION_ENDS_ZH_WORDS}")
+LEADING_ZH = re.compile(r"^(?:[了过有]|同时)+")  # 没有同时部署: 同时 belongs to the negation
+CLAUSE_END = re.compile(r"[,.;:!?，。；：！？]")
 # A source counts as negated only on clear words; a rewrite keeps the negation with any of
 # these characters, so a correct translation is never rejected for wording it differently.
 NEGATION_ZH = ("没有", "并未", "尚未", "从未", "未曾", "未能", "并非", "不是", "无法", "不会", "不能", "不再", "未", "不")
@@ -176,37 +184,78 @@ def _stem(word: str) -> str:
     return word
 
 
-def _negated_heads(text: str) -> list[str]:
-    """The English words a negation applies to: "did not deploy it" -> ["deploy"]."""
-    words = [word.casefold() for word in re.findall(r"[A-Za-z][A-Za-z'-]*", NOT_NEGATION.sub("", text))]
-    heads = []
-    for index, word in enumerate(words):
-        if word in NEGATION_WORDS or word.endswith("n't"):
-            following = [later for later in words[index + 1:] if later not in NEGATION_HELPERS]
-            if following:
-                heads.append(_stem(following[0]))
-    return list(dict.fromkeys(heads))
+def _english_negations(text: str) -> list[tuple[str, str, set[str]]]:
+    """Each English negation as (stem of the word it applies to, that word, stems of the words
+    after it in its clause): "did not deploy it" -> ("deploy", "deploy", {"deploy", "it"}). The
+    clause lets "No third-party libraries were used" still negate "use"."""
+    found = []
+    for clause in CLAUSE_END.split(NOT_NEGATION.sub("", text)):
+        words = [word.casefold() for word in re.findall(r"[A-Za-z][A-Za-z'-]*", clause)]
+        for index, word in enumerate(words):
+            if word in NEGATION_WORDS or word.endswith("n't"):
+                following = []
+                for later in words[index + 1:]:
+                    if later in NEGATION_ENDS:
+                        break
+                    if later not in NEGATION_HELPERS:
+                        following.append(later)
+                following = following[:NEGATION_SCOPE]
+                if following:
+                    found.append((_stem(following[0]), following[0], {_stem(later) for later in following}))
+    return found
+
+
+def _chinese_negations(text: str, clearly: bool) -> list[tuple[str, str]]:
+    """Each Chinese negation as (the two characters it applies to, the five after it):
+    没有部署服务 -> ("部署", "部署服务"). A source counts only clear negation words."""
+    found = []
+    for word in NEGATION_ZH if clearly else tuple(NEGATION_ZH_ANY):
+        cleaned = text
+        for compound in COMPOUNDS.get(word, ()):
+            cleaned = cleaned.replace(compound, "")
+        for match in re.finditer(re.escape(word), cleaned):
+            after = NEGATION_ENDS_ZH.split(LEADING_ZH.sub("", cleaned[match.end():]))[0]
+            if after:
+                found.append((after[:2], after[:5]))
+    return found
+
+
+def _chinese_names(stem: str) -> set[str]:
+    """What the glossary calls an English word in Chinese: deploy -> 部署."""
+    return {name for term, others in _OTHER_NAMES.items() if term.isascii() and _stem(term) == stem
+            for name in others if not name.isascii()}
+
+
+def _english_stems(scope: str) -> set[str]:
+    """What the glossary calls the Chinese words starting a negated span in English: 部署服务 -> deploy."""
+    terms = [term for term in _OTHER_NAMES if not term.isascii() and scope.startswith(term)]
+    return {_stem(name.casefold()) for term in terms for name in _OTHER_NAMES[term] if name.isascii()}
 
 
 def _negations_dropped(text: str, source_text: str) -> list[str]:
-    """Negated words of the source that the rewrite no longer negates. Each English word must
-    stay negated; in a translation, a word with a known translation must appear right after a
-    negation; otherwise any negation in the rewrite is accepted."""
-    heads = _negated_heads(source_text)
-    if not heads:
+    """Negated words of the source that the rewrite no longer negates. Each word must stay
+    negated in the same language; in a translation, a word the glossary knows must be negated
+    under its translation; otherwise any negation in the translation is accepted."""
+    english, chinese = _english_negations(source_text), _chinese_negations(source_text, clearly=True)
+    if not english and not chinese:
         return [] if _negated(text, clearly=False) else ["否定"]
-    if CJK.search(text):
-        missing = []
-        for head in heads:
-            names = {name for term, others in _OTHER_NAMES.items() if term.isascii() and _stem(term) == head
-                     for name in others if not name.isascii()}
-            negation = f"[{NEGATION_ZH_ANY}][^，。；、,.;]{{0,3}}"
-            if (not any(re.search(negation + re.escape(name), text) for name in names)
-                    if names else not _negated(text, clearly=False)):
-                missing.append(head)
-        return missing
-    kept = _negated_heads(text)
-    return [head for head in heads if head not in kept]
+    kept_english = [scope for _, _, scope in _english_negations(text)]
+    kept_chinese = [scope for _, scope in _chinese_negations(text, clearly=False)]
+    in_chinese = CJK.search(text) is not None
+    missing = []
+    for stem, word, _ in english:
+        names = _chinese_names(stem)
+        if any(stem in scope for scope in kept_english) or (in_chinese and (
+                any(name in scope for scope in kept_chinese for name in names) if names else kept_chinese)):
+            continue
+        missing.append(word)
+    for head, scope in chinese:
+        stems = _english_stems(scope)
+        if any(head in kept for kept in kept_chinese) or (not in_chinese and (
+                any(stem in kept for kept in kept_english for stem in stems) if stems else kept_english)):
+            continue
+        missing.append(head)
+    return list(dict.fromkeys(missing))
 
 
 def _quantities(text: str) -> list[tuple[str, str | None, str]]:

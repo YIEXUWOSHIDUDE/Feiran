@@ -6,10 +6,11 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from deepseek_client import DEFAULT_MODEL as DEEPSEEK_MODEL, DeepSeekError
 from facts import FactStoreError, find_confirmed_facts, list_facts, load_confirmed_fact
+from privacy import mask
 from review import build_report
 
 
@@ -85,18 +86,20 @@ def _validated_requirements(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _model_choices(
-    requirements: list[dict[str, Any]], facts_db: Path, chat: Callable[..., dict], effort: str
+    requirements: list[dict[str, Any]], facts_db: Path, chat: Callable[..., dict], effort: str,
+    private: Iterable[str] = (),
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Ask DeepSeek which confirmed facts show each requirement is met.
 
-    Only requirement texts and confirmed fact texts are sent. Unknown or pending fact IDs
+    Only requirement texts and confirmed fact texts are sent, with the name, contact details,
+    schools and employers in ``private`` (and any email, link or phone) masked. Unknown or pending fact IDs
     and unknown requirements in the answer are dropped, so the model can only point at
     facts the user confirmed.
     """
     confirmed = {fact["id"]: fact for fact in list_facts(facts_db) if fact["status"] == "confirmed"}
     request = {
         "requirements": [{"id": item["id"], "text": item["text"]} for item in requirements],
-        "facts": [{"id": fact["id"], "text": fact["text"]} for fact in confirmed.values()],
+        "facts": [{"id": fact["id"], "text": mask(fact["text"], private)} for fact in confirmed.values()],
     }
     reply = chat(
         [{"role": "system", "content": MATCH_RULES}, {"role": "user", "content": json.dumps(request, ensure_ascii=False)}],
@@ -129,6 +132,7 @@ def propose_matches(
     limit: int = 10,
     chat: Callable[..., dict] | None = None,
     effort: str = "none",
+    private: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Retrieve bounded local candidates without copying unrelated facts.
 
@@ -147,9 +151,9 @@ def propose_matches(
     details: dict[str, Any] = {}
     if chat is not None:
         try:
-            choices, details = _model_choices(requirements, facts_db, chat, effort)
+            choices, details = _model_choices(requirements, facts_db, chat, effort, private)
         except (DeepSeekError, MatchingError) as exc:
-            details = {"fallback_reason": str(exc)}
+            details = {"fallback_reason": str(exc), "fallback_code": getattr(exc, "reason", "bad_response")}
     match_candidates = []
     requirement_summaries = []
     for requirement in requirements:
