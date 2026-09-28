@@ -148,6 +148,26 @@ class GapTests(unittest.TestCase):
         gaps, _ = self.gaps(overclaiming)
         self.assertEqual({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"], None)
 
+    def test_a_new_line_that_rewords_one_already_there_is_dropped(self):
+        # Seen on a real posting: the suggestion restated an existing bullet with the job's words.
+        def rewording(ids):
+            return [{"requirement": ids["Writing integration tests for services"], "kind": "bullet", "entry": "s1e0",
+                     "text": "Built and tested REST APIs for the internal tool's users.", "tags": ["REST APIs"]},
+                    {"requirement": ids["Hands-on Docker and Kubernetes"], "kind": "bullet", "entry": "s1e0",
+                     "text": "Writing unit test for the billing codes.", "tags": []}]  # the same words, other endings
+        gaps, _ = self.gaps(rewording)
+        suggestions = {item["text"]: item["suggestion"] for item in gaps["requirements"]}
+        self.assertIsNone(suggestions["Writing integration tests for services"])
+        self.assertIsNone(suggestions["Hands-on Docker and Kubernetes"])
+
+    def test_a_new_line_about_unrelated_work_is_dropped(self):
+        # Seen on a real posting: sensor fusion and HD map work suggested under unrelated projects.
+        def unrelated(ids):
+            return [{"requirement": ids["Writing integration tests for services"], "kind": "bullet", "entry": "s1e0",
+                     "text": "Integrated camera and LiDAR sensor fusion for vehicle perception.", "tags": ["LiDAR"]}]
+        gaps, _ = self.gaps(unrelated)
+        self.assertIsNone({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"])
+
     def test_suggestions_repeating_what_the_cv_already_says_are_dropped(self):
         def repeating(ids):
             return [

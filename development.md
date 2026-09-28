@@ -292,6 +292,12 @@ v3 根据 2026-09 下载的 8,787 个公开岗位补充了各公司常用的要�
 
 之后 232 个测试通过；上述修正的变异检查全部被测试发现；真实 DeepSeek 在新的按条目格式下复测正常（实习 JD 2.6 秒，结果不变）；浏览器点击检查结果不变。
 
+**真实岗位检查（2026-09-28；用户说检查 2 个岗位即可）**：用 Start 在真实数据上走完整流程（真实 DeepSeek）：DoorDash Software Engineer, Intern (Summer 2027) 与 Waymo 2027 Summer Intern, MS/PhD, Road Understanding, ML Engineer。每个岗位约 5–6 秒准备好简历、3–5 秒完成要求检查。要求提取两个岗位都正确（必需/加分分组正确，职责和福利行未计入）；两份简历的改写都没有改动任何一行；结构调整合理。发现并修正的问题：
+- 补充建议：DoorDash 7 条中 4 条只是把已有要点换个说法并加上 JD 原话（如 “Addressed real-time technology problems by decoupling window capture…”），接受后会出现几乎重复且多出主张的要点；Waymo 有 3 条在无关条目下编造具体工作（求职工具项目下的 MapTR 车道拓扑、OCR 项目下的相机/LiDAR 融合和 Transformer 模型）；还建议把 “Data Structures” 加进 Languages 行。现在规则要求技能只加进标签相符的行，新要点只加在已有相关工作的条目下，不重述已有行、不照抄要求原文、不编造模型/系统/功能，需要单独项目才能说明的经验回答 none。程序另外丢弃与所在条目（名称、角色和各行）没有共同实词的新要点，以及与某条已有行实词重合 ≥60% 的新要点（轻量词干化，中文按双字）。用旧答案回放，8 条有问题的新要点中程序规则单独就丢弃 5 条；重新检查后 DoorDash 只剩 1 条技能建议（CI/CD），Waymo 不再有编造的要点。
+- 证据判断：列出多个选择的要求（A、B 或 C）被当作需要全部满足；证据没有按强弱排序（“experience with databases” 由在读课程而不是 MySQL 要点说明）；论文不在指定会议时判为 none。规则现在说明满足其一即可、按强弱排序、这种论文算 related；重新检查后 databases 由 MySQL 要点说明、论文为 related。“project or research-based work, hackathons…” 仍为 related（被删去的论文显示在旁边，可以放回）。
+- 结构调整：删去 Publications 的理由写在 “sections” 下，栏目顺序本身没变，所以页面上这项删减没有理由；现在删去的栏目没有自己的理由时使用 “sections” 的理由。
+- 仍存在：同类判断在不同次检查中可能宽严不一（如把列出 PyTorch 的技能行算作 “solid experience with deep learning frameworks”）。这正是第 6 项测试集要衡量的。
+
 尚未做（计划第 6–7 项）：语义复核的测试集与 DeepSeek/Jev 对比；文档整体更新。
 
 ## 上传简历（2026-09-27）
