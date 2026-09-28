@@ -533,6 +533,23 @@ class ChromeTests(unittest.TestCase):
                 with self.assertRaisesRegex(CVError, "退出码 1.*No usable sandbox"):
                     print_with_chrome(html, Path(directory) / "cv.pdf")
 
+    def test_chrome_always_keeps_its_sandbox(self):
+        # A container that refuses the sandbox is given a seccomp profile (deploy/), never --no-sandbox.
+        with tempfile.TemporaryDirectory() as directory:
+            chrome = Path(directory) / "chrome"
+            chrome.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args.txt\"\n"
+                "for arg in \"$@\"; do case \"$arg\" in --print-to-pdf=*)"
+                " printf '%%PDF-1.4\\n%%%%EOF\\n' > \"${arg#--print-to-pdf=}\";; esac; done\n")
+            chrome.chmod(0o755)
+            html = Path(directory) / "cv.html"
+            html.write_text("<p>CV</p>", encoding="utf-8")
+            with patch.dict(os.environ, {"CHROME_PATH": str(chrome)}):
+                print_with_chrome(html, Path(directory) / "cv.pdf")
+            arguments = (Path(directory) / "args.txt").read_text().splitlines()
+            self.assertIn("--headless=new", arguments)
+            self.assertEqual([argument for argument in arguments if "sandbox" in argument], [])
+
 
 class PrivateLineTests(unittest.TestCase):
     def test_a_line_naming_the_employer_is_never_sent_whatever_extra_words_are_given(self):

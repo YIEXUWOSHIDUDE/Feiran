@@ -39,6 +39,11 @@ jobs:
       WORKBENCH_REQUIRE_DATA: "1"
     steps:
       - uses: actions/checkout@v7
+      - name: The Docker and kernel settings Chromium's sandbox depends on
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          sysctl user.max_user_namespaces kernel.apparmor_restrict_unprivileged_userns || true
       - name: Build the image
         run: docker build -t "$WORKBENCH_IMAGE" .
       - name: Nothing personal or local is in the image, and it runs as its own user

@@ -1,8 +1,10 @@
 import importlib.util
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -761,9 +763,12 @@ class ServerSettingsTests(unittest.TestCase):
 
     def test_startup_refuses_a_data_folder_that_is_not_the_volume(self):
         # Logging is set up for the whole process when the server starts; not in a test run.
-        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("web.logging.basicConfig"):
+        said, complained = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, \
+                patch("web.logging.basicConfig"), redirect_stdout(said), redirect_stderr(complained):
             self.assertEqual(main(["--data", directory, "--require-data"]), 2)
             run.assert_not_called()
+            self.assertIn(DATA_MARKER, complained.getvalue())  # says why, not only that it stopped
             (Path(directory) / DATA_MARKER).write_text("", encoding="utf-8")
             self.assertEqual(main(["--data", directory, "--require-data", "--host", "0.0.0.0"]), 0)
         self.assertEqual((run.call_args.kwargs["host"], run.call_args.kwargs["access_log"]), ("0.0.0.0", False))

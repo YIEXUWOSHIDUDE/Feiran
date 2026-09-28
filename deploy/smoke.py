@@ -90,7 +90,7 @@ def client_for(data: Path) -> TestClient:
 
 def ok(response, what: str) -> dict:
     if response.status_code != 200:
-        raise SystemExit(f"FAILED {what}: HTTP {response.status_code} {response.text[:300]}")
+        raise SystemExit(f"FAILED {what}: HTTP {response.status_code} {response.text[:600]}")
     return response.json()
 
 
