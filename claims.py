@@ -67,11 +67,11 @@ NEGATION_WORDS = {"not", "never", "no", "without", "none", "cannot"}
 NEGATION_HELPERS = {"be", "been", "being", "have", "has", "had", "to", "a", "an", "the", "any", "yet", "ever", "even"}
 NEGATION_SCOPE = 6  # words after a negation, within its clause, that it can apply to
 # Words that end what a negation applies to: "did not test but deployed" negates only "test".
-NEGATION_ENDS = {"but", "and", "yet", "while", "whereas", "although", "though", "however", "instead", "then",
-                 "so", "because", "after", "before"}
+NEGATION_ENDS = {"but", "and", "while", "whereas", "although", "though", "however", "instead", "then",
+                 "so", "because", "after", "before"}  # "yet" is a helper: "not yet deployed"
 NEGATION_ENDS_ZH_WORDS = "但|而|却|并且|且|然后|以及|同时|虽然|不过|可是"
 NEGATION_ENDS_ZH = re.compile(rf"[，。；、,.;:：!?！？\s]|{NEGATION_ENDS_ZH_WORDS}")
-LEADING_ZH = re.compile(rf"^(?:[了过有]|{NEGATION_ENDS_ZH_WORDS})+")
+LEADING_ZH = re.compile(r"^(?:[了过有]|同时)+")  # 没有同时部署: 同时 belongs to the negation
 CLAUSE_END = re.compile(r"[,.;:!?，。；：！？]")
 # A source counts as negated only on clear words; a rewrite keeps the negation with any of
 # these characters, so a correct translation is never rejected for wording it differently.
@@ -196,9 +196,7 @@ def _english_negations(text: str) -> list[tuple[str, str, set[str]]]:
                 following = []
                 for later in words[index + 1:]:
                     if later in NEGATION_ENDS:
-                        if following:
-                            break
-                        continue  # "not yet deployed": right after the negation it belongs to it
+                        break
                     if later not in NEGATION_HELPERS:
                         following.append(later)
                 following = following[:NEGATION_SCOPE]

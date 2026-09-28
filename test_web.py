@@ -275,6 +275,36 @@ class WebTests(unittest.TestCase):
         retry = self.client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
         self.assertEqual(retry.status_code, 400)
         self.assertEqual(self.chat.sent, [])
+        # A broken backup stops requests too, and the page names the file to delete or fix.
+        self.profile_path.write_text(json.dumps(PROFILE, ensure_ascii=False), encoding="utf-8")
+        history = self.profile_path.parent / "profile-history"
+        history.mkdir(exist_ok=True)
+        (history / "cv-profile-20260101T000000000000.json").write_text("[", encoding="utf-8")
+        again = self.client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+        layout = next(stage for stage in self.job(job_id)["cv"]["en"]["stages"] if stage["stage"] == "layout")
+        self.assertEqual((again.status_code, self.chat.sent), (400, []))
+        self.assertIn("cv-profile-20260101T000000000000.json", layout["message"])
+
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_uploading_a_cv_again_repairs_an_unreadable_layout(self):
+        # Found in review by Codex: the broken file went into the backups and kept blocking.
+        from test_cv_import import minimal_pdf
+
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.profile_path.write_text("{ broken", encoding="utf-8")
+        self.chat.cv_structure = {"sections": [{"kind": "skills", "heading": 2, "entries": [{"facts": [{"lines": [3], "tags": []}]}]}]}
+        pdf = minimal_pdf([(72, 740, "ALEX EXAMPLE"), (72, 700, "SKILLS"), (72, 686, "Languages: Python, Java")])
+        upload = self.client.post("/api/cv/upload", content=pdf, headers={**self.headers, "Content-Type": "application/pdf"}).json()
+        saved = self.client.post(f"/api/cv/uploads/{upload['upload_id']}/save", headers=self.headers,
+                                 json={"name": "Alex Example", "links": []})
+        job = self.client.post("/api/jobs", headers=self.headers,
+                               json={"title": "Backend Intern", "text": "Requirements:\n- Experience with Python and SQL"})
+        stages = self.job(job.json()["job_id"])["cv"]["en"]["stages"]
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(stages[0]["status"], "done")
+        self.assertFalse({"profile_unreadable", "backup_unreadable"} & {stage["reason_code"] for stage in stages})
+        self.assertEqual(len(list((self.profile_path.parent / "profile-history").glob("*.broken"))), 1)  # kept aside
 
     def test_a_failed_retry_says_the_earlier_result_is_kept(self):
         # Found in review of PR #2 by Codex: a failed "Adjust again" said the usual layout was

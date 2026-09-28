@@ -120,9 +120,11 @@ REASONS = {
     "no_facts": "There are no facts yet. Upload your CV on the Facts page.",
     "facts_not_confirmed": "Some lines of your CV are not confirmed yet. Confirm them on the Facts page.",
     "facts_missing": "Your CV lists facts that are no longer stored. Upload your CV again on the Facts page.",
-    "profile_unreadable": "Your CV layout file could not be read. Upload your CV again on the Facts page.",
-    "private_unreadable": "Your CV layout or one of its backups could not be read, so it is not clear what must "
-                          "stay private. Nothing was sent to DeepSeek. Upload your CV again on the Facts page.",
+    "profile_unreadable": "Your CV layout file could not be read, so it is not clear what must stay private. "
+                          "Nothing was sent to DeepSeek. Upload your CV again on the Facts page.",
+    "backup_unreadable": "A backup of your CV layout ({file} in .local/profile-history) could not be read, so it "
+                         "is not clear what must stay private. Nothing was sent to DeepSeek. Delete or fix that "
+                         "file, then try again.",
 }
 STAGES = ("draft", "rewording", "layout")
 STAGE_FAILED = {"draft": "Not prepared", "rewording": "Not reworded", "layout": "Not adjusted for this job"}
@@ -146,7 +148,8 @@ def _stage_failure(stage: str, exc: Exception, earlier: bool = False) -> dict:
     """A stage that did not work: a fallback when a result stays usable, else failed. ``earlier``
     says a retry failed while this stage's earlier result is still shown."""
     code = _reason(exc)
-    explanation = REASONS.get(code) or str(exc)  # domain messages hold no key or response text
+    # Domain messages hold no key or response text.
+    explanation = (REASONS.get(code) or str(exc)).replace("{file}", getattr(exc, "file", ""))
     if stage == "draft":
         return _stage(stage, "failed", f"{STAGE_FAILED[stage]}: {explanation}", code, output=False)
     kept = STAGE_KEPT_EARLIER[stage] if earlier else STAGE_KEPT[stage]
@@ -397,8 +400,14 @@ def create_app(
             history = path.parent / "profile-history"
             history.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-            with (history / f"cv-profile-{stamp}.json").open("xb") as backup:
-                backup.write(path.read_bytes())
+            raw = path.read_bytes()
+            try:
+                readable = isinstance(json.loads(raw.decode("utf-8")), dict)
+            except ValueError:
+                readable = False
+            # A broken file is kept for the user to look at, but never read as a backup.
+            with (history / f"cv-profile-{stamp}.{'json' if readable else 'broken'}").open("xb") as backup:
+                backup.write(raw)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
         temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -421,7 +430,11 @@ def create_app(
                 terms.update(private_terms(json.loads(source.read_text(encoding="utf-8"))))
             except (OSError, ValueError, AttributeError) as exc:
                 # Unsure what is private: send nothing rather than guess.
-                raise CVError(f"无法读取 {source.name}，不确定哪些内容需要遮盖", reason="private_unreadable") from exc
+                if source == path:
+                    raise CVError(f"无法读取简历 profile：{source.name}", reason="profile_unreadable") from exc
+                error = CVError(f"无法读取 profile 备份：{source.name}", reason="backup_unreadable")
+                error.file = source.name
+                raise error from exc
         return sorted(terms, key=len, reverse=True)
 
     def record_stages(job_id: str, language: str, stages: list[dict]) -> None:

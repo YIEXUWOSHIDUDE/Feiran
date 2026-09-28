@@ -169,21 +169,26 @@ def _plain(text: str) -> str:
     return "".join(character for character in text if not character.isspace() and character not in "|•●◦▪")
 
 
-def _free_span(here: str, after: str, labels: list[str], claimed: list[tuple[int, int]]) -> tuple[int, int] | None:
+Span = tuple[int, int]
+
+
+def _free_span(here: str, after: str, labels: list[str], claimed: list[Span],
+               claimed_after: list[Span]) -> tuple[Span, Span | None] | None:
     """Where one of the labels sits on this line (text without spaces) that no other link has
-    claimed; text running on into the next line counts from where it starts here."""
-    def free(span: tuple[int, int]) -> bool:
-        return not any(start < span[1] and span[0] < end for start, end in claimed)
+    claimed, and, for text running on into the next line, the part it takes there."""
+    def free(span: Span, taken: list[Span]) -> bool:
+        return not any(start < span[1] and span[0] < end for start, end in taken)
 
     for label in filter(None, labels):
         position = here.find(label)
         while position >= 0:
-            if free(span := (position, position + len(label))):
-                return span
+            if free(span := (position, position + len(label)), claimed):
+                return span, None
             position = here.find(label, position + 1)
         position = (here + after).find(label, max(0, len(here) - len(label) + 1))
-        if 0 <= position < len(here) and free(span := (position, len(here))):
-            return span
+        if (0 <= position < len(here) and free(span := (position, len(here)), claimed)
+                and free(rest := (0, position + len(label) - len(here)), claimed_after)):
+            return span, rest
     return None
 
 
@@ -229,9 +234,13 @@ class _Links:
                     continue
                 here = _compact(" ".join(lines[index]))
                 after = _compact(" ".join(lines[index + 1])) if index + 1 < len(lines) else ""
-                span = _free_span(here, after, [_compact(label) for label in item["labels"]], claimed.setdefault(index, []))
-                if span is not None:
+                found = _free_span(here, after, [_compact(label) for label in item["labels"]],
+                                   claimed.setdefault(index, []), claimed.setdefault(index + 1, []))
+                if found is not None:
+                    span, rest = found
                     claimed[index].append(span)
+                    if rest:
+                        claimed[index + 1].append(rest)
                     item["line"], start = index + 1, index
                     break
 

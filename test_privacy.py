@@ -28,6 +28,13 @@ class PrivacyTests(unittest.TestCase):
         masked = mask("Published tools as octocat on GitHub; profile alex-example-123; blog alexdev.", private_terms(profile))
         self.assertEqual(masked, "Published tools as [private] on GitHub; profile [private]; blog [private].")
 
+    def test_short_and_encoded_handles_in_a_link_are_private(self):
+        # Found in review by Codex: a two-letter handle and a percent-encoded one got through.
+        profile = {"name": "Alex Example", "sections": [], "contact": {"links": [
+            {"label": "GitHub", "url": "https://github.com/xy"}, {"label": "GitLab", "url": "https://gitlab.com/octo%63at"}]}}
+        masked = mask("Published tools as xy and octocat.", private_terms(profile))
+        self.assertEqual(masked, "Published tools as [private] and [private].")
+
 
 if __name__ == "__main__":
     unittest.main()

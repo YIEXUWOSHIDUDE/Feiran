@@ -214,6 +214,19 @@ class CVImportTests(unittest.TestCase):
         self.assertEqual((alpha["links"], beta["links"]),
                          ({"GitHub": "https://example.com/alpha"}, {"GitHub": "https://example.com/beta"}))
 
+    def test_link_text_running_onto_the_next_line_is_claimed_on_both_lines(self):
+        # Found in review by Codex: the continued part stayed free for another link.
+        lines = [["ALEX EXAMPLE"], ["alex@example.com"], ["PROJECTS"], ["Alpha", "Python"], ["• See Git"],
+                 ["Hub for source."], ["Beta", "Go"], ["• See Hub for source."]]
+        links = [{"url": "https://example.com/alpha", "pieces": ["Git", "Hub"], "context": "• See Git"},
+                 {"url": "https://example.com/beta", "pieces": ["Hub"], "context": "• See Hub for source."}]
+        answer = {"sections": [{"kind": "projects", "heading": 3, "entries": [
+            {"title": [4, 1], "location": [4, 2], "facts": [{"lines": [5, 6], "tags": []}]},
+            {"title": [7, 1], "location": [7, 2], "facts": [{"lines": [8], "tags": []}]}]}]}
+        alpha, beta = structure_cv(lines, FakeStructurer(answer), links=links)["sections"][0]["entries"]
+        self.assertEqual((alpha["links"], beta["links"]),
+                         ({"Git Hub": "https://example.com/alpha"}, {"Hub": "https://example.com/beta"}))
+
     def test_uploading_an_old_cv_again_never_undoes_a_later_correction(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "workbench.db"

@@ -8,7 +8,7 @@ them; the CV itself keeps each line word for word.
 
 import re
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 EMAIL = re.compile(r"(?:mailto:)?[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -36,8 +36,8 @@ URL_WORDS = {"in", "pub", "u", "user", "users", "profile", "people", "citations"
 def _handles(url: str) -> list[str]:
     """The parts of a personal link that name the user: github.com/octocat -> octocat."""
     parts = urlsplit(url if "://" in url else f"https://{url}")
-    words = [word for word in parts.path.split("/")] + [value for _, value in parse_qsl(parts.query)]
-    return [word for word in words if len(word) >= 3 and word.casefold() not in URL_WORDS]
+    words = [unquote(word) for word in parts.path.split("/")] + [value for _, value in parse_qsl(parts.query)]
+    return [word for word in words if len(word) >= 2 and word.casefold() not in URL_WORDS]
 
 
 def is_phone(text: str) -> bool:

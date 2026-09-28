@@ -94,6 +94,7 @@ class ClaimCheckTests(unittest.TestCase):
             ("没有部署服务。", "没有测试但部署服务。"),
             ("Have not yet deployed the service.", "Deployed the service without downtime."),  # review of the fixes
             ("没有同时部署服务。", "部署服务且没有停机。"),
+            ("Did not deploy the service.", "Not before testing did we deploy the service."),  # 4th review
         ]
         for source, rewrite in cases:
             with self.subTest(rewrite=rewrite):
