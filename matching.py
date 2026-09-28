@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterable
 
 from deepseek_client import DEFAULT_MODEL as DEEPSEEK_MODEL, DeepSeekError
 from facts import FactStoreError, find_confirmed_facts, list_facts, load_confirmed_fact
-from privacy import mask
+from privacy import mask, stand_ins
 from review import build_report
 
 
@@ -91,15 +91,16 @@ def _model_choices(
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Ask DeepSeek which confirmed facts show each requirement is met.
 
-    Only requirement texts and confirmed fact texts are sent, with the name, contact details,
-    schools and employers in ``private`` (and any email, link or phone) masked. Unknown or pending fact IDs
-    and unknown requirements in the answer are dropped, so the model can only point at
+    Only requirement texts and confirmed fact texts are sent, under stand-in IDs, with the name,
+    contact details, schools and employers in ``private`` (and any email, link or phone) masked.
+    Unknown stand-ins and requirements in the answer are dropped, so the model can only point at
     facts the user confirmed.
     """
     confirmed = {fact["id"]: fact for fact in list_facts(facts_db) if fact["status"] == "confirmed"}
+    out, back = stand_ins(confirmed, prefix="F")
     request = {
         "requirements": [{"id": item["id"], "text": item["text"]} for item in requirements],
-        "facts": [{"id": fact["id"], "text": mask(fact["text"], private)} for fact in confirmed.values()],
+        "facts": [{"id": out[fact["id"]], "text": mask(fact["text"], private)} for fact in confirmed.values()],
     }
     reply = chat(
         [{"role": "system", "content": MATCH_RULES}, {"role": "user", "content": json.dumps(request, ensure_ascii=False)}],
@@ -116,7 +117,7 @@ def _model_choices(
         fact_ids = pick.get("facts") if isinstance(pick, dict) else None
         if requirement_id not in wanted or requirement_id in choices or not isinstance(fact_ids, list):
             continue
-        known = [fact_id for fact_id in dict.fromkeys(fact_ids) if isinstance(fact_id, str) and fact_id in confirmed]
+        known = [back[alias] for alias in dict.fromkeys(fact_ids) if isinstance(alias, str) and alias in back]
         choices[requirement_id] = [
             {**confirmed[fact_id], "retrieval_basis": {"method": "deepseek", "rank": rank}}
             for rank, fact_id in enumerate(known[:MAX_MODEL_FACTS], 1)

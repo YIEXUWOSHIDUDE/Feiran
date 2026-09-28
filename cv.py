@@ -20,7 +20,7 @@ from claims import check_rewrite
 from cv_layout import shown_sections
 from deepseek_client import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, load_current_facts
-from privacy import mask, private_terms
+from privacy import mask, private_terms, stand_ins
 from review import build_report
 
 
@@ -654,7 +654,7 @@ Rules:
 5. One sentence per line, no line breaks, about the same length or shorter.
 6. For "Label: items" lines keep the items exactly; you may translate only the label.
 Reply with this json shape, exactly one entry per input line, reusing each fact_id:
-{{"lines": [{{"fact_id": "fact-example", "text": "rewritten line"}}]}}"""
+{{"lines": [{{"fact_id": "L1", "text": "rewritten line"}}]}}"""
 
 
 def _rewrites(content: Any, expected: set[str]) -> dict[str, str]:
@@ -683,8 +683,8 @@ def tailor_draft(
 ) -> dict[str, Any]:
     """Rewrite bullet, skill and coursework lines for one job, keeping only checked rewrites.
 
-    Only line text, the job title and its confirmed requirements are sent: never the name,
-    contact details, entry titles or publications. A line that itself holds any of them (such
+    Only line text (under stand-in IDs), the job title and its confirmed requirements are sent:
+    never the name, contact details, entry titles, publications or fact IDs. A line that itself holds any of them (such
     as a link or an employer's name) is not sent and stays as confirmed; ``private`` adds words
     to mask to the draft's own (its language only). A rewrite that fails
     check_rewrite is recorded with its reasons while the line keeps the confirmed fact word
@@ -697,13 +697,14 @@ def tailor_draft(
     current = _verify_draft(draft, facts_db)
     job_summary = _job_summary(job)
     private = sorted({*private_terms(draft), *(private or ())}, key=len, reverse=True)
-    requested = [
-        {"fact_id": line["fact_id"], "section": section["kind"], "text": line["text"]}
-        for section in draft["sections"] if section["kind"] in TAILOR_KINDS
+    sendable = [
+        (section["kind"], line) for section in draft["sections"] if section["kind"] in TAILOR_KINDS
         for entry in section["entries"] for line in entry["lines"] if mask(line["text"], private) == line["text"]
     ]
-    if not requested:
+    if not sendable:
         raise CVError("草稿中没有可改写的行")
+    out, back = stand_ins(line["fact_id"] for _, line in sendable)
+    requested = [{"fact_id": out[line["fact_id"]], "section": kind, "text": line["text"]} for kind, line in sendable]
     language = LANGUAGE_NAMES[draft["language"]]
     request = {
         "target_language": language,
@@ -719,7 +720,7 @@ def tailor_draft(
         answer = chat(messages, model=model, effort=effort)
     except DeepSeekError as exc:
         raise CVError(f"DeepSeek 改写失败：{exc}") from exc
-    rewrites = _rewrites(answer.get("content"), {item["fact_id"] for item in requested})
+    rewrites = {back[alias]: text for alias, text in _rewrites(answer.get("content"), set(back)).items()}
     vocabulary = [tag for fact in current.values() for tag in fact["tags"]]
     result = copy.deepcopy(draft)
     counts = {"accepted": 0, "rejected": 0}

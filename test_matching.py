@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from deepseek_client import DeepSeekError
-from facts import FactStoreError, add_fact, confirm_fact, initialize_database, revise_fact
+from facts import FactStoreError, add_fact, confirm_fact, initialize_database, list_facts, revise_fact
 from matching import MatchingError, apply_match_decisions, first_candidates, main, propose_matches
 from requirement_flow import apply_requirement_decisions, propose_requirements
 from review import build_report
@@ -41,18 +41,23 @@ def decided_requirements(include_education=False):
 
 
 class FakeMatcher:
-    """Stands in for DeepSeek: returns fixed fact choices per requirement, or fails."""
+    """Stands in for DeepSeek: returns fixed fact choices per requirement, or fails. Choices
+    name facts by ID; the answer uses the IDs the request gave those facts' texts."""
 
-    def __init__(self, matches=None, error=None):
+    def __init__(self, matches=None, error=None, database=None):
         self.matches = matches
         self.error = error
+        self.database = database
         self.messages = None
 
     def __call__(self, messages, model, effort):
         self.messages = messages
         if self.error:
             raise self.error
-        return {"model": "deepseek-flash", "content": {"matches": self.matches},
+        sent = {fact["text"]: fact["id"] for fact in json.loads(messages[-1]["content"])["facts"]}
+        ids = {fact["id"]: sent[fact["text"]] for fact in list_facts(self.database) if fact["text"] in sent}
+        matches = [{**item, "facts": [ids.get(fact_id, fact_id) for fact_id in item["facts"]]} for item in self.matches]
+        return {"model": "deepseek-flash", "content": {"matches": matches},
                 "usage": {"prompt_tokens": 40, "completion_tokens": 8}}
 
 
@@ -74,7 +79,7 @@ class MatchingTests(unittest.TestCase):
                 {"requirement": ids[0], "facts": [python["id"], pending["id"], "fact-unknown", python["id"]]},
                 {"requirement": ids[1], "facts": []},
                 {"requirement": "req-unknown", "facts": [degree["id"]]},
-            ])
+            ], database=database)
             proposed = propose_matches(data, database, chat=matcher)
             linked = apply_match_decisions(proposed, database, *first_candidates(proposed), decided_by="auto")
         sent = json.loads(matcher.messages[-1]["content"])
@@ -83,8 +88,10 @@ class MatchingTests(unittest.TestCase):
             [(ids[0], python["id"])],
         )
         self.assertEqual(proposed["fact_matching"]["method"], "deepseek-facts-v1")
-        # Pending facts are never offered, so they are never sent either.
-        self.assertEqual(sorted(fact["id"] for fact in sent["facts"]), sorted([python["id"], degree["id"]]))
+        # Pending facts are never offered, so they are never sent either; nor is any fact ID.
+        self.assertEqual(sorted(fact["text"] for fact in sent["facts"]), sorted([python["text"], degree["text"]]))
+        for fact in (python, degree, pending):
+            self.assertNotIn(fact["id"], matcher.messages[-1]["content"])
         self.assertEqual(
             {key: (value["status"], value["decided_by"]) for key, value in linked["match_decisions"].items()},
             {ids[0]: ("linked", "auto"), ids[1]: ("no_match", "auto")},

@@ -8,7 +8,7 @@ from facts import add_fact, list_facts, revise_fact
 from gaps import SUGGEST_RULES, accept_gap, decline_gap, find_gaps
 from matching import MATCH_RULES
 from requirement_flow import apply_requirement_decisions, propose_requirements
-from test_cv import PROFILE, make_store
+from test_cv import FACTS, PROFILE, make_store, stand_ins_for, swap_ids
 
 
 JD = """Requirements:
@@ -36,12 +36,19 @@ class FakeDeepSeek:
         request = json.loads(messages[-1]["content"])
         self.sent.append(messages[-1]["content"])
         if messages[0]["content"] == MATCH_RULES:
-            matches = [{"requirement": item["id"], "facts": ["fact-skills-languages"] if "Python" in item["text"] else []}
+            python = stand_ins_for(request["facts"])["fact-skills-languages"]
+            matches = [{"requirement": item["id"], "facts": [python] if "Python" in item["text"] else []}
                        for item in request["requirements"]]
             return {"model": "deepseek-flash", "content": {"matches": matches}, "usage": {}}
         assert messages[0]["content"] == SUGGEST_RULES
         ids = {item["text"]: item["id"] for item in request["gaps"]}
-        return {"model": "deepseek-flash", "usage": {}, "content": {"suggestions": self.suggestions(ids)}}
+        return {"model": "deepseek-flash", "usage": {}, "content": {"suggestions": resume_ids(self.suggestions(ids), request)}}
+
+
+def resume_ids(value, request):
+    """``value`` naming CV lines by fact ID, turned into the IDs the request gave them."""
+    lines = [line for section in request["resume"] for entry in section["entries"] for line in entry["lines"]]
+    return swap_ids(value, stand_ins_for(lines))
 
 
 def suggestions(ids):
@@ -82,6 +89,9 @@ class GapTests(unittest.TestCase):
             self.assertFalse(any(private in sent for sent in chat.sent))
         self.assertEqual({item["strength"] for item in gaps["gaps"]}, {"required"})
         self.assertEqual({item["strength"] for item in json.loads(chat.sent[-1])["gaps"]}, {"required"})
+        for fact in FACTS:
+            self.assertNotIn(fact["id"], chat.sent[-1])
+        self.assertEqual(listed["Hands-on Docker and Kubernetes"]["fact_id"], "fact-skills-languages")
 
     def test_suggestions_that_claim_numbers_or_leadership_are_dropped(self):
         def overclaiming(ids):

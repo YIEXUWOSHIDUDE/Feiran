@@ -19,7 +19,7 @@ from cv_layout import original_layout
 from deepseek_client import DEFAULT_MODEL, DeepSeekError
 from facts import add_fact, confirm_fact, list_facts, load_current_facts, revise_fact, tag_pattern
 from matching import propose_matches
-from privacy import mask, private_terms
+from privacy import mask, private_terms, stand_ins
 
 
 GAPS_VERSION = 1
@@ -60,24 +60,27 @@ def _profile_entry_key(kind: str, entry: Any, language: str) -> str | None:
         return None
 
 
-def _resume(draft: dict[str, Any], private: list[str]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, tuple[str, str, str]]]:
-    """The CV as ids and line texts (masked for DeepSeek), the skills lines by fact ID, and
-    bullet entries by ID."""
+def _resume(
+    draft: dict[str, Any], private: list[str]
+) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], dict[str, tuple[str, str, str]]]:
+    """The CV as stand-in line IDs and texts (masked for DeepSeek), the skills lines by
+    stand-in (fact ID and text), and bullet entries by ID."""
     texts = {
         line["fact_id"]: line.get("source_text") or line["text"]
         for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
     }
+    out, _ = stand_ins(texts)
     layout = original_layout(draft)
     resume = [
         {"section": section["kind"], "entries": [
-            {"entry": entry["entry"], "lines": [{"id": fact_id, "text": mask(texts[fact_id], private)}
+            {"entry": entry["entry"], "lines": [{"id": out[fact_id], "text": mask(texts[fact_id], private)}
                                                 for fact_id in entry["lines"]]}
             for entry in section["entries"]
         ]}
         for section in layout
     ]
     skills = {
-        fact_id: texts[fact_id]
+        out[fact_id]: (fact_id, texts[fact_id])
         for section in layout if section["kind"] == "skills"
         for entry in section["entries"] for fact_id in entry["lines"]
     }
@@ -99,14 +102,14 @@ def _existing_lines(draft: dict[str, Any]) -> list[str]:
 
 
 def _suggestion(
-    item: Any, skills: dict[str, str], entries: dict[str, tuple[str, str, str]], existing: list[str]
+    item: Any, skills: dict[str, tuple[str, str]], entries: dict[str, tuple[str, str, str]], existing: list[str]
 ) -> dict[str, Any] | None:
     """Keep a suggestion only if it points at a real line or entry, adds something the CV does
     not already say, and claims nothing more than plain use."""
     if not isinstance(item, dict):
         return None
     if item.get("kind") == "skill" and item.get("line") in skills:
-        line = skills[item["line"]]
+        fact_id, line = skills[item["line"]]
         items: list[str] = []
         for value in item.get("items") if isinstance(item.get("items"), list) else []:
             if not isinstance(value, str):
@@ -120,7 +123,7 @@ def _suggestion(
         if not items:
             return None
         items = items[:MAX_ITEMS]
-        return {"kind": "skill", "fact_id": item["line"], "items": items, "where": line,
+        return {"kind": "skill", "fact_id": fact_id, "items": items, "where": line,
                 "new_text": f"{line}, {', '.join(items)}"}
     if item.get("kind") == "bullet" and item.get("entry") in entries:
         text = " ".join(item.get("text").split()) if isinstance(item.get("text"), str) else ""
