@@ -737,6 +737,33 @@ function suggestionBlock(item, post) {
       actionButton("Not true", post(`/${item.requirement_id}/decline`), true)));
 }
 
+// The user's own words for a requirement: skills for one of the skills lines, or a new line under
+// an entry, prefilled with DeepSeek's suggestion when there is one. On a refusal the text stays.
+function writeOwn(view, item, places, refresh) {
+  if (item.suggestion_status === "added" || !places.length) return null;
+  const suggestion = item.suggestion || {};
+  const chosen = suggestion.kind === "skill" ? `skill:${suggestion.fact_id}`
+    : suggestion.kind === "bullet" ? `entry:${suggestion.entry_key}` : null;
+  const select = el("select", {}, places.map((place) => el("option", { value: place.id, selected: place.id === chosen },
+    place.kind === "skill" ? `Add to skills line: ${place.where}` : `New line under ${place.where}`)));
+  const input = el("input", { type: "text", value: suggestion.kind === "skill" ? suggestion.items.join(", ") : suggestion.text || "" });
+  const hint = () => {
+    input.placeholder = select.value.startsWith("skill:") ? "Skills to add, separated by commas" : "The line as it should read on your CV";
+  };
+  select.addEventListener("change", hint);
+  hint();
+  const add = actionButton("Add to my CV", async () => {
+    await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/write`, {
+      method: "POST", body: JSON.stringify({ place: select.value, text: input.value }),
+    });
+    await refresh();
+  });
+  return el("details", { class: "write-own" },
+    el("summary", {}, suggestion.kind ? "Edit it, or write your own" : "Write your own line"),
+    el("p", { class: "muted" }, "Only what is true for you. It is added as you write it, as a confirmed fact, and the CV is prepared again."),
+    el("div", { class: "write-row" }, select, input, add));
+}
+
 function coverageRow(view, language, item, refresh, post) {
   const strength = item.strength && item.strength !== "required" ? el("span", { class: "muted auto" }, ` · ${strengthLabel(item.strength)}`) : "";
   const lines = item.evidence.length
@@ -748,7 +775,8 @@ function coverageRow(view, language, item, refresh, post) {
   if (item.status === "unchecked") notes.push(el("p", { class: "muted" }, "DeepSeek gave no usable answer for this requirement, so it does not count as shown. Use Check again."));
   const gap = item.status === "related" || item.status === "none";
   return el("div", { class: `requirement ${item.status} ${gap ? item.suggestion_status : ""}` },
-    el("div", { class: "requirement-text" }, item.text, strength), lines, notes, gap ? suggestionBlock(item, post) : null);
+    el("div", { class: "requirement-text" }, item.text, strength), lines, notes,
+    gap ? suggestionBlock(item, post) : null, gap ? writeOwn(view, item, view.gaps.places || [], refresh) : null);
 }
 
 function gapsPanel(view, refresh) {

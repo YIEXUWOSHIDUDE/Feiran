@@ -188,8 +188,7 @@ def _suggestion(
         if not items:
             return None
         items = items[:MAX_ITEMS]
-        return {"kind": "skill", "fact_id": fact_id, "items": items, "where": line,
-                "new_text": f"{line}, {', '.join(items)}"}
+        return {"kind": "skill", "fact_id": fact_id, "items": items, "where": line, "new_text": _joined(line, items)}
     if item.get("kind") == "bullet" and isinstance(item.get("entry"), str) and item["entry"] in entries:
         text = " ".join(item.get("text").split()) if isinstance(item.get("text"), str) else ""
         entry = entries[item["entry"]]
@@ -601,6 +600,16 @@ def accept_gap(
         if len(places) != 1:
             raise ValueError(f"建议所属的条目（{suggestion['where']}）已经改变，请重新检查缺口")
         section, entry = places[0]
+        # Added before, whatever skill words it was stored with (a retry after a save that
+        # stopped halfway may no longer have them): nothing more to write.
+        listed = profile["sections"][section]["entries"][entry].get("facts") or []
+        there = load_current_facts(facts_db, listed)
+        before = next((fact_id for fact_id in listed if (there.get(fact_id) or {}).get("text") == suggestion["text"]), None)
+        if before is not None:
+            if there[before]["status"] != "confirmed":
+                raise ValueError("这一行已在该条目下，但尚未确认，请先在 Facts 页面核对确认")
+            gap.update(status="added", fact_id=before)
+            return updated, None
         elsewhere = {
             known for i, other in enumerate(profile["sections"]) for j, listed in enumerate(other.get("entries", []))
             if (i, j) != (section, entry) for known in listed.get("facts") or []
@@ -620,6 +629,83 @@ def accept_gap(
             new_profile["sections"][section]["entries"][entry].setdefault("facts", []).append(fact_id)
     gap.update(status="added", fact_id=fact_id)
     return updated, new_profile
+
+
+SKILL_SEPARATORS = re.compile(r"[,，、;；]")
+
+
+def _skill_items(line: str) -> str:
+    """The items of a skills line, after its label (Languages: … or 编程语言：…)."""
+    return re.split(r"[:：]", line, maxsplit=1)[-1]
+
+
+def _joined(line: str, items: list[str]) -> str:
+    """A skills line with items added in its own style: 、 or ， in a Chinese line."""
+    listed = _skill_items(line)
+    separator = "、" if "、" in listed else "，" if "，" in listed else ", "
+    return separator.join([line, *items])
+
+
+def places(cv: dict[str, Any]) -> list[dict[str, Any]]:
+    """Where the user can add a line of their own: items for one of the skills lines, or a new
+    line under an experience or project entry. An entry is named by what it shows, so a line
+    can never land under another entry after the layout changes."""
+    found = []
+    for section in cv["sections"]:
+        for entry in section["entries"]:
+            if section["kind"] == "skills":
+                found += [{"id": f"skill:{line['fact_id']}", "kind": "skill", "fact_id": line["fact_id"],
+                           "where": line.get("source_text") or line["text"]} for line in entry["lines"]]
+            elif section["kind"] in BULLET_TYPES:
+                key = _entry_key(section["kind"], entry)
+                found.append({"id": f"entry:{key}", "kind": "bullet", "entry_key": key,
+                              "fact_type": BULLET_TYPES[section["kind"]], "where": entry.get("title") or section["title"]})
+    return found
+
+
+def write_line(
+    gaps: dict[str, Any], requirement_id: str, place_id: str, text: str, cv: dict[str, Any],
+    facts_db: Path, profile: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The user writes what shows a requirement themselves: skills for one of the skills lines,
+    or a new line under an entry, even after saying a suggestion was not true. It is their own
+    words, so it becomes a confirmed fact as written, numbers included; it is only refused when
+    empty, too long, already on the CV, or when its place is gone. Adding works as for a
+    suggestion (see accept_gap), with the same protection against a changed line or entry."""
+    place = next((item for item in places(cv) if item["id"] == place_id), None)
+    if place is None:
+        raise ValueError("这个位置已不在简历中，请刷新页面后重试")
+    text = " ".join(text.split()) if isinstance(text, str) else ""
+    gap = _gap(gaps, requirement_id)
+    if place["kind"] == "skill":
+        known = {item.strip().casefold() for item in SKILL_SEPARATORS.split(_skill_items(place["where"]))}
+        items: list[str] = []
+        for item in (part.strip() for part in SKILL_SEPARATORS.split(text)):
+            if item and item.casefold() not in known:
+                known.add(item.casefold())
+                items.append(item)
+        if not items:
+            raise ValueError("请写要加入这一行的技能（用逗号分隔），不要与这一行已有的重复")
+        if len(items) > MAX_ITEMS or any(len(item) > MAX_ITEM_CHARACTERS for item in items):
+            raise ValueError(f"一次最多加 {MAX_ITEMS} 项，每项最多 {MAX_ITEM_CHARACTERS} 个字符")
+        suggestion = {"kind": "skill", "fact_id": place["fact_id"], "items": items, "where": place["where"],
+                      "new_text": _joined(place["where"], items)}
+    else:
+        if not text:
+            raise ValueError("请写要加入简历的一行")
+        if len(text) > MAX_LINE_CHARACTERS:
+            raise ValueError(f"一行最多 {MAX_LINE_CHARACTERS} 个字符")
+        if any(text.casefold() == known.casefold() for known in _existing_lines(cv)):
+            raise ValueError("简历中已经有这一行")
+        # Skill words from the suggestion it replaces are kept if the user's line still names them.
+        named = [tag for tag in ((gap.get("suggestion") or {}).get("tags") or []) if tag_pattern(tag).search(text)]
+        suggestion = {"kind": "bullet", "entry_key": place["entry_key"], "fact_type": place["fact_type"],
+                      "text": text, "tags": named, "where": place["where"]}
+    if gap["status"] == "added":
+        raise ValueError("这条要求已经添加过一行")
+    updated = copy.deepcopy(gaps)
+    _gap(updated, requirement_id).update(suggestion={**suggestion, "written": True}, status="open")
+    return accept_gap(updated, requirement_id, facts_db, profile)
 
 
 def decline_gap(gaps: dict[str, Any], requirement_id: str) -> dict[str, Any]:
