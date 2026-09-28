@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 from cv import (
     CVError,
+    print_with_chrome,
     approve_draft,
     build_draft,
     export_pdf,
@@ -516,6 +518,20 @@ class CVCommandLineTests(unittest.TestCase):
                     ])
             self.assertTrue((root / "cv-en.pdf").exists() and (root / "cv-zh.pdf").exists())
 
+
+
+class ChromeTests(unittest.TestCase):
+    def test_when_chrome_prints_nothing_its_own_last_words_say_why(self):
+        # On a server a refused sandbox or a missing library is only visible in Chrome's output.
+        with tempfile.TemporaryDirectory() as directory:
+            chrome = Path(directory) / "chrome"
+            chrome.write_text("#!/bin/sh\necho 'starting' >&2\necho 'No usable sandbox! Update your kernel' >&2\nexit 1\n")
+            chrome.chmod(0o755)
+            html = Path(directory) / "cv.html"
+            html.write_text("<p>CV</p>", encoding="utf-8")
+            with patch.dict(os.environ, {"CHROME_PATH": str(chrome)}):
+                with self.assertRaisesRegex(CVError, "退出码 1.*No usable sandbox"):
+                    print_with_chrome(html, Path(directory) / "cv.pdf")
 
 
 class PrivateLineTests(unittest.TestCase):

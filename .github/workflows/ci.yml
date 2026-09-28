@@ -16,8 +16,8 @@ jobs:
     name: Tests (Python 3.14 on Linux)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
       - name: Install the app's packages
@@ -38,7 +38,7 @@ jobs:
       WORKBENCH_DATA_DIR: ${{ github.workspace }}/ci-data
       WORKBENCH_REQUIRE_DATA: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build the image
         run: docker build -t "$WORKBENCH_IMAGE" .
       - name: Nothing personal or local is in the image, and it runs as its own user
@@ -95,7 +95,7 @@ jobs:
           docker compose down
       - name: Keep the PDFs to look at
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-pdfs
           path: ci-data/smoke/*.pdf
