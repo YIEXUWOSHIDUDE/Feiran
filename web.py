@@ -7,14 +7,17 @@ so other websites open in the browser cannot read facts or trigger DeepSeek call
 
 import argparse
 import json
+import logging
+import os
 import re
 import secrets
+import sys
 import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping, NamedTuple
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
@@ -74,6 +77,10 @@ from workspace import DEFAULT_ROOT, Workspace, WorkspaceError
 WEB_DIR = Path(__file__).parent / "web"
 DEFAULT_PROFILE = Path(".local/cv-profile.json")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+# Written once into the data volume when it is set up. With --require-data the app starts only
+# on a folder holding it, so a volume that failed to mount never becomes an empty new workspace.
+DATA_MARKER = ".workbench-data"
+access_log = logging.getLogger("workbench.access")
 CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by", "extraction_method")
 CV_LANGUAGES = ("en", "zh")
 QUERY_TOKEN_PATHS = ("/preview/", "/download/")
@@ -264,6 +271,49 @@ def _matching_view(matches: dict, linked: dict | None) -> dict:
     ]}
 
 
+def data_problem(folder: Path) -> str | None:
+    """Why ``folder`` is not a usable data volume, or None."""
+    if not folder.is_dir():
+        return f"数据目录不存在：{folder}"
+    if not (folder / DATA_MARKER).is_file():
+        return f"数据目录中没有 {DATA_MARKER}：数据卷可能没有挂载"
+    if not os.access(folder, os.W_OK):
+        return f"数据目录不可写：{folder}"
+    return None
+
+
+class ServerSettings(NamedTuple):
+    host: str
+    port: int
+    facts_db: Path
+    jobs: Path
+    profile: Path
+    data: Path
+    require_data: bool
+
+
+def server_settings(argv: list[str] | None, environ: Mapping[str, str]) -> ServerSettings:
+    """Where to listen and keep data. One data folder (--data or WORKBENCH_DATA) holds everything;
+    the older per-file options still win when given. Environment variables configure a container."""
+    parser = argparse.ArgumentParser(description="在本机浏览器中使用岗位匹配与简历工作台")
+    parser.add_argument("--host", default=environ.get("WORKBENCH_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(environ.get("WORKBENCH_PORT", "8765")))
+    parser.add_argument("--data", type=Path, default=Path(environ.get("WORKBENCH_DATA", ".local")),
+                        help="数据目录：事实库、简历 profile、岗位文件夹都在这里")
+    parser.add_argument("--facts-db", type=Path)
+    parser.add_argument("--jobs", type=Path, help="每个岗位一个文件夹")
+    parser.add_argument("--profile", type=Path, help="简历 profile JSON")
+    parser.add_argument("--require-data", action="store_true", default=environ.get("WORKBENCH_REQUIRE_DATA") == "1",
+                        help=f"数据目录必须是含 {DATA_MARKER} 的数据卷，否则不启动")
+    args = parser.parse_args(argv)
+    return ServerSettings(
+        host=args.host, port=args.port, data=args.data, require_data=args.require_data,
+        facts_db=args.facts_db or args.data / DEFAULT_DATABASE.name,
+        jobs=args.jobs or args.data / DEFAULT_ROOT.name,
+        profile=args.profile or args.data / DEFAULT_PROFILE.name,
+    )
+
+
 def create_app(
     facts_db: Path = DEFAULT_DATABASE,
     jobs_root: Path = DEFAULT_ROOT,
@@ -305,6 +355,23 @@ def create_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
+
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        """One line per request, with the path only: preview and download links carry the page
+        token in their query string, so it never reaches a log."""
+        started = time.monotonic()
+        response = await call_next(request)
+        access_log.info("%s %s %s %dms", request.method, request.url.path, response.status_code,
+                        (time.monotonic() - started) * 1000)
+        return response
+
+    @app.get("/healthz")
+    def health() -> JSONResponse:
+        """Whether the data folder is there and writable; no model is called and nothing personal is shown."""
+        folder = Path(facts_db).parent
+        usable = folder.is_dir() and os.access(folder, os.W_OK)
+        return JSONResponse({"status": "ok" if usable else "unavailable"}, status_code=200 if usable else 503)
 
     @app.exception_handler(FactStoreError)
     @app.exception_handler(WorkspaceError)
@@ -890,17 +957,19 @@ def create_app(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="在本机浏览器中使用岗位匹配与简历工作台")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--facts-db", type=Path, default=DEFAULT_DATABASE)
-    parser.add_argument("--jobs", type=Path, default=DEFAULT_ROOT, help="每个岗位一个文件夹")
-    parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE, help="简历 profile JSON")
-    args = parser.parse_args(argv)
+    settings = server_settings(argv, os.environ)
+    if settings.require_data:
+        problem = data_problem(settings.data)
+        if problem:
+            print(f"不启动：{problem}", file=sys.stderr)
+            return 2
     import uvicorn
 
-    print(f"打开 http://127.0.0.1:{args.port}/ （只在本机可用；按 Ctrl+C 停止）")
-    app = create_app(args.facts_db, args.jobs, profile_path=args.profile)
-    uvicorn.run(app, host="127.0.0.1", port=args.port)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    print(f"打开 http://127.0.0.1:{settings.port}/ （只在本机可用；按 Ctrl+C 停止）")
+    app = create_app(settings.facts_db, settings.jobs, profile_path=settings.profile)
+    # Uvicorn's own access log would print the query string, and with it the page token.
+    uvicorn.run(app, host=settings.host, port=settings.port, access_log=False)
     return 0
 
 

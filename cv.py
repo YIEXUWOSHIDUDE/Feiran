@@ -48,7 +48,8 @@ LABEL_KINDS = {"education", "skills"}
 STYLE = """
 * { box-sizing: border-box; }
 body { margin: 0; color: #111; font-size: 10.5pt; line-height: 1.2;
-  font-family: "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Hiragino Sans GB", "Heiti SC", sans-serif; }
+  font-family: "Helvetica Neue", Helvetica, Arial, "Liberation Sans", "PingFang SC", "Hiragino Sans GB", "Heiti SC",
+    "Noto Sans CJK SC", sans-serif; }
 body.zh { line-height: 1.32; }
 a { color: inherit; text-decoration: underline; text-decoration-thickness: 0.5pt; text-underline-offset: 1.5pt; }
 header { text-align: center; margin-bottom: 4pt; }

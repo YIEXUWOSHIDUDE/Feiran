@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -45,10 +46,21 @@ def _checked(key: str) -> str:
 
 
 def load_api_key() -> str:
-    """Read DEEPSEEK_API_KEY, or the macOS Keychain item the user stored it in."""
+    """Read DEEPSEEK_API_KEY, the file DEEPSEEK_API_KEY_FILE names (how a server hands the key
+    over without putting it in the environment), or the macOS Keychain item the user stored it
+    in. A named file that cannot be read is an error, never a reason to look elsewhere."""
     key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if key:
         return _checked(key)
+    key_file = (os.environ.get("DEEPSEEK_API_KEY_FILE") or "").strip()
+    if key_file:
+        try:
+            key = Path(key_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            key = ""
+        if key:
+            return _checked(key)
+        raise DeepSeekError("DEEPSEEK_API_KEY_FILE 指定的文件不存在、无法读取或为空", reason="missing_key")
     if sys.platform == "darwin":
         try:
             found = subprocess.run(

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from deepseek_client import DeepSeekError
 from facts import confirm_facts, import_facts, revise_fact
@@ -21,7 +22,7 @@ HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
 if HAS_FASTAPI:
     from fastapi.testclient import TestClient
 
-    from web import create_app
+    from web import DATA_MARKER, create_app, data_problem, main, server_settings
 
 TOKEN = "test-token"
 FACTS = [
@@ -125,6 +126,22 @@ class WebTests(unittest.TestCase):
         rebinding = self.client.get("/api/facts", headers={**self.headers, "Host": "evil.example"})
         self.assertEqual(rebinding.status_code, 403)
         self.assertEqual(self.client.get("/api/facts", headers=self.headers).json(), {"facts": []})
+
+    def test_health_says_ok_without_a_token_or_any_personal_data(self):
+        response = self.client.get("/healthz")
+        self.assertEqual((response.status_code, response.json()), (200, {"status": "ok"}))
+        self.assertEqual(self.client.get("/healthz", headers={"Host": "evil.example"}).status_code, 403)
+        self.directory.cleanup()  # the data folder is gone
+        self.assertEqual(self.client.get("/healthz").status_code, 503)
+
+    def test_the_access_log_never_holds_the_page_token(self):
+        # Preview and download links carry the token in their address; logs keep only the path.
+        with self.assertLogs("workbench.access", level="INFO") as logs:
+            self.client.get(f"/preview/20260101-000000-abcdef/en?token={TOKEN}")
+            self.client.get("/api/facts", headers=self.headers)
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("/preview/20260101-000000-abcdef/en", logs.output[0])
+        self.assertFalse(any(TOKEN in line for line in logs.output))
 
     def test_facts_page_confirms_only_the_selected_versions(self):
         import_facts(self.database, FACTS)
@@ -718,6 +735,38 @@ class WebTests(unittest.TestCase):
                          {("Built REST APIs for an internal tool.", "pending"), ("Languages: Python, Java", "pending")})
         self.assertEqual((profile["name"], profile["contact"]["links"][0]["url"]), ("Alex Example", "https://github.com/alex-example"))
         self.assertEqual(profile["sections"][0]["entries"][0]["title"], "Example Corp")
+
+
+@unittest.skipUnless(HAS_FASTAPI, "web tests need the packages in requirements.txt")
+class ServerSettingsTests(unittest.TestCase):
+    def test_one_data_folder_sets_every_path_and_the_older_options_still_win(self):
+        settings = server_settings(["--data", "/srv/data", "--profile", "/elsewhere/cv-profile.json"], {})
+        self.assertEqual((settings.facts_db, settings.jobs, settings.profile, settings.host, settings.port),
+                         (Path("/srv/data/workbench.db"), Path("/srv/data/jobs"), Path("/elsewhere/cv-profile.json"),
+                          "127.0.0.1", 8765))
+        container = server_settings([], {"WORKBENCH_DATA": "/data", "WORKBENCH_HOST": "0.0.0.0", "WORKBENCH_PORT": "9000",
+                                         "WORKBENCH_REQUIRE_DATA": "1"})
+        self.assertEqual((container.facts_db, container.host, container.port, container.require_data),
+                         (Path("/data/workbench.db"), "0.0.0.0", 9000, True))
+        local = server_settings([], {})
+        self.assertEqual((local.facts_db, local.require_data), (Path(".local/workbench.db"), False))
+
+    def test_a_required_data_folder_must_be_the_marked_volume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            self.assertIn(DATA_MARKER, data_problem(folder))  # an empty folder is not the data volume
+            (folder / DATA_MARKER).write_text("", encoding="utf-8")
+            self.assertIsNone(data_problem(folder))
+            self.assertIsNotNone(data_problem(folder / "missing"))
+
+    def test_startup_refuses_a_data_folder_that_is_not_the_volume(self):
+        # Logging is set up for the whole process when the server starts; not in a test run.
+        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("web.logging.basicConfig"):
+            self.assertEqual(main(["--data", directory, "--require-data"]), 2)
+            run.assert_not_called()
+            (Path(directory) / DATA_MARKER).write_text("", encoding="utf-8")
+            self.assertEqual(main(["--data", directory, "--require-data", "--host", "0.0.0.0"]), 0)
+        self.assertEqual((run.call_args.kwargs["host"], run.call_args.kwargs["access_log"]), ("0.0.0.0", False))
 
 
 if __name__ == "__main__":

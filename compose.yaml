@@ -1,0 +1,35 @@
+# The workbench in its container, on a laptop or on the EC2 host.
+#
+#   WORKBENCH_DATA_DIR=/srv/workbench-data docker compose up -d
+#
+# WORKBENCH_DATA_DIR is the folder (on EC2, the mounted data volume) that holds the facts, the
+# CV profile and the jobs; the container's user (uid 10001) must be able to write it. Set
+# WORKBENCH_REQUIRE_DATA=1 where that folder must be the prepared volume (it holds
+# .workbench-data): then the app refuses to start on an empty folder instead of starting over.
+# DEEPSEEK_KEY_FILE is a file on the host holding the DeepSeek key; without it DeepSeek calls
+# fail with a clear message and the heading rules take over.
+services:
+  workbench:
+    build: .
+    image: ${WORKBENCH_IMAGE:-job-fit-workbench:local}
+    ports:
+      - "127.0.0.1:8765:8765"  # the host's loopback only, never every interface
+    volumes:
+      - ${WORKBENCH_DATA_DIR:?set WORKBENCH_DATA_DIR to the data folder}:/data
+    environment:
+      WORKBENCH_REQUIRE_DATA: ${WORKBENCH_REQUIRE_DATA:-0}
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      HOME: /tmp
+    secrets:
+      - deepseek_api_key
+    read_only: true
+    tmpfs:
+      - /tmp
+    shm_size: 256m
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+secrets:
+  deepseek_api_key:
+    file: ${DEEPSEEK_KEY_FILE:-/dev/null}
