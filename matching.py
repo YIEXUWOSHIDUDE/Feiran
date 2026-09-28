@@ -149,7 +149,7 @@ def propose_matches(
         try:
             choices, details = _model_choices(requirements, facts_db, chat, effort)
         except (DeepSeekError, MatchingError) as exc:
-            details = {"fallback_reason": str(exc)}
+            details = {"fallback_reason": str(exc), "fallback_code": getattr(exc, "reason", "bad_response")}
     match_candidates = []
     requirement_summaries = []
     for requirement in requirements:

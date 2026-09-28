@@ -24,7 +24,15 @@ RETRY_HTTP_CODES = {429, 500, 502, 503}
 
 
 class DeepSeekError(Exception):
-    """A DeepSeek request or answer could not be used safely."""
+    """A DeepSeek request or answer could not be used safely.
+
+    ``reason`` says what kind of failure it was, so a page can explain it and suggest what to
+    do: missing_key, key_rejected, rate_limited, unreachable, request_failed or bad_response.
+    """
+
+    def __init__(self, message: str, reason: str = "bad_response") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def load_api_key() -> str:
@@ -43,7 +51,8 @@ def load_api_key() -> str:
         if found is not None and found.returncode == 0 and found.stdout.strip():
             return found.stdout.strip()
     raise DeepSeekError(
-        f"缺少 DeepSeek API key：设置 DEEPSEEK_API_KEY，或存入钥匙串 service {KEYCHAIN_SERVICE}"
+        f"缺少 DeepSeek API key：设置 DEEPSEEK_API_KEY，或存入钥匙串 service {KEYCHAIN_SERVICE}",
+        reason="missing_key",
     )
 
 
@@ -64,12 +73,13 @@ def _post(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
             if exc.code in RETRY_HTTP_CODES and attempt < HTTP_ATTEMPTS:
                 time.sleep(2 ** attempt)
                 continue
-            raise DeepSeekError(f"DeepSeek API 返回 HTTP {exc.code}") from exc
+            reason = {401: "key_rejected", 403: "key_rejected", 429: "rate_limited"}.get(exc.code, "request_failed")
+            raise DeepSeekError(f"DeepSeek API 返回 HTTP {exc.code}", reason=reason) from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as exc:
             if attempt < HTTP_ATTEMPTS:
                 time.sleep(2 ** attempt)
                 continue
-            raise DeepSeekError("无法连接 DeepSeek API") from exc
+            raise DeepSeekError("无法连接 DeepSeek API", reason="unreachable") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
         raise DeepSeekError("DeepSeek API 响应过大")
     try:

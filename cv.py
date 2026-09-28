@@ -71,7 +71,15 @@ li, .line { margin: 0 0 0.5pt; }
 
 
 class CVError(Exception):
-    """The profile, draft, or export request cannot be used safely."""
+    """The profile, draft, or export request cannot be used safely.
+
+    ``reason`` names the problem when the page can suggest a fix (facts_not_confirmed,
+    facts_missing, no_profile); otherwise it is "not_usable".
+    """
+
+    def __init__(self, message: str, reason: str = "not_usable") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _check_keys(value: Any, allowed: set[str], path: str) -> dict[str, Any]:
@@ -290,7 +298,7 @@ def build_draft(
     facts = load_current_facts(facts_db, referenced)
     missing = [fact_id for fact_id in referenced if fact_id not in facts]
     if missing:
-        raise CVError(f"简历引用的事实不存在：{', '.join(missing)}")
+        raise CVError(f"简历引用的事实不存在：{', '.join(missing)}", reason="facts_missing")
     pending = [
         f"{fact_id}@{facts[fact_id]['version']}"
         for fact_id in referenced if facts[fact_id]["status"] != "confirmed"
@@ -298,7 +306,8 @@ def build_draft(
     if pending:
         raise CVError(
             "简历只能使用已确认的事实；以下事实的当前版本尚未确认，逐条核对后运行："
-            "python3 facts.py confirm " + " ".join(pending)
+            "python3 facts.py confirm " + " ".join(pending),
+            reason="facts_not_confirmed",
         )
 
     # Pass 2 quotes each confirmed fact word for word; job-matched facts go first.

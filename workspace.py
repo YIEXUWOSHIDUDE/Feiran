@@ -22,6 +22,9 @@ CV_STEPS = ("cv-draft", "cv-tailored", "cv-planned", "cv-approved", "cv-final")
 LANGUAGES = ("en", "zh")
 STEPS = JOB_STEPS + EXTRA_STEPS + tuple(f"{step}-{language}" for language in LANGUAGES for step in CV_STEPS)
 JOB_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
+# Small status files kept beside the steps and replaced in place: how the latest CV preparation
+# went, stage by stage. They are not part of the step chain.
+NOTES = tuple(f"cv-status-{language}" for language in LANGUAGES)
 
 
 class WorkspaceError(Exception):
@@ -95,6 +98,21 @@ class Workspace:
         with self.path(job_id, step).open("x", encoding="utf-8") as output:
             json.dump(data, output, ensure_ascii=False, indent=2)
             output.write("\n")
+
+    def _note_path(self, job_id: str, name: str) -> Path:
+        if name not in NOTES:
+            raise WorkspaceError(f"未知的状态文件：{name}")
+        return self._job_dir(job_id) / f"{name}.json"
+
+    def write_note(self, job_id: str, name: str, data: dict[str, Any]) -> None:
+        path = self._note_path(job_id, name)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
+    def read_note(self, job_id: str, name: str) -> dict[str, Any] | None:
+        path = self._note_path(job_id, name)
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
     def write_bytes(self, job_id: str, step: str, data: bytes) -> None:
         if not step.startswith("cv-final-"):

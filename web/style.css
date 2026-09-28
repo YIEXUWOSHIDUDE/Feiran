@@ -366,6 +366,12 @@ details.other-language { margin-top: 18px; }
 .found-entry { margin: 6px 0 12px; }
 .found-entry ul { margin: 6px 0; padding-left: 20px; }
 .found-entry li { margin: 3px 0; }
+.stages { list-style: none; margin: 10px 0; padding: 0; }
+.stage { margin: 4px 0; }
+.stage-mark { display: inline-block; width: 1.2em; font-weight: 800; }
+.stage.done .stage-mark { color: var(--ok); }
+.stage.fallback, .stage.failed { color: var(--warn); }
+.stage.skipped { color: var(--muted); }
 
 @media (max-width: 760px) {
   .top { position: static; align-items: flex-start; padding: 14px 16px; }

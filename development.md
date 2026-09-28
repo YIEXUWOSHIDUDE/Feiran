@@ -248,7 +248,9 @@ v3 根据 2026-09 下载的 8,787 个公开岗位补充了各公司常用的要�
 
 之后请 Codex（gpt-6-astra，high，只读）审查这些改动，它用合成输入复现了 7 个问题，均已修正并加为测试：数字换位只看数字后第一个词（“3 backend services in 2 calendar weeks” 和中文“2 周内完成 3 个服务”可绕过；现在取数字后名词短语的中心词，并按“时间/百分比/数量”类别比较，跨语言也能发现时间与数量互换）；否定只看有没有否定词（新增的 “without downtime” 掩盖了删掉的 “did not deploy”；现在英文逐个比对被否定的词，翻译中已知译名须紧跟否定，“not only … but also” 不算否定，中文原文的“不”计入但排除“不断、不同、不仅”等）；billion 与“亿”相差十倍；“客户”同时属于 customer 与 client 两组导致误拒（现在一个词只要任一所属组在原文有支持即可）；缺口重试会确认别人未审核过标签的待确认版本（现在拒绝并提示先在 Facts 页核对）；事实已在其他条目下时被当作添加成功（现在拒绝）；“优先队列”被当作“优先”，“not required” 被当作必需。修正后 188 个测试通过，27 条真实改写仍全部通过。
 
-尚未做（计划第 4–7 项）：各步骤失败原因持久化并显示；区分“有证据”与“在这份简历中显示”；语义复核的测试集与 DeepSeek/Jev 对比；文档整体更新。
+**第 4 项，失败与降级可见**：`DeepSeekError` 带 `reason`（missing_key、key_rejected、rate_limited、unreachable、request_failed、bad_response），`CVError` 也可带（no_profile、facts_not_confirmed、facts_missing）。网页准备简历时按阶段记录结果（draft、rewording、layout：done/fallback/failed/skipped，附 reason_code、说明和是否仍有可用简历），存到岗位文件夹的 `cv-status-<语言>.json`（不属于步骤链，按草稿的 created_at 对应，旧记录不会显示在新草稿上）。页面据此区分“已为岗位改写”和“简历可用但改写失败、仍用你确认过的原文”，并给出原因和重试按钮；单独重试改写后，布局标为未重新调整。说明文字来自固定对照表，从不引用 DeepSeek 的原始错误，因此不会出现 key 或回答内容。要求提取、事实匹配和缺口建议的降级记录也带 `fallback_code`；缺口页现在会说明“只按技能词匹配”，因为这时相关事实可能被当作已覆盖。
+
+尚未做（计划第 5–7 项）：区分“有证据”与“在这份简历中显示”；语义复核的测试集与 DeepSeek/Jev 对比；文档整体更新。
 
 ## 上传简历（2026-09-27）
 

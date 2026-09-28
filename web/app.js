@@ -522,7 +522,7 @@ function requirementsPanel(view, refresh) {
   const extraction = view.extraction || {};
   const foundBy = extraction.method === "deepseek-lines-v1"
     ? "Found by DeepSeek, which picks lines of the job description; each line is copied word for word."
-    : `Found by heading rules${extraction.fallback_reason ? ` (DeepSeek not used: ${extraction.fallback_reason})` : ""}.`;
+    : `Found by heading rules${extraction.fallback_reason ? ` (DeepSeek not used: ${extraction.message || extraction.fallback_reason})` : ""}.`;
   const body = [
     view.steps.some((name) => name.startsWith("cv-")) ? el("p", { class: "warning" }, "Saving changes here prepares the CV again; an approved CV is moved to the job's history folder.") : null,
     rows.length ? el("table", {}, el("tbody", {}, rows)) : el("p", {}, "No requirement lines were found. Try Find again with DeepSeek, or add lines below by copying exact text from the job description."),
@@ -575,6 +575,16 @@ function changeRow(view, language, change, refresh, editable) {
     el("td", { class: "choice" }, toggle));
 }
 
+const STAGE_MARKS = { done: "✓", fallback: "!", failed: "✕", skipped: "–" };
+
+// How the latest preparation went, stage by stage, so a usable CV is never mistaken for a
+// tailored one.
+function stageList(stages) {
+  if (!stages || !stages.length) return null;
+  return el("ul", { class: "stages" }, stages.map((stage) => el("li", { class: `stage ${stage.status}` },
+    el("span", { class: "stage-mark" }, STAGE_MARKS[stage.status] || "·"), " ", stage.message)));
+}
+
 function cvBlock(view, language, refresh) {
   const cv = view.cv[language];
   const title = CV_TITLES[language];
@@ -584,8 +594,8 @@ function cvBlock(view, language, refresh) {
   };
   if (!cv.head) {
     return el("div", { class: "cv-block" }, el("h3", {}, title),
-      el("p", { class: "muted" }, "Not prepared yet."),
-      el("div", { class: "toolbar" }, actionButton("Prepare this CV", post("prepare"))));
+      stageList(cv.stages) || el("p", { class: "muted" }, "Not prepared yet."),
+      el("div", { class: "toolbar" }, actionButton(cv.stages ? "Try again" : "Prepare this CV", post("prepare"))));
   }
   const approved = cv.head === "approved";
   const tools = [];
@@ -599,8 +609,9 @@ function cvBlock(view, language, refresh) {
   }
   const notes = [];
   if (approved) notes.push(el("p", { class: "ok-text" }, `Approved ${new Date(cv.approved_at).toLocaleString()}. To change anything, use Start over and approve again.`));
-  if (cv.head === "draft") notes.push(el("p", { class: "warning" }, "This is your usual CV: DeepSeek could not reword or adjust it yet. Use the buttons above."));
-  if (cv.head === "tailored") notes.push(el("p", { class: "warning" }, "Reworded, but not adjusted for this job yet: DeepSeek could not plan it. Use Adjust for this job."));
+  if (cv.stages) notes.push(stageList(cv.stages));
+  else if (cv.head === "draft") notes.push(el("p", { class: "warning" }, "This is your usual CV: DeepSeek could not reword or adjust it yet. Use the buttons above."));
+  else if (cv.head === "tailored") notes.push(el("p", { class: "warning" }, "Reworded, but not adjusted for this job yet: DeepSeek could not plan it. Use Adjust for this job."));
   if ((cv.language_fallbacks || []).length) {
     const missing = language === "zh" ? "Chinese" : "English";
     notes.push(el("p", { class: "warning" },
@@ -692,8 +703,12 @@ function gapsPanel(view, refresh) {
     return el("div", { class: `requirement ${gap.status}` }, el("div", { class: "requirement-text" }, gap.text, strength), detail);
   });
   const notes = [];
+  if (gaps && gaps.matching && gaps.matching.fallback_reason) {
+    notes.push(el("p", { class: "warning" }, `Checked by matching skill words only: ${gaps.matching.message || gaps.matching.fallback_reason} `,
+      "A related fact may count as covering a requirement here. Use Check again when DeepSeek works."));
+  }
   if (gaps && gaps.suggesting && gaps.suggesting.fallback_reason) {
-    notes.push(el("p", { class: "warning" }, `No suggestions this time (DeepSeek: ${gaps.suggesting.fallback_reason}). Use Check again.`));
+    notes.push(el("p", { class: "warning" }, `No suggestions this time: ${gaps.suggesting.message || gaps.suggesting.fallback_reason} Use Check again.`));
   }
   return el("section", { class: "panel step-panel gaps-panel" },
     el("h2", {}, gaps ? `3. Not on your CV yet (${open})` : "3. Not on your CV yet"),

@@ -167,7 +167,7 @@ def find_gaps(
             picks = answer["content"].get("suggestions")
             suggesting = {"model": answer.get("model"), "usage": answer.get("usage")}
         except DeepSeekError as exc:
-            picks, suggesting = [], {"fallback_reason": str(exc)}
+            picks, suggesting = [], {"fallback_reason": str(exc), "fallback_code": exc.reason}
         by_requirement: dict[str, Any] = {}
         for pick in picks if isinstance(picks, list) else []:
             requirement = pick.get("requirement") if isinstance(pick, dict) else None
@@ -180,7 +180,8 @@ def find_gaps(
         "gaps_version": GAPS_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "language": draft["language"],
-        "matching": {key: fact_matching.get(key) for key in ("method", "fallback_reason") if fact_matching.get(key)},
+        "matching": {key: fact_matching.get(key) for key in ("method", "fallback_reason", "fallback_code")
+                     if fact_matching.get(key)},
         "suggesting": suggesting,
         "gaps": gaps,
     }

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from deepseek_client import DeepSeekError
-from facts import confirm_facts, import_facts
+from facts import confirm_facts, import_facts, revise_fact
 from cv_import import STRUCTURE_RULES
 from cv_plan import PLAN_RULES
 from gaps import SUGGEST_RULES
@@ -40,27 +40,30 @@ class FakeDeepSeek(FakeChat):
         self.plan = None
         self.gap_suggestions = None
         self.cv_structure = None
+        self.tailor_error = None
         self.sent = []
 
     def __call__(self, messages, model, effort):
         self.sent.append(messages[-1]["content"])
+        if self.tailor_error and messages[0]["content"].startswith("You rewrite resume lines"):
+            raise self.tailor_error
         if messages[0]["content"] == STRUCTURE_RULES:
             if self.cv_structure is None:
-                raise DeepSeekError("测试中不联网")
+                raise DeepSeekError("测试中不联网", reason="unreachable")
             return {"model": "deepseek-flash", "content": self.cv_structure, "usage": {}}
         if messages[0]["content"] == SUGGEST_RULES:
             if self.gap_suggestions is None:
-                raise DeepSeekError("测试中不联网")
+                raise DeepSeekError("测试中不联网", reason="unreachable")
             ids = {item["text"]: item["id"] for item in json.loads(messages[-1]["content"])["gaps"]}
             return {"model": "deepseek-flash", "content": {"suggestions": self.gap_suggestions(ids)}, "usage": {}}
         if messages[0]["content"] == MATCH_RULES or (messages[0]["content"] == PLAN_RULES and self.plan is None):
-            raise DeepSeekError("测试中不联网")
+            raise DeepSeekError("测试中不联网", reason="unreachable")
         if messages[0]["content"] == PLAN_RULES:
             return {"model": "deepseek-flash", "content": self.plan, "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
         if messages[0]["content"] != FIND_RULES:
             return super().__call__(messages, model, effort)
         if self.requirement_lines is None:
-            raise DeepSeekError("测试中不联网")
+            raise DeepSeekError("测试中不联网", reason="unreachable")
         lines = json.loads(messages[-1]["content"])["lines"]
         picks = [{"line": line["n"], "kind": "required"} for line in lines
                  if line["text"].lstrip("- ") in self.requirement_lines]
@@ -196,6 +199,45 @@ class WebTests(unittest.TestCase):
             "每周至少实习4天": ("excluded", "user"), "参与后端服务开发与测试": ("confirmed", "user"),
         })
         self.assertEqual({item["text"]: item["strength"] for item in later["selected_requirements"]}["有开源项目经历"], "unclear")
+
+    def test_the_cv_says_which_stage_did_not_work_and_why(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.chat.tailor_error = DeepSeekError("key sk-test-secret was refused", reason="key_rejected")
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+        failed = self.job(job_id)["cv"]["en"]
+        self.chat.tailor_error = None
+        self.chat.plan = {"sections": ["education", "experience", "skills"], "entries": [], "reasons": []}
+        self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+        fixed = self.job(job_id)["cv"]["en"]
+        stages = lambda cv: [(item["stage"], item["status"], item["reason_code"], item["output_available"]) for item in cv["stages"]]
+        self.assertEqual(failed["head"], "draft")
+        self.assertEqual(stages(failed), [("draft", "done", None, True), ("rewording", "fallback", "key_rejected", True),
+                                          ("layout", "fallback", "unreachable", True)])
+        self.assertIn("refused the API key", failed["stages"][1]["message"])
+        self.assertNotIn("sk-test-secret", json.dumps(failed))
+        self.assertEqual(stages(fixed), [("draft", "done", None, True), ("rewording", "done", None, True),
+                                         ("layout", "done", None, True)])
+
+    def test_a_cv_that_cannot_be_drafted_says_what_to_do(self):
+        import_facts(self.database, CV_FACTS)  # imported, not confirmed yet
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+        cv = self.job(job_id)["cv"]["en"]
+        self.assertIsNone(cv["head"])
+        self.assertEqual([(item["stage"], item["status"], item["reason_code"]) for item in cv["stages"]],
+                         [("draft", "failed", "facts_not_confirmed"), ("rewording", "skipped", None), ("layout", "skipped", None)])
+        self.assertIn("Facts page", cv["stages"][0]["message"])
+        # Once a CV exists, a later failure is shown next to it instead of being hidden.
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+        revise_fact(self.database, "fact-skills-languages", text="Languages: Python, Java, Go")
+        again = self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+        cv = self.job(job_id)["cv"]["en"]
+        self.assertEqual(again.status_code, 400)
+        self.assertEqual((cv["head"], cv["stages"][0]["status"], cv["stages"][0]["output_available"]), ("tailored", "failed", True))
+        self.assertIn("last time it could be prepared", cv["stages"][0]["message"])
 
     def decided_job(self):
         job_id = self.create_job()
@@ -402,6 +444,9 @@ class WebTests(unittest.TestCase):
         saved = json.loads(self.profile_path.read_text(encoding="utf-8"))
         backups = list((self.profile_path.parent / "profile-history").glob("*.json"))
         self.assertEqual(found.status_code, 200, found.text)
+        # Matching fell back to skill words, and the page is told so in plain words.
+        self.assertEqual(found.json()["gaps"]["matching"]["fallback_code"], "unreachable")
+        self.assertIn("could not be reached", found.json()["gaps"]["matching"]["message"])
         self.assertEqual({item["requirement_id"]: item["status"] for item in declined["gaps"]["gaps"]},
                          {docker: "added", years: "declined", tests: "added"})
         self.assertIn("Python, Java, Docker", preview)
