@@ -27,10 +27,17 @@ def decided_job():
     return apply_requirement_decisions(proposed, {item["id"] for item in proposed["requirement_candidates"]}, set())
 
 
+def sent_lines(request):
+    """Every line an evidence request gave an ID, by its text: each entry's role and lines, and
+    the facts not on the CV."""
+    lines = [line for entry in request["resume"] for line in [entry.get("role"), *entry["lines"]] if line]
+    return {line["text"]: line["id"] for line in lines + request["other_facts"]}
+
+
 def evidence(request):
     """Python is shown by the skills line; the years only in part, by the internship and its
     dates; integration tests only by a related line; nothing is about Docker."""
-    lines = {line["text"]: line["id"] for line in request["lines"]}
+    lines = sent_lines(request)
     ids = {item["text"]: item["id"] for item in request["requirements"]}
     return [
         {"id": ids["Experience with Python"], "verdict": "supported", "sets": [[lines["Languages: Python, Java"]]]},
@@ -107,8 +114,9 @@ class GapTests(unittest.TestCase):
         # Sent: every confirmed fact and each entry's role or degree with its dates, but no
         # names, schools, employers or fact IDs.
         sent = json.loads(chat.sent[0])
-        self.assertEqual(sorted(line["text"] for line in sent["lines"]), sorted(
+        self.assertEqual(sorted(sent_lines(sent)), sorted(
             [fact["text"] for fact in FACTS] + ["M.S. in Computer Science (2026 – 2028)", "Software Intern (2025)"]))
+        self.assertEqual(sent["other_facts"], [])  # every confirmed fact is on this CV
         for private in ("Alex Example", "Example Corp", "Example University", "Los Angeles", *(fact["id"] for fact in FACTS)):
             self.assertNotIn(private, chat.sent[0])
 
@@ -268,6 +276,25 @@ class GapTests(unittest.TestCase):
         later = find_gaps(decided_job(), self.draft, self.database, FakeDeepSeek(suggestions), previous=earlier)
         self.assertEqual(next(item for item in later["requirements"] if item["requirement_id"] == docker)["status"], "declined")
 
+    def test_a_declined_suggestion_stays_declined_after_a_check_that_failed(self):
+        # Found in review by Codex: a failed check in between forgot what the user had declined.
+        gaps, _ = self.gaps()
+        docker = next(item["requirement_id"] for item in gaps["requirements"] if "Docker" in item["text"])
+        failed = find_gaps(decided_job(), self.draft, self.database, FakeDeepSeek(
+            suggestions, error=DeepSeekError("测试中不联网", reason="unreachable")), previous=decline_gap(gaps, docker))
+        again = find_gaps(decided_job(), self.draft, self.database, FakeDeepSeek(suggestions), previous=failed)
+        self.assertEqual(next(item for item in again["requirements"] if item["requirement_id"] == docker)["status"], "declined")
+
+    def test_suggestions_naming_lines_in_the_wrong_shape_are_dropped(self):
+        def misshapen(ids):
+            return [{"requirement": ids["Hands-on Docker and Kubernetes"], "kind": "skill", "line": ["L1"], "items": ["Docker"]},
+                    {"requirement": ids["Writing integration tests for services"], "kind": "bullet", "entry": {"id": "s1e0"},
+                     "text": "Wrote integration tests for internal services.", "tags": []}]
+        gaps, _ = self.gaps(misshapen)
+        self.assertEqual({item["text"]: item["suggestion"] for item in gaps["requirements"] if item["evidence"] != "supported"},
+                         dict.fromkeys(["Hands-on Docker and Kubernetes", "3+ years of backend experience",
+                                        "Writing integration tests for services"]))
+
     def test_a_declined_or_unsuggested_gap_stays_off_the_cv(self):
         gaps, _ = self.gaps()
         years = next(item["requirement_id"] for item in gaps["requirements"] if "years" in item["text"])
@@ -283,7 +310,7 @@ class GapTests(unittest.TestCase):
 def verdicts_for(requirement, *groups):
     """An evidence answer for one requirement: supported by each group of line texts."""
     def answer(request):
-        lines = {line["text"]: line["id"] for line in request["lines"]}
+        lines = sent_lines(request)
         ids = {item["text"]: item["id"] for item in request["requirements"]}
         return [{"id": ids[requirement], "verdict": "supported", "sets": [[lines[text] for text in group] for group in groups]}]
     return answer
@@ -321,7 +348,7 @@ class CoverageTests(unittest.TestCase):
             PYTHON: "shown", "Hands-on Docker and Kubernetes": "none",
             "3+ years of backend experience": "related", TESTS: "related"})
         python = next(item for item in shown["requirements"] if item["text"] == PYTHON)
-        self.assertEqual(python["evidence"], [{"text": "Languages: Python, Java", "shown": True, "why": None, "undo": None}])
+        self.assertEqual(python["evidence"], [{"text": "Languages: Python, Java", "shown": True, "why": None, "undo": []}])
         years = next(item for item in shown["requirements"] if "years" in item["text"])
         self.assertEqual((years["missing"], years["evidence"][0]["text"]), ("3+ years", "Software Intern (2025)"))
 
@@ -330,7 +357,7 @@ class CoverageTests(unittest.TestCase):
         planned = plan_draft(self.draft, decided_job(), chat=FakePlanner(CUT_SKILLS))
         python = self.requirement(gaps, planned, PYTHON)
         self.assertEqual(python["status"], "not_shown")
-        self.assertEqual(python["evidence"], [{"text": "Languages: Python, Java", "shown": False, "why": "cut", "undo": "cut:skills"}])
+        self.assertEqual(python["evidence"], [{"text": "Languages: Python, Java", "shown": False, "why": "cut", "undo": ["cut:skills"]}])
         self.assertEqual(self.requirement(gaps, set_change(planned, "cut:skills"), PYTHON)["status"], "shown")
 
     def test_lines_that_show_it_only_together_must_all_be_shown(self):
@@ -340,8 +367,8 @@ class CoverageTests(unittest.TestCase):
         tests = self.requirement(gaps, planned, TESTS)
         self.assertEqual(tests["status"], "not_shown")
         self.assertEqual([(item["text"], item["shown"], item["undo"]) for item in tests["evidence"]], [
-            ("Built REST APIs for an internal tool.", False, "cut:fact-intern-api"),
-            ("Wrote unit tests for billing code.", True, None)])
+            ("Built REST APIs for an internal tool.", False, ["cut:fact-intern-api"]),
+            ("Wrote unit tests for billing code.", True, [])])
         self.assertEqual(self.requirement(gaps, self.draft, TESTS)["status"], "shown")
 
     def test_a_rewording_that_no_longer_shows_it_says_so_and_can_be_undone(self):
@@ -350,7 +377,7 @@ class CoverageTests(unittest.TestCase):
         gaps = self.check(planned, verdicts_for(TESTS, ["Wrote unit tests for billing code."]))
         tests = self.requirement(gaps, planned, TESTS)
         self.assertEqual((tests["status"], tests["evidence"]), ("not_shown", [
-            {"text": "Wrote unit tests for billing code.", "shown": False, "why": "reworded", "undo": "reword:fact-intern-tests"}]))
+            {"text": "Wrote unit tests for billing code.", "shown": False, "why": "reworded", "undo": ["reword:fact-intern-tests"]}]))
         self.assertEqual(self.requirement(gaps, set_change(planned, "reword:fact-intern-tests"), TESTS)["status"], "shown")
 
     def test_a_change_already_undone_is_not_offered_again(self):
@@ -358,14 +385,14 @@ class CoverageTests(unittest.TestCase):
         planned = set_change(plan_draft(tailored, decided_job(), chat=FakePlanner(KEEP_ALL)), "reword:fact-intern-tests")
         gaps = self.check(planned, verdicts_for(TESTS, ["Wrote tests for billing code."]))  # only the new words show it
         self.assertEqual(self.requirement(gaps, planned, TESTS)["evidence"], [
-            {"text": "Wrote tests for billing code.", "shown": False, "why": "reworded", "undo": None}])
+            {"text": "Wrote tests for billing code.", "shown": False, "why": "reworded", "undo": []}])
 
     def test_evidence_that_is_not_on_this_cv_is_named_as_such(self):
         docker, _ = add_fact(self.database, "Deployed services with Docker and Kubernetes.", "experience", ["Docker"])
         confirm_fact(self.database, docker["id"], 1)
         gaps = self.check(self.draft, verdicts_for("Hands-on Docker and Kubernetes", ["Deployed services with Docker and Kubernetes."]))
         self.assertEqual(self.requirement(gaps, self.draft, "Hands-on Docker and Kubernetes")["evidence"], [
-            {"text": "Deployed services with Docker and Kubernetes.", "shown": False, "why": "not_on_cv", "undo": None}])
+            {"text": "Deployed services with Docker and Kubernetes.", "shown": False, "why": "not_on_cv", "undo": []}])
 
     def test_without_an_answer_nothing_is_shown_or_missing(self):
         # A matching skill word must never stand in for DeepSeek's verdict.
@@ -376,12 +403,13 @@ class CoverageTests(unittest.TestCase):
 
     def test_an_answer_without_a_usable_line_leaves_that_requirement_unchecked(self):
         def sloppy(request):
-            lines = {line["text"]: line["id"] for line in request["lines"]}
+            lines = sent_lines(request)
             ids = {item["text"]: item["id"] for item in request["requirements"]}
             python = lines["Languages: Python, Java"]
             return [
-                {"id": ids[PYTHON], "verdict": "supported", "sets": [["E999"], [python, python, "E998"]]},
-                {"id": ids[TESTS], "verdict": "related", "lines": ["E999"]},
+                {"id": ["not", "an", "id"], "verdict": "none"},
+                {"id": ids[PYTHON], "verdict": "supported", "sets": [["E999"], [python, python, "E998"], [{"id": python}], "E1"]},
+                {"id": ids[TESTS], "verdict": "related", "lines": ["E999", {"id": python}, [python]]},
                 {"id": ids["Hands-on Docker and Kubernetes"], "verdict": "maybe"},
                 {"id": ids["3+ years of backend experience"], "verdict": "supported",
                  "sets": [[python, lines["Software Intern (2025)"], lines["Wrote unit tests for billing code."],
@@ -389,6 +417,53 @@ class CoverageTests(unittest.TestCase):
             ]
         statuses = {item["text"]: item["status"] for item in self.shown(self.check(self.draft, sloppy), self.draft)["requirements"]}
         self.assertEqual(set(statuses.values()), {"unchecked"})
+
+    def test_each_line_goes_out_with_its_own_entry_so_no_line_borrows_other_dates(self):
+        # Found in review by Codex: a flat list of lines let a bullet from one job take another
+        # job's dates, so "3+ years of X" could look shown.
+        profile = copy.deepcopy(PROFILE)
+        profile["sections"][1]["entries"][0]["facts"] = ["fact-intern-api"]
+        profile["sections"][1]["entries"].append(
+            {"title": "Other Co", "subtitle": "Software Engineer", "dates": "2020 – 2024", "facts": ["fact-intern-tests"]})
+        chat = FakeDeepSeek(lambda ids: [], lambda request: [])
+        gaps = find_gaps(decided_job(), build_draft(profile, self.database, "en"), self.database, chat)
+        entries = {entry["role"]["text"]: [line["text"] for line in entry["lines"]]
+                   for entry in json.loads(chat.sent[0])["resume"] if entry.get("role")}
+        self.assertEqual(entries["Software Intern (2025)"], ["Built REST APIs for an internal tool."])
+        self.assertEqual(entries["Software Engineer (2020 – 2024)"], ["Wrote unit tests for billing code."])
+        self.assertNotIn("Other Co", chat.sent[0])
+        # Moving a line to the other job changes what it shows, so the check is out of date.
+        moved = copy.deepcopy(profile)
+        moved["sections"][1]["entries"][0]["facts"], moved["sections"][1]["entries"][1]["facts"] = \
+            ["fact-intern-tests"], ["fact-intern-api"]
+        self.assertTrue(self.shown(gaps, build_draft(moved, self.database, "en"))["stale"])
+
+    def test_putting_back_a_reworded_line_also_restores_the_words_that_show_it(self):
+        # Found in review by Codex: undoing the cut alone brought back the rewording, which does
+        # not show the requirement.
+        tailored = tailor_draft(self.draft, self.database, chat=FakeChat({"fact-intern-tests": "Wrote tests for billing code."}))
+        planned = plan_draft(tailored, decided_job(), chat=FakePlanner(
+            {**KEEP_ALL, "entries": [{"entry": "s1e0", "lines": ["fact-intern-api"]}]}))
+        gaps = self.check(planned, verdicts_for(TESTS, ["Wrote unit tests for billing code."]))
+        [line] = self.requirement(gaps, planned, TESTS)["evidence"]
+        self.assertEqual((line["why"], line["undo"]), ("cut", ["cut:fact-intern-tests", "reword:fact-intern-tests"]))
+        for change in line["undo"]:
+            planned = set_change(planned, change)
+        self.assertEqual(self.requirement(gaps, planned, TESTS)["status"], "shown")
+
+    def test_a_check_is_out_of_date_when_evidence_changes_even_where_it_is_hidden(self):
+        # Found in review by Codex: only what the CV showed was compared, so a cut line could be
+        # reworded again, or a role removed, without the check noticing.
+        def planned_with(rewording):
+            tailored = tailor_draft(self.draft, self.database, chat=FakeChat({"fact-skills-languages": rewording}))
+            return plan_draft(tailored, decided_job(), chat=FakePlanner(CUT_SKILLS))
+        first = planned_with("Languages: Java, Python")
+        gaps = self.check(first)
+        self.assertFalse(self.shown(gaps, set_change(first, "cut:skills"))["stale"])  # undoing is not a change
+        self.assertTrue(self.shown(gaps, planned_with("Languages: Python and Java"))["stale"])
+        no_role = copy.deepcopy(PROFILE)
+        del no_role["sections"][0]["entries"][0]["subtitle"]
+        self.assertTrue(self.shown(gaps, build_draft(no_role, self.database, "en"))["stale"])
 
     def test_a_check_is_out_of_date_once_the_facts_or_the_wording_change(self):
         gaps = self.check(self.draft)

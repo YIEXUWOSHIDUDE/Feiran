@@ -13,7 +13,7 @@ from gaps import EVIDENCE_RULES, SUGGEST_RULES
 from matching import MATCH_RULES
 from requirement_flow import FIND_RULES
 from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
-from test_gaps import resume_ids
+from test_gaps import resume_ids, sent_lines
 from test_listings import FakeBoards, posting
 
 HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
@@ -576,7 +576,7 @@ class WebTests(unittest.TestCase):
 
         def judged(request):
             """Shown by any line naming it; the years only in part, by the internship's dates."""
-            lines = {line["text"]: line["id"] for line in request["lines"]}
+            lines = sent_lines(request)
             ids = {item["text"]: item["id"] for item in request["requirements"]}
             answer = [{"id": ids["3+ years of backend experience"], "verdict": "related",
                        "lines": [lines["Software Intern (2025)"]], "missing": "3+ years"},

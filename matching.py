@@ -115,9 +115,10 @@ def _model_choices(
     for pick in picks:
         requirement_id = pick.get("requirement") if isinstance(pick, dict) else None
         fact_ids = pick.get("facts") if isinstance(pick, dict) else None
-        if requirement_id not in wanted or requirement_id in choices or not isinstance(fact_ids, list):
+        if (not isinstance(requirement_id, str) or requirement_id not in wanted or requirement_id in choices
+                or not isinstance(fact_ids, list)):
             continue
-        known = [back[alias] for alias in dict.fromkeys(fact_ids) if isinstance(alias, str) and alias in back]
+        known = [back[alias] for alias in dict.fromkeys(alias for alias in fact_ids if isinstance(alias, str)) if alias in back]
         choices[requirement_id] = [
             {**confirmed[fact_id], "retrieval_basis": {"method": "deepseek", "rank": rank}}
             for rank, fact_id in enumerate(known[:MAX_MODEL_FACTS], 1)

@@ -702,13 +702,21 @@ const LEFT_OUT = {
 };
 const WAY_BACK = { cut: "Put it back", reworded: "Use your own wording" };
 
+// Undoes every change that hides the quoted words: a cut, and a rewording when the line would
+// otherwise come back reworded.
 function evidenceLine(view, language, line, refresh) {
-  const undo = line.undo
-    ? actionButton(WAY_BACK[line.why] || "Undo", async () => {
-      await api(`/api/jobs/${view.job_id}/cv/${language}/change`, {
-        method: "POST", body: JSON.stringify({ change_id: line.undo, undone: true }),
-      });
-      await refresh();
+  const both = line.undo.length > 1;
+  const undo = line.undo.length
+    ? actionButton(both ? "Put it back in your own words" : WAY_BACK[line.why] || "Undo", async () => {
+      try {
+        for (const change of line.undo) {
+          await api(`/api/jobs/${view.job_id}/cv/${language}/change`, {
+            method: "POST", body: JSON.stringify({ change_id: change, undone: true }),
+          });
+        }
+      } finally {
+        await refresh();
+      }
     }, true)
     : null;
   return el("li", {}, `“${line.text}”`,
@@ -734,6 +742,7 @@ function coverageRow(view, language, item, refresh, post) {
   const notes = [];
   if (item.status === "related" && item.missing) notes.push(el("p", { class: "muted" }, `No line shows: ${item.missing}`));
   if (item.status === "none") notes.push(el("p", { class: "muted" }, "None of your confirmed facts states this; that does not mean you lack it."));
+  if (item.status === "unchecked") notes.push(el("p", { class: "muted" }, "DeepSeek gave no usable answer for this requirement, so it does not count as shown. Use Check again."));
   const gap = item.status === "related" || item.status === "none";
   return el("div", { class: `requirement ${item.status} ${gap ? item.suggestion_status : ""}` },
     el("div", { class: "requirement-text" }, item.text, strength), lines, notes, gap ? suggestionBlock(item, post) : null);
