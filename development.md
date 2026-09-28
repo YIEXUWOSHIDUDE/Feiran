@@ -292,6 +292,14 @@ v3 根据 2026-09 下载的 8,787 个公开岗位补充了各公司常用的要�
 
 之后 232 个测试通过；上述修正的变异检查全部被测试发现；真实 DeepSeek 在新的按条目格式下复测正常（实习 JD 2.6 秒，结果不变）；浏览器点击检查结果不变。
 
+**真实岗位检查（2026-09-28；用户说检查 2 个岗位即可）**：用 Start 在真实数据上走完整流程（真实 DeepSeek）：DoorDash Software Engineer, Intern (Summer 2027) 与 Waymo 2027 Summer Intern, MS/PhD, Road Understanding, ML Engineer。每个岗位约 5–6 秒准备好简历、3–5 秒完成要求检查。要求提取两个岗位都正确（必需/加分分组正确，职责和福利行未计入）；两份简历的改写都没有改动任何一行；结构调整合理。发现并修正的问题：
+- 补充建议：DoorDash 7 条中 4 条只是把已有要点换个说法并加上 JD 原话（如 “Addressed real-time technology problems by decoupling window capture…”），接受后会出现几乎重复且多出主张的要点；Waymo 有 3 条在无关条目下编造具体工作（求职工具项目下的 MapTR 车道拓扑、OCR 项目下的相机/LiDAR 融合和 Transformer 模型）；还建议把 “Data Structures” 加进 Languages 行。现在规则要求技能只加进标签相符的行，新要点只加在已有相关工作的条目下，不重述已有行（附具体反例）、不照抄要求原文、不编造模型/系统/功能；质量或规模类要求（efficient、real-time、large-scale）以及需要单独项目才能说明的经验回答 none。页面在每条建议的新要点旁列出该条目已有的行，换了说法的重复一眼可见；程序只丢弃与某条已有行逐词几乎相同的新要点（按词序的相似度 ≥0.85，或除首个词外完全相同，即只换了动词；中文按字）。
+
+最初还加了两条按词判断的规则（新要点须与所在条目有共同实词、与某条已有行实词重合 ≥60% 即丢弃），用旧答案回放能丢弃 8 条问题要点中的 5 条。**Codex 审查 PR #5** 指出它们两头出错：会丢弃诚实的补充（“Documented REST APIs for the internal tool with OpenAPI” 因重复所补充的工作而被当作重复；API、SQL、Go、JWT 这类短词被忽略；中文夹英文时有无空格结果不同），又拦不住问题要点（一个共同词如 “Python” 就放行无关的车道拓扑 Transformer；换说法加上 JD 词可以稀释重合比例）。按词无法区分“给同一工作补充新工具”和“换个说法重述”，所以删去这两条，只保留上面的规则、并排显示和逐词近似检查（对 Codex 的诚实例子相似度约 0.6–0.7，不会误删）。同时删去的栏目借用 “sections” 理由只在它是栏目列表唯一改动时进行（Codex 指出删去两个栏目时两者会得到同一理由）。**再次审查**又发现 3 点：被护栏撤回的顺序调整（教育栏目固定在原位）仍会把它的理由让给删减（现在按 DeepSeek 提出的栏目列表判断，只有它恰好是原列表去掉一个栏目时才借用）；只换了动词的短要点（“Built REST APIs.”→“Created REST APIs.”）相似度只有 0.67，逃过检查（现在除首个词外完全相同也算抄写）；在已有行末尾加工具名的新要点（“…billing code using pytest”）会被当作抄写——作为新要点，它会让简历出现两条几乎相同的行，所以仍丢弃，同时规则要求只加工具时改为技能建议。只靠规则重新检查三次：Waymo 三次都没有编造的要点；DoorDash 一次出现 3 条换说法的要点（都来自 efficient/real-time/large-scale 这类要求，之后已加入 none 规则），加规则后一次没有建议、一次只有 CI/CD 技能和一条只改了首个动词的已有要点（现在被逐词近似检查丢弃）。换说法的重述要靠第 6 项的语义复核才能可靠发现。
+- 证据判断：列出多个选择的要求（A、B 或 C）被当作需要全部满足；证据没有按强弱排序（“experience with databases” 由在读课程而不是 MySQL 要点说明）；论文不在指定会议时判为 none。规则现在说明满足其一即可、按强弱排序、这种论文算 related；重新检查后 databases 由 MySQL 要点说明、论文为 related。“project or research-based work, hackathons…” 仍为 related（被删去的论文显示在旁边，可以放回）。
+- 结构调整：删去 Publications 的理由写在 “sections” 下，栏目顺序本身没变，所以页面上这项删减没有理由；现在删去的栏目没有自己的理由时使用 “sections” 的理由。
+- 仍存在：同类判断在不同次检查中可能宽严不一（如把列出 PyTorch 的技能行算作 “solid experience with deep learning frameworks”；“clean code, version control, unit testing” 一次为 shown、一次为 related）。这正是第 6 项测试集要衡量的。
+
 尚未做（计划第 6–7 项）：语义复核的测试集与 DeepSeek/Jev 对比；文档整体更新。
 
 ## 上传简历（2026-09-27）

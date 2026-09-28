@@ -683,7 +683,10 @@ function suggestionText(suggestion) {
     return el("span", {}, "Add to your skills line ", el("span", { class: "muted" }, `“${suggestion.where}”`), ": ",
       el("strong", {}, suggestion.items.join(", ")));
   }
-  return el("span", {}, `New line under ${suggestion.where}: `, el("strong", {}, `“${suggestion.text}”`));
+  const beside = suggestion.beside || [];
+  return el("span", {}, `New line under ${suggestion.where}: `, el("strong", {}, `“${suggestion.text}”`),
+    beside.length ? el("span", { class: "beside muted" }, el("br"), "Already there: ",
+      beside.flatMap((line, index) => [index ? " · " : "", `“${line}”`])) : null);
 }
 
 // What the CV shows for each requirement, most useful to act on first. Worked out on the

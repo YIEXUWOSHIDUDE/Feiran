@@ -94,6 +94,27 @@ class CVPlanTests(unittest.TestCase):
         experience = next(section for section in planned["plan"]["layout"] if section["kind"] == "experience")
         self.assertEqual(experience["entries"], [{"entry": "s1e0", "lines": ["fact-intern-api"]}])  # its one kept line
 
+    def test_a_cut_section_takes_the_reason_given_for_the_section_list(self):
+        # Seen on a real posting: DeepSeek explained leaving out Publications under "sections",
+        # and the order of the rest did not change, so the cut showed no reason.
+        planned = plan_draft(self.draft, decided_job(), chat=FakePlanner({
+            "sections": ["education", "experience"], "entries": [],
+            "reasons": [{"target": "sections", "reason": "Skills repeat the bullets."}]}))
+        self.assertEqual([(item["id"], item["reason"]) for item in planned["plan"]["changes"]],
+                         [("cut:skills", "Skills repeat the bullets.")])
+        # Found in review by Codex: with more than one change to the section list, that reason
+        # may explain any of them, so a cut without its own reason stays without one.
+        both = plan_draft(self.draft, decided_job(), chat=FakePlanner({
+            "sections": ["education"], "entries": [],
+            "reasons": [{"target": "sections", "reason": "Skills repeat the bullets."}]}))
+        self.assertEqual({item["id"]: item["reason"] for item in both["plan"]["changes"]},
+                         {"cut:experience": None, "cut:skills": None})
+        # Found in review by Codex: a reordering the guardrails undid still asked for that reason.
+        moved = plan_draft(self.draft, decided_job(), chat=FakePlanner({
+            "sections": ["experience", "education"], "entries": [],
+            "reasons": [{"target": "sections", "reason": "Experience first for this hands-on role."}]}))
+        self.assertEqual({item["id"]: item["reason"] for item in moved["plan"]["changes"]}, {"cut:skills": None})
+
     def test_plan_orders_and_cuts_with_reasons_and_sends_no_names(self):
         planner = FakePlanner(CUT_API)
         planned = plan_draft(self.draft, decided_job(), chat=planner)

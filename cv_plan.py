@@ -65,13 +65,28 @@ def _facts_named(content: dict[str, Any], back: dict[str, str]) -> dict[str, Any
     return {**content, "entries": entries, "reasons": reasons}
 
 
-def _with_reasons(changes: list[dict[str, str]], reasons: dict[str, str], kinds: list[str]) -> list[dict[str, Any]]:
-    """Attach the model's reason for each change's target; a section may be named by id or kind."""
+def _only_cut(proposed: Any, kinds: list[str]) -> str | None:
+    """The one section a proposed section list leaves out, when that is all it does: then a
+    reason given for the list explains that cut (DeepSeek tends to put it there). A list that
+    also moves a section, even one the guardrails put back, may be explaining the move."""
+    listed = [kind for kind in dict.fromkeys(item for item in proposed if isinstance(item, str)) if kind in kinds] \
+        if isinstance(proposed, list) else []
+    left_out = [kind for kind in kinds if kind not in listed]
+    return left_out[0] if len(left_out) == 1 and listed == [kind for kind in kinds if kind in listed] else None
+
+
+def _with_reasons(
+    changes: list[dict[str, str]], reasons: dict[str, str], kinds: list[str], only_cut: str | None = None
+) -> list[dict[str, Any]]:
+    """Attach the model's reason for each change's target; a section may be named by id or kind.
+    ``only_cut`` is the section whose cut may take the reason given for the section list."""
     result = []
     for change in changes:
         target = change["id"].split(":", 1)[1]
         section = re.fullmatch(r"s(\d+)", target)
         names = [target] + ([kinds[int(section[1])]] if section else [])
+        if change["id"] == f"cut:{only_cut}":
+            names.append("sections")
         reason = next((reasons[name] for name in names if name in reasons), None)
         result.append({**change, "reason": reason})
     return result
@@ -142,7 +157,7 @@ def plan_draft(
         "layout": planned_layout,
         "changes": _with_reasons(
             describe_changes(draft, planned_layout), _reasons(content.get("reasons")),
-            [section["kind"] for section in layout],
+            [section["kind"] for section in layout], _only_cut(content["sections"], [section["kind"] for section in layout]),
         ),
         "undone": [],
     }
