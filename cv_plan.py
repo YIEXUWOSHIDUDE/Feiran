@@ -1,7 +1,7 @@
 """Per-job CV plan: DeepSeek proposes which sections, entries and lines to show, and in what order.
 
-Only the job title, its requirements and the CV's line texts are sent: never the name,
-contact details, schools, employers or project names. The proposal passes cv_layout's
+Only the job title, its requirements and the CV's line texts (under stand-in IDs) are sent:
+never the name, contact details, schools, employers, project names or fact IDs. The proposal passes cv_layout's
 guardrails before it is used. The draft keeps every line, so each listed change can be
 undone, or done again, without asking the model.
 """
@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
 from cv import CVError, _job_summary, requirement_briefs
-from privacy import mask, private_terms
+from privacy import mask, private_terms, stand_ins
 from cv_layout import describe_changes, guarded_layout, original_layout
 from deepseek_client import DEFAULT_MODEL, DeepSeekError, chat_json
 
@@ -47,6 +47,22 @@ def _reasons(value: Any) -> dict[str, str]:
             if reason:
                 reasons.setdefault(item["target"], reason)
     return reasons
+
+
+def _facts_named(content: dict[str, Any], back: dict[str, str]) -> dict[str, Any]:
+    """The answer with each line's stand-in turned back into its fact ID. A line name that was
+    never sent is dropped; entry IDs and section names in reasons pass through."""
+    entries = [
+        {**item, "lines": [back[line] for line in item["lines"] if isinstance(line, str) and line in back]}
+        if isinstance(item, dict) and isinstance(item.get("lines"), list) else item
+        for item in content["entries"]
+    ]
+    reasons = [
+        {**item, "target": back.get(item["target"], item["target"])}
+        if isinstance(item, dict) and isinstance(item.get("target"), str) else item
+        for item in (content.get("reasons") if isinstance(content.get("reasons"), list) else [])
+    ]
+    return {**content, "entries": entries, "reasons": reasons}
 
 
 def _with_reasons(changes: list[dict[str, str]], reasons: dict[str, str], kinds: list[str]) -> list[dict[str, Any]]:
@@ -87,12 +103,13 @@ def plan_draft(
         line["fact_id"]: mask(line.get("source_text") or line["text"], private)
         for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
     }
+    out, back = stand_ins(texts)
     request = {
         "job_title": job_summary["title"],
         "job_requirements": requirement_briefs(job),
         "resume": [
             {"section": section["kind"], "entries": [
-                {"entry": entry["entry"], "lines": [{"id": fact_id, "text": texts[fact_id]} for fact_id in entry["lines"]]}
+                {"entry": entry["entry"], "lines": [{"id": out[fact_id], "text": texts[fact_id]} for fact_id in entry["lines"]]}
                 for entry in section["entries"]
             ]}
             for section in layout
@@ -110,6 +127,7 @@ def plan_draft(
     if not isinstance(content, dict) or not isinstance(content.get("sections"), list) \
             or not isinstance(content.get("entries"), list):
         raise CVError("DeepSeek 的结构建议缺少 sections 或 entries")
+    content = _facts_named(content, back)
     planned_layout = guarded_layout(draft, content)
     planned = copy.deepcopy(draft)
     planned["plan"] = {

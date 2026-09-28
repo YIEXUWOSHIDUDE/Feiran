@@ -13,6 +13,7 @@ from gaps import SUGGEST_RULES
 from matching import MATCH_RULES
 from requirement_flow import FIND_RULES
 from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
+from test_gaps import resume_ids
 from test_listings import FakeBoards, posting
 
 HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
@@ -57,12 +58,15 @@ class FakeDeepSeek(FakeChat):
         if messages[0]["content"] == SUGGEST_RULES:
             if self.gap_suggestions is None:
                 raise DeepSeekError("测试中不联网", reason="unreachable")
-            ids = {item["text"]: item["id"] for item in json.loads(messages[-1]["content"])["gaps"]}
-            return {"model": "deepseek-flash", "content": {"suggestions": self.gap_suggestions(ids)}, "usage": {}}
+            request = json.loads(messages[-1]["content"])
+            ids = {item["text"]: item["id"] for item in request["gaps"]}
+            return {"model": "deepseek-flash", "content": {"suggestions": resume_ids(self.gap_suggestions(ids), request)},
+                    "usage": {}}
         if messages[0]["content"] == MATCH_RULES or (messages[0]["content"] == PLAN_RULES and self.plan is None):
             raise DeepSeekError("测试中不联网", reason="unreachable")
         if messages[0]["content"] == PLAN_RULES:
-            return {"model": "deepseek-flash", "content": self.plan, "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+            return {"model": "deepseek-flash", "content": resume_ids(self.plan, json.loads(messages[-1]["content"])),
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
         if messages[0]["content"] != FIND_RULES:
             return super().__call__(messages, model, effort)
         if self.requirement_lines is None:

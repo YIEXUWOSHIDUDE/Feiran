@@ -250,8 +250,27 @@ class CVExportTests(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["workbench.db"])
 
 
+FACT_IDS = {item["text"]: item["id"] for item in FACTS}
+
+
+def stand_ins_for(lines, key="id"):
+    """The ID a request gave each of FACTS's lines, found by text as DeepSeek would see it."""
+    sent = {line["text"]: line[key] for line in lines}
+    return {item["id"]: sent[item["text"]] for item in FACTS if item["text"] in sent}
+
+
+def swap_ids(value, ids):
+    """``value`` with every string that is a key of ``ids`` replaced by its value."""
+    if isinstance(value, dict):
+        return {key: swap_ids(item, ids) for key, item in value.items()}
+    if isinstance(value, list):
+        return [swap_ids(item, ids) for item in value]
+    return ids.get(value, value) if isinstance(value, str) else value
+
+
 class FakeChat:
-    """Stands in for DeepSeek: echoes each requested line unless a rewrite is given."""
+    """Stands in for DeepSeek: echoes each requested line unless a rewrite is given for the
+    fact whose text it is (by fact ID, while the request names lines by stand-ins)."""
 
     def __init__(self, rewrites=None, drop=None):
         self.rewrites = rewrites or {}
@@ -262,8 +281,8 @@ class FakeChat:
         self.messages = messages
         request = json.loads(messages[-1]["content"])
         lines = [
-            {"fact_id": line["fact_id"], "text": self.rewrites.get(line["fact_id"], line["text"])}
-            for line in request["lines"] if line["fact_id"] != self.drop
+            {"fact_id": line["fact_id"], "text": self.rewrites.get(FACT_IDS.get(line["text"]), line["text"])}
+            for line in request["lines"] if self.drop is None or FACT_IDS.get(line["text"]) != self.drop
         ]
         return {
             "model": "deepseek-flash",
@@ -334,6 +353,18 @@ class CVTailorTests(unittest.TestCase):
             with self.assertRaisesRegex(CVError, "fact-intern-api"):
                 export_pdf(tailored, database, Path(directory) / "stale.pdf", printer=FakePrinter())
         self.assertIn("For an internal tool, built REST APIs.", printer.html)
+
+    def test_lines_go_out_under_stand_in_ids_never_their_fact_ids(self):
+        # A fact ID can be made from its text, such as fact-usc-coursework, and so name a school.
+        chat = FakeChat({"fact-intern-api": "For an internal tool, built REST APIs."})
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory)
+            tailored = tailor_draft(build_draft(PROFILE, database, "en"), database, chat=chat)
+        sent = chat.messages[-1]["content"]
+        for fact in FACTS:
+            self.assertNotIn(fact["id"], sent)
+        self.assertEqual(line_for(tailored, "fact-intern-api")["text"], "For an internal tool, built REST APIs.")
+        self.assertEqual(line_for(tailored, "fact-intern-tests")["text"], "Wrote unit tests for billing code.")
 
     def test_answers_that_skip_a_requested_line_are_refused(self):
         with tempfile.TemporaryDirectory() as directory:

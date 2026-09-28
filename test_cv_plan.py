@@ -8,7 +8,7 @@ from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError
 from facts import confirm_facts, import_facts
 from requirement_flow import apply_requirement_decisions, propose_requirements
-from test_cv import PROFILE, FakeChat, make_store
+from test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
 
 
 def decided_job():
@@ -23,7 +23,8 @@ def decided_job():
 
 
 class FakePlanner:
-    """Stands in for DeepSeek: returns one fixed structure proposal, or fails."""
+    """Stands in for DeepSeek: returns one fixed structure proposal, or fails. The proposal
+    names lines by fact ID; the answer uses the IDs the request gave them."""
 
     def __init__(self, content=None, error=None):
         self.content = content
@@ -34,7 +35,10 @@ class FakePlanner:
         self.messages = messages
         if self.error:
             raise self.error
-        return {"model": "deepseek-flash", "content": self.content, "usage": {"prompt_tokens": 30, "completion_tokens": 20}}
+        request = json.loads(messages[-1]["content"])
+        lines = [line for section in request["resume"] for entry in section["entries"] for line in entry["lines"]]
+        return {"model": "deepseek-flash", "content": swap_ids(self.content, stand_ins_for(lines)),
+                "usage": {"prompt_tokens": 30, "completion_tokens": 20}}
 
 
 CUT_API = {
@@ -80,6 +84,16 @@ class CVPlanTests(unittest.TestCase):
         self.assertIn("billing tool", planner.messages[-1]["content"])
         self.assertNotIn("Example Corp", planner.messages[-1]["content"])
 
+    def test_the_answer_can_name_only_lines_the_request_gave_it(self):
+        # A fact ID never goes out, so an answer naming one did not come from the request.
+        def planner(messages, model, effort):
+            return {"model": "deepseek-flash", "usage": {}, "content": {
+                "sections": ["education", "experience", "skills"],
+                "entries": [{"entry": "s1e0", "lines": ["fact-intern-tests", "L99"]}]}}
+        planned = plan_draft(self.draft, decided_job(), chat=planner)
+        experience = next(section for section in planned["plan"]["layout"] if section["kind"] == "experience")
+        self.assertEqual(experience["entries"], [{"entry": "s1e0", "lines": ["fact-intern-api"]}])  # its one kept line
+
     def test_plan_orders_and_cuts_with_reasons_and_sends_no_names(self):
         planner = FakePlanner(CUT_API)
         planned = plan_draft(self.draft, decided_job(), chat=planner)
@@ -89,7 +103,8 @@ class CVPlanTests(unittest.TestCase):
             "order:sections": "The job asks for hands-on testing first.",
             "cut:fact-intern-api": "REST APIs are not asked for.",
         })
-        for private in ("Alex Example", "alex@example.com", "Example Corp", "Example University", "Los Angeles"):
+        for private in ("Alex Example", "alex@example.com", "Example Corp", "Example University", "Los Angeles",
+                        *(fact["id"] for fact in FACTS)):
             self.assertNotIn(private, sent)
         self.assertIn("Wrote unit tests for billing code.", sent)
         self.assertLess(html.index("Python, Java"), html.index("Example Corp"))
