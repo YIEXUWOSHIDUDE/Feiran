@@ -1,20 +1,22 @@
-# 岗位匹配与申请材料审核工作台
+# Job Fit Workbench
 
-目的：帮助候选人针对每个岗位，用自己已确认的真实经历拿出最好的一版简历（先放什么、删什么、怎样按岗位的说法改写），而不是评判候选人是否符合岗位。系统不会加入事实以外的内容，最终简历由用户审核批准。
+English | [简体中文](README.zh-CN.md)
 
-本机 SQLite 保存带版本、分类和标签的候选人事实；岗位来自 Greenhouse、Lever、Ashby 公开招聘板或手动粘贴的 JD。网页是主要入口；命令行用于开发和测试。仓库不包含真实候选人资料。
+Purpose: for each job, help the candidate present the best CV they can make from their own confirmed, real experience: what to put first, what to cut, and how to word it in the job's language. It does not judge whether the candidate qualifies. Nothing beyond the candidate's facts is ever added, and the candidate reviews and approves the final CV.
 
-架构、业务不变量和当前限制见 [development.md](development.md)。
+Candidate facts are stored locally in SQLite with versions, a type and tags. Jobs come from public Greenhouse, Lever and Ashby job boards, or from a pasted job description (JD). The web page is the main entry point; the command line is for development and testing. The repository contains no real candidate data.
 
-## 环境
+Architecture, business invariants and current limits: [development.md](development.md) (in Chinese).
 
-需要 Python 3.10 或更新版本，不需要安装第三方依赖。TypeSafe/Jev 仅用于可选的 JD 候选语义判断；普通离线流程不需要 API key。
+## Requirements
 
-## 完整流程
+Python 3.10 or newer. The command-line tools need no third-party packages. TypeSafe/Jev is only used for optional semantic checks of JD requirements; the normal offline flow needs no API key. The web page needs a small virtual environment (see [Web page](#web-page)).
 
-### 1. 建立并确认候选人事实
+## Command-line flow
 
-每个事实必须选择一个粗分类；`--tag` 可以重复，记录用于检索的技能、领域和资格词。
+### 1. Build and confirm candidate facts
+
+Every fact needs a coarse type; `--tag` can be repeated and records the skills, domains and qualifications used for search.
 
 ```sh
 python3 facts.py add \
@@ -22,42 +24,42 @@ python3 facts.py add \
   --tag Python \
   --tag FastAPI \
   --tag backend \
-  --text "使用 Python 和 FastAPI 完成后端课程项目。"
+  --text "Built a backend course project with Python and FastAPI."
 
 python3 facts.py list
 python3 facts.py confirm fact-xxxxxxxxxxxx@1
 ```
 
-支持的分类：`project`、`experience`、`skill`、`education`、`eligibility`、`availability`、`achievement`、`other`。
+Supported types: `project`, `experience`, `skill`, `education`, `eligibility`, `availability`, `achievement`, `other`.
 
-事实较多时可从一个 JSON 文件批量导入，格式见 [examples/synthetic_facts_import.json](examples/synthetic_facts_import.json)：每条必须有 `type` 和 `text`，`tags` 和 `id` 可选，其他字段会被拒绝。
+Many facts can be imported from one JSON file; see [examples/synthetic_facts_import.json](examples/synthetic_facts_import.json). Each item needs `type` and `text`; `tags` and `id` are optional; any other field is rejected.
 
-`id` 是自定义的可读 ID（如 `fact-uni-coursework`，只能用 `fact-` 开头的字母、数字和连字符），简历 profile 用它引用事实，见 [examples/synthetic_cv_facts.json](examples/synthetic_cv_facts.json)。带 `id` 的条目：ID 不存在则新建；内容未变则不改动；内容改变则为该事实新建一个 `pending` 版本，需要重新确认。因此可以直接修改 JSON 文件后重新导入。新 ID 的内容若与已有事实完全相同会被拒绝，以免同一事实出现两份。
+`id` is a readable ID of your choice (for example `fact-uni-coursework`; letters, digits and hyphens after `fact-`). The CV profile uses it to refer to facts; see [examples/synthetic_cv_facts.json](examples/synthetic_cv_facts.json). For an item with an `id`: a new ID creates the fact; unchanged content changes nothing; changed content creates a new `pending` version of that fact, which needs confirming again. So you can edit the JSON file and import it again. A new ID whose content exactly matches an existing fact is rejected, so one fact never exists twice.
 
 ```sh
 python3 facts.py import .local/my-facts.json
 python3 facts.py confirm fact-aaaaaaaaaaaa@1 fact-bbbbbbbbbbbb@1
 ```
 
-导入会先校验全部条目，任何一条无效则整批不写入；全部新事实都是 `pending`，重复导入同一内容不会产生重复事实。导入输出的 `next_step` 会列出可确认的 `FACT_ID@VERSION`，请逐条核对后只保留确实无误的 ID。一次确认多个版本时，任何一个不是当前版本就全部不确认。不带 `id` 的条目不会修改已有事实；修改请用 `revise` 或带 `id` 重新导入。个人事实文件请放在 `.local/` 下，不要提交。
+Import validates every item first; if any item is invalid, nothing is written. All new facts start as `pending`, and importing the same content again creates no duplicates. The import output's `next_step` lists the `FACT_ID@VERSION` refs you can confirm: check each one and keep only the ones that are right. When confirming several versions at once, if any one is not the current version, none is confirmed. Items without an `id` never modify existing facts; to change a fact use `revise` or re-import with its `id`. Keep personal fact files under `.local/` and never commit them.
 
-修改文本、分类或标签会创建新的 `pending` 版本；没有提供的字段会沿用当前版本：
+Changing the text, type or tags creates a new `pending` version; fields you do not give are carried over from the current version:
 
 ```sh
-python3 facts.py revise fact-xxxxxxxxxxxx --text "更新后的事实原文"
+python3 facts.py revise fact-xxxxxxxxxxxx --text "Updated fact text"
 python3 facts.py revise fact-xxxxxxxxxxxx --type experience --tag Python --tag backend
 python3 facts.py revise fact-xxxxxxxxxxxx --clear-tags
 python3 facts.py list --history fact-xxxxxxxxxxxx
 python3 facts.py confirm fact-xxxxxxxxxxxx@2
 ```
 
-单个事实仍可使用旧写法 `confirm fact-xxxxxxxxxxxx --version 2`。
+A single fact can still be confirmed the old way: `confirm fact-xxxxxxxxxxxx --version 2`.
 
-创建 v2 后，已确认的 v1 会保留为历史，但不能再用于新匹配。文本、分类和标签作为一个完整版本共同确认。
+Once v2 exists, the confirmed v1 is kept as history but is no longer used for new matches. Text, type and tags are confirmed together as one complete version.
 
-### 2. 获取岗位 JD
+### 2. Get the job description
 
-任何来源的岗位（LinkedIn、公司官网、国内招聘网站等）都可以把 JD 纯文本粘贴进来：
+A job from any source (LinkedIn, a company site, a Chinese job site, …) can be pasted as plain text:
 
 ```sh
 python3 job_search.py paste \
@@ -67,13 +69,13 @@ python3 job_search.py paste \
   --url "https://jobs.example.com/123" \
   --output .local/acme-input.json
 
-# macOS 也可以直接读取剪贴板
-pbpaste | python3 job_search.py paste --file - --title "后端开发实习生" --output .local/xx-input.json
+# On macOS you can read the clipboard directly
+pbpaste | python3 job_search.py paste --file - --title "Backend Developer Intern" --output .local/xx-input.json
 ```
 
-不提供 `--url` 时来源记为“未知”。`captured_at` 是粘贴时间，不是官方发布时间；粘贴内容也不能证明岗位仍开放。`--output` 与 `select` 生成的审核输入格式相同。
+Without `--url` the source is recorded as unknown. `captured_at` is when you pasted it, not the official posting date, and pasted text does not prove the job is still open. `--output` writes the same review-input format as `select`.
 
-Greenhouse、Lever、Ashby 招聘板可以直接搜索（`--provider` 默认 `greenhouse`）。搜索可以使用事实库中当前已确认版本的标签进行本地词面排序；不会把候选人事实发送给 Greenhouse。排序按命中的不同标签数量，同一标签被多条事实使用只算一次。排序时先只读标签和事实 ID，最终只为展示中命中的事实读取原文；每个岗位最多展示 20 条证据。接口超时、连接失败、429 或 5xx 会自动重试一次；404 通常表示招聘板标识或岗位 ID 有误。
+Greenhouse, Lever and Ashby boards can be searched directly (`--provider` defaults to `greenhouse`). Search can rank locally by the tags of the current confirmed fact versions; candidate facts are never sent to the job boards. Jobs are ranked by the number of distinct tags they mention; a tag used by several facts counts once. Ranking reads only tags and fact IDs; fact text is read only for the evidence shown, at most 20 items per job. Timeouts, connection failures, 429 and 5xx responses are retried once; a 404 usually means the board name or job ID is wrong.
 
 ```sh
 python3 job_search.py search \
@@ -83,15 +85,15 @@ python3 job_search.py search \
 
 python3 job_search.py select \
   --board duolingounirecruitment \
-  --job-id 实际岗位ID \
+  --job-id <job id> \
   --output .local/review-input.json
 ```
 
-Lever 用 `--provider lever --board palantir`，Ashby 用 `--provider ashby --board openai`；招聘板标识就是 `jobs.lever.co/<标识>`、`jobs.ashbyhq.com/<标识>` 或 `boards.greenhouse.io/<标识>` 里的那一段。
+For Lever use `--provider lever --board palantir`; for Ashby `--provider ashby --board openai`. The board name is the part after `jobs.lever.co/`, `jobs.ashbyhq.com/` or `boards.greenhouse.io/`.
 
-`select` 会再次读取选中岗位，并只生成 JD 快照。它不会提前复制全部事实；岗位已消失或接口失败时也不会使用旧内容冒充最新。
+`select` reads the chosen job again and writes only a JD snapshot. It does not copy any facts yet, and if the job is gone or the API fails, it never passes off old content as current.
 
-### 3. 提取并确认 JD 要求
+### 3. Extract and confirm requirements
 
 ```sh
 python3 requirement_flow.py propose \
@@ -105,9 +107,9 @@ python3 requirement_flow.py decide \
   --output .local/review-decided.json
 ```
 
-`propose` 从已知要求章节复制 JD 原文，所有候选从 `pending` 开始。可识别常见英文标题（`Requirements`、`Minimum Requirements`、`You have`、`Nice to have` 等）和中文标题（`岗位要求`、`任职要求`、`职位要求`、`加分项` 等），也能处理 `**…**`、`【…】`、`一、`、`1.` 等装饰或编号，以及 `任职要求：熟悉 Python` 这种同一行写内容的情况。`decide` 只确认或排除要求，不再承担事实关联；候选 ID 根据原文稳定生成。
+`propose` copies JD lines word for word from known requirement sections; every candidate starts as `pending`. It recognizes common English headings (`Requirements`, `Minimum Requirements`, `You have`, `Nice to have`, `What we look for`, …) and Chinese headings (`岗位要求`, `任职要求`, `职位要求`, `加分项`, …), handles decorations and numbering such as `**…**`, `【…】`, `一、` and `1.`, and headings with content on the same line (`任职要求：熟悉 Python`). `decide` only confirms or excludes requirements; it no longer links facts. Candidate IDs are derived from the text, so they are stable.
 
-规则漏掉的要求可以手动补充，但必须是 JD 中的确切原文（可以是一行中的一部分）；补充的候选同样从 `pending` 开始，需要再用 `decide` 确认：
+Requirements the rules miss can be added by hand, but only as exact JD text (part of a line is fine). Added candidates also start as `pending` and need `decide`:
 
 ```sh
 python3 requirement_flow.py add \
@@ -116,9 +118,9 @@ python3 requirement_flow.py add \
   --output .local/review-candidates-2.json
 ```
 
-不在 JD 中的文字、已存在的候选以及已进入事实匹配阶段的文件都会被拒绝。
+Text not in the JD, an existing candidate, or a file already at the fact-matching stage is rejected.
 
-若要使用 Jev 补充“是否是申请人要求、类别、required/preferred 强度”判断，可在 zsh 中隐藏输入 API key：
+To add Jev's judgments (is it an applicant requirement, its category, required or preferred), enter the API key without echo in zsh:
 
 ```sh
 read -s "TYPESAFE_API_KEY?TypeSafe API key: "
@@ -130,9 +132,9 @@ python3 requirement_flow.py propose \
 unset TYPESAFE_API_KEY
 ```
 
-该请求只发送 JD 和要求候选，不发送候选人事实。Jev 的输出仍是待核对信号，不能自动确认要求。不要把 key 写进命令、JSON 或仓库文件。
+This request sends only the JD and the requirement candidates, never candidate facts. Jev's output is a signal to check; it never confirms a requirement by itself. Never put the key in a command, a JSON file or the repository.
 
-### 4. 检索事实候选并人工绑定
+### 4. Find supporting facts and link them
 
 ```sh
 python3 matching.py propose \
@@ -151,13 +153,13 @@ python3 matching.py decide \
 python3 review.py .local/review-linked.json
 ```
 
-检索先使用要求的类别信号缩小事实类型，再使用版本化标签寻找相关候选。英文标签只以英文字母、数字为边界，因此 `熟悉Python` 也能命中 `Python`；中文标签使用子串匹配。只有一两个字母/数字的短标签（如 `Go`、`R`、`C`、`AI`）区分大小写且不能紧挨 `&`，单字母标签也不能紧挨 `-`，以避免 `go to market`、`R&D`、`C-suite` 误命中；句首的 `Go` 等仍可能误命中，可改用 `Golang` 这类更具体的标签。输出只复制用户最终选择的事实，不复制整个事实库。若事实从候选生成后被修改、失去确认或不再是当前版本，`decide` 会拒绝旧候选并要求重新检索。
+Search first narrows fact types by the requirement's category signal, then looks for candidates by versioned tags. English tags only use ASCII letters and digits as word boundaries, so `熟悉Python` still matches `Python`; Chinese tags match as substrings. Short tags of one or two letters/digits (such as `Go`, `R`, `C`, `AI`) are case-sensitive and may not touch `&`, and single letters may not touch `-`, so `go to market`, `R&D` and `C-suite` do not match; a sentence starting with `Go` can still match, so prefer a more specific tag such as `Golang`. The output copies only the facts the user chose, never the whole fact store. If a fact was changed, lost its confirmation or is no longer the current version after the candidates were made, `decide` rejects the old candidate and asks for a new search.
 
-`--no-match` 是明确的“当前没有支持事实”，审核结果会保留未知。检索顺序和候选数量不是匹配分数、资格结论或录取概率。
+`--no-match` records "no supporting fact for now", and the report keeps it as unknown. Search order and candidate counts are not a match score, an eligibility verdict or a chance of an offer.
 
-### 5. 生成简历 PDF
+### 5. Build the CV PDF
 
-简历由两部分组成：`.local/cv-profile.json` 保存姓名、联系方式、学校/公司/职位/日期等版面信息和各条目引用的事实 ID（格式见 [examples/synthetic_cv_profile.json](examples/synthetic_cv_profile.json)）；每一行正文逐字来自事实库中当前已确认的事实版本。文字字段可以是普通字符串（各语言相同），也可以是 `{"en": ..., "zh": ...}`；中文留空时回退英文，并在输出的 `language_fallbacks` 中列出。
+A CV has two parts. `.local/cv-profile.json` holds the name, contact details, school/company/title/dates layout and the fact IDs each entry uses (format: [examples/synthetic_cv_profile.json](examples/synthetic_cv_profile.json)). Every line of body text is copied word for word from the current confirmed fact version. Text fields can be a plain string (same in every language) or `{"en": ..., "zh": ...}`; a blank Chinese value falls back to English and is listed in the output's `language_fallbacks`.
 
 ```sh
 python3 cv.py draft --profile .local/cv-profile.json --language en --output .local/cv-draft-en.json
@@ -167,13 +169,13 @@ python3 cv.py draft --profile .local/cv-profile.json --language zh --output .loc
 python3 cv.py pdf .local/cv-draft-zh.json --output .local/cv-zh.pdf
 ```
 
-- 英文默认 US Letter，中文默认 A4，可用 `--paper` 修改。`--job .local/review-linked.json` 会把与该岗位要求关联的事实排在各条目前面，不增删内容。
-- 引用了未确认事实时 `draft` 拒绝执行，并列出需要确认的 `FACT_ID@VERSION`。`pdf` 会再次核对：事实被修改、草稿被手工改写都会被拒绝，需要重新生成草稿。
-- PDF 由本机 Google Chrome 无界面打印（找不到时可设置 `CHROME_PATH`），HTML 中所有文字都经过转义并禁止任何网络加载。超过一页会给出提示。
-- 未批准的草稿导出的 PDF 都带“DRAFT / 草稿”水印；批准流程见本节末尾。
-- 输出文件都是新建，不会覆盖已有文件。
+- English defaults to US Letter and Chinese to A4; change it with `--paper`. `--job .local/review-linked.json` puts the facts linked to that job's requirements first in each entry, adding or removing nothing.
+- `draft` refuses to use unconfirmed facts and lists the `FACT_ID@VERSION` refs to confirm. `pdf` checks again: a changed fact or a hand-edited draft is refused, and the draft must be built again.
+- The PDF is printed by the local Google Chrome in headless mode (set `CHROME_PATH` if it is not found). All text in the HTML is escaped and no network loading is allowed. A CV longer than one page is reported.
+- Any PDF from an unapproved draft carries a "DRAFT / 草稿" watermark; approval is described at the end of this section.
+- Output files are always new; existing files are never overwritten.
 
-按岗位改写或翻译（DeepSeek）：
+Rewording or translating for a job (DeepSeek):
 
 ```sh
 python3 cv.py tailor .local/cv-draft-zh.json \
@@ -182,70 +184,70 @@ python3 cv.py tailor .local/cv-draft-zh.json \
 python3 cv.py pdf .local/cv-tailored-zh.json --output .local/cv-tailored-zh.pdf
 ```
 
-- API key 依次从环境变量 `DEEPSEEK_API_KEY` 和 macOS 钥匙串（service `deepseek-api-key`）读取，不写入任何文件。存入或更换：`security add-generic-password -U -a "$USER" -s deepseek-api-key -w`（会提示输入且不显示）。
-- 只发送教育细节、经历和项目要点、技能行的原文，以及岗位标题和已确认的要求；不发送姓名、联系方式、学校和公司名称、论文。
-- 每一行对应一条事实。改写中出现事实里没有的数字、技术或技能词、“主导/负责/led/managed”等更强的表述、链接，或者格式不对，都会被拒绝；该行保留事实原文，拒绝原因写在命令输出和草稿中。这些检查只看词面，不能证明语义完全一致，导出前仍需逐行核对。
-- `--job` 可以省略，此时只翻译和润色。默认模型 `deepseek-flash`、`--effort low`，可用 `--model deepseek-v4-pro` 或 `--effort high` 调整。
+- The API key is read from the `DEEPSEEK_API_KEY` environment variable, then from the macOS Keychain (service `deepseek-api-key`); it is never written to a file. To store or replace it: `security add-generic-password -U -a "$USER" -s deepseek-api-key -w` (it prompts without echo).
+- Only the text of education details, experience and project bullets and skills lines is sent, plus the job title and its confirmed requirements; never the name, contact details, school or company names, or publications.
+- Each line is one fact. A rewrite is rejected if it adds a number, technology or skill the fact does not have, a stronger claim ("led", "managed", 主导, 负责, …), a link, or has the wrong shape; that line keeps the fact's own words, and the reasons are in the command output and the draft. Translations may use the other language's word for a term the line already has (前端 for "frontend", 接口 for "API"). These checks are word-level and cannot prove the meaning is identical, so read every line before exporting.
+- `--job` is optional; without it the draft is only translated and polished. The default model is `deepseek-flash` with `--effort low`; use `--model deepseek-v4-pro` or `--effort high` to change it.
 
-审核、批准与最终 PDF：
+Review, approval and the final PDF:
 
 ```sh
 python3 cv.py approve .local/cv-tailored-zh.json --output .local/cv-approved-zh.json
 python3 cv.py pdf .local/cv-approved-zh.json --output .local/cv-final-zh.pdf
 ```
 
-- 先用带水印的 PDF 逐行核对。`approve` 会再次核对全部事实，列出 DeepSeek 改动过的每一行（原文 → 改写），并在新文件中记录批准时间和内容指纹。
-- 只有已批准、且批准后内容没有任何改动的文件才能导出无水印的最终 PDF。批准后改动任何内容（包括姓名、日期），或引用的事实被修改，最终导出都会被拒绝，需要重新生成草稿并重新批准。
-- 已批准的文件不能再改写，也不能重复批准。
+- Check every line in the watermarked PDF first. `approve` checks all facts again, lists every line DeepSeek changed (original → rewrite), and records the approval time and a content fingerprint in a new file.
+- Only an approved file whose content has not changed at all since approval exports as a final PDF without the watermark. If anything changes after approval (including the name or dates), or a fact it uses is revised, the final export is refused; build a new draft and approve again.
+- An approved file cannot be reworded again or approved twice.
 
-## 网页界面
+## Web page
 
-网页版需要项目内的虚拟环境（只需安装一次，不会安装到全局）：
+The web page needs a virtual environment inside the project (install once; nothing is installed globally):
 
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-启动后在浏览器打开 http://127.0.0.1:8765/ ，按 Ctrl+C 停止：
+Start it, open http://127.0.0.1:8765/ in the browser, and press Ctrl+C to stop:
 
 ```sh
 .venv/bin/python web.py
 ```
 
-- **Facts**：查看全部事实，勾选后一次确认多个 pending 版本。全部确认后自动转到 Find jobs。
-- **Find jobs**：关注公司的全部公开岗位按“提到你多少个已确认技能标签”排序，最多的在前；同分时较新的在前。同一职位在多个城市发布只显示一行。可按标题、地点筛选，可勾选“Hide senior roles”（隐藏 Senior、Staff、Principal、Lead、Manager、Director 等标题；“Member of Technical Staff” 保留）。点 **Start** 会重新读取该岗位并新建到 My jobs；同一岗位再点只会打开已有的那一个。
-- **My jobs**：已开始的岗位；也可以粘贴任意来源的 JD 新建岗位。
-- **每个岗位**（Start 或粘贴后自动完成，2026-09 实测约 5 秒）：
-  1. **What this job asks for**：DeepSeek 按行号挑出 JD 中的要求行，程序逐字复制原文，因此不会编造要求；全部自动计入。可以把某行改为 “Not a requirement”、补充漏掉的原文或让 DeepSeek 重新找；保存后简历自动重新准备。
-  2. **Your CV for this job**：简历只用你的简历本身所用的语言（按 profile 中姓名填写的语言判断；只填英文名就只有英文简历，中文 JD 也用英文简历）。自动生成草稿、按岗位措辞改写（每行通过事实检查）、再由 DeepSeek 提出结构调整：栏目顺序、项目和条目顺序、删去对这个岗位没有帮助的条目。每项改动都列出理由，可以单独撤销或恢复，不需要再调用 DeepSeek。勾选“已阅读简历和全部改动”后批准，再生成并下载最终 PDF。另一种语言可一键准备。
-  3. **Not on your CV yet**：只列出没有任何已确认事实能说明的要求（已满足的不显示）。每条缺口 DeepSeek 最多建议一处补充：给某行技能加上工具名，或在某段经历/项目下加一行。**只有你点 “True for me” 才会加入**：技能会成为该技能行的新确认版本，新的一行会成为新确认事实并写入 profile（旧 profile 先备份到 `profile-history/`），然后重新准备简历；点 “Not true” 则保留为缺口，不会进入简历。年限、资深程度、学历或个人特质类要求不给建议；含数字、领导类用词或与简历已有内容重复的建议会被丢弃。
+- **Facts**: see all facts and confirm several pending versions at once. Once every fact is confirmed, the page moves to Find jobs.
+- **Find jobs**: all open jobs of the companies you follow, ranked by how many of your confirmed skill tags they mention, most first; ties go to the newest posting. One role posted in several cities is one row. Filter by title and location, or tick "Hide senior roles" (hides Senior, Staff, Principal, Lead, Manager, Director and similar titles; "Member of Technical Staff" stays). **Start** reads the job again and adds it to My jobs; clicking it again opens the same job instead of making a second one.
+- **My jobs**: the jobs you started; you can also paste a JD from any source to create a job.
+- **Each job** (done automatically after Start or pasting; about 5 seconds in 2026-09):
+  1. **What this job asks for**: DeepSeek picks the requirement lines of the JD by line number and the program copies them word for word, so no requirement is invented; all of them count. You can mark a line "Not a requirement", add a missed line, or let DeepSeek look again; saving prepares the CV again.
+  2. **Your CV for this job**: CVs come only in the language(s) your own resume is written in, judged by the language of the name in your profile. With only an English name there is only an English CV, even for a Chinese JD. The draft is built automatically, reworded for the job (every line passes the fact check), and DeepSeek then proposes structure changes: section order, entry and bullet order, and cutting what does not help this job. Every change is listed with its reason and can be undone or redone on its own, without calling DeepSeek again. Tick "I read the CV and every change", approve, then create and download the final PDF. If your resume has a second language, that CV can be prepared with one click.
+  3. **Not on your CV yet**: only the requirements none of your confirmed facts covers (covered ones are hidden). For each gap DeepSeek suggests at most one addition: a tool for one of your skills lines, or a new line under one of your jobs or projects. **It is added only when you click "True for me"**: a skill becomes a new confirmed version of that skills line; a new line becomes a new confirmed fact and is written into your profile (the old profile is first backed up to `profile-history/`); then the CV is prepared again. "Not true" keeps it as a gap and it never reaches the CV. Requirements about years, seniority, degrees or personal traits get no suggestion; suggestions with numbers, leadership words or content already on the CV are dropped.
 
-说明：
+Notes:
 
-- 关注的公司和下载的岗位保存在 `.local/listings.db`（与事实库分开；删除它只会丢掉公司列表和下载的岗位）。第一次创建时预置 `starter_boards.json` 里的 30 家公司，之后删掉的公司不会自动回来。在页面下方 Companies 里粘贴 `boards.greenhouse.io/…`、`jobs.lever.co/…` 或 `jobs.ashbyhq.com/…` 链接即可添加公司。
-- 打开 Find jobs 时，超过 24 小时未更新的公司会自动重新下载（每次 4 家并行，2026-09 实测 30 家约 6 秒）；没有后台定时任务。只向公开招聘板发送不含个人信息的 GET 请求；排序完全在本机进行。
-- 排序数字是词面计数，不是匹配度或录取概率。实测 “AI” 出现在 79% 的岗位里，所以数字只适合比较先后。技能标签与岗位的匹配结果会保存在 `listings.db`，只有岗位文字或已确认技能变化时才重新计算（约 9 千个岗位首次约 5 秒，之后约 0.05 秒）。
-- 每个岗位保存在 `.local/jobs/<岗位编号>/`，每一步一个文件。重做某一步时，这一步和之后的文件会移到该岗位的 `history/`，不会被覆盖或删除。简历只依赖要求（`decided`），与 talking points 无关，所以生成 talking points 不会影响简历。
-- 结构调整的限制：教育经历始终保留且位置不变；工作经历保持时间顺序且每段至少保留一行；只能排序和删去已有行，不能新增或跨条目移动。简历文件保存全部行，撤销任何一项改动只是换一种显示方式。
-- 所有 DeepSeek 请求都用 temperature 0。即便如此，边界要求（如 “architect distributed systems”）在不同次检查中仍可能被判为已满足或缺口；缺口列表按岗位保存，只有点 “Check again” 才会重新判断。
-- 发给 DeepSeek 的只有：JD 原文行、简历各行文字（已确认事实或其改写）和岗位要求；不发送姓名、联系方式、学校、公司或项目名称。DeepSeek 不可用时退回标题规则提取要求，简历停在最后成功的一步并提示可重试。
-- 只接受发往 127.0.0.1/localhost 的请求；所有接口都需要页面启动时生成的随机令牌（预览和下载链接把同一令牌放在地址里）。其他网站无法读取你的事实，也无法触发 DeepSeek 调用。
-- 可用 `--facts-db`、`--jobs`、`--profile`、`--port` 修改路径和端口；`listings.db` 放在事实库所在目录。
-- 网页测试需要虚拟环境：`.venv/bin/python -m unittest`；直接用 `python3` 运行时网页测试会自动跳过。
+- Followed companies and downloaded jobs are stored in `.local/listings.db`, separate from the fact store; deleting it only loses the company list and downloaded jobs. It starts with the 30 companies in `starter_boards.json`; a company you remove does not come back on the next start. Add a company under Companies by pasting a `boards.greenhouse.io/…`, `jobs.lever.co/…` or `jobs.ashbyhq.com/…` link.
+- When Find jobs opens, companies not updated in the last 24 hours are downloaded again (4 at a time; 30 companies took about 6 seconds in 2026-09). There is no background schedule. Only GET requests without any personal data go to the public job boards; ranking happens entirely on your computer.
+- The ranking number is a word count, not a match score or a chance of an offer. "AI" appears in 79% of jobs, so the number is only good for ordering. Tag matches are saved in `listings.db` and recomputed only when a job's text or your confirmed skills change (about 5 seconds the first time for about 9,000 jobs, then about 0.05 seconds).
+- Each job is stored in `.local/jobs/<job id>/`, one file per step. Redoing a step moves that step and every later one into the job's `history/`; nothing is overwritten or deleted. The CV depends only on the requirements, so talking points and gap checks never change it.
+- Structure changes are limited: education is always kept, in its place; jobs stay in date order and keep at least one line each; a change can only reorder or leave out existing lines, never add one or move it to another entry. The CV file keeps every line, so undoing a change only changes what is shown.
+- Every DeepSeek request uses temperature 0. Even so, borderline requirements (such as "architect distributed systems") can count as covered in one check and as a gap in the next; each job's gap list is saved and only changes when you click "Check again".
+- DeepSeek only receives JD lines, CV line texts (confirmed facts or their rewrites) and the job's requirements; never the name, contact details, schools, companies or project names. If DeepSeek is unavailable, requirements come from the heading rules and the CV stops at the last step that worked, with a prompt to retry.
+- Only requests to 127.0.0.1/localhost are accepted, and every API call needs a random token created when the page starts (preview and download links carry the same token in the URL). Other websites cannot read your facts or trigger DeepSeek calls.
+- Use `--facts-db`, `--jobs`, `--profile` and `--port` to change paths and the port; `listings.db` lives next to the fact store.
+- Web tests need the virtual environment: `.venv/bin/python -m unittest`. With plain `python3` the web tests are skipped.
 
-## 数据与限制
+## Data and limits
 
-- `.local/workbench.db`、运行 JSON、`.env` 和个人数据均被 Git 忽略。
-- 所有生成命令只新建 JSON 文件，不覆盖已有文件。
-- SQLite schema 当前为 v2；程序会保留数据并自动把 v1 迁移到 v2，旧事实分类为 `other`、标签为空。
-- `search --profile` 仍保留给合成样例，其 `confirmed` 字段只是输入声明；实际使用推荐 `--facts-db`。
-- 岗位来源是 Greenhouse、Lever、Ashby 的公开招聘板和手动粘贴；LinkedIn 等需要登录的网站不采集，也不做全网岗位发现。中国公司的官网岗位请粘贴。
-- 要求提取仍是标题规则（`section-lines-v3`）。按 2026-09 下载的 8,787 个岗位统计，找不到任何要求行的比例：Greenhouse 9%、Ashby 7%、Lever 1%；这些岗位请用 `add` 或网页的 “Add missed requirement” 手动补充原文。
-- TypeSafe 当前只判断 JD 要求；把候选人事实发送给外部模型尚未授权或实现。
-- 当前没有投递记录、自动投递或录取概率预测；网页中还不能编辑事实原文（请用命令行）。地点筛选只是“包含文字”，还没有“只看美国”这类按国家的筛选。
+- `.local/workbench.db`, run files, `.env` and all personal data are ignored by Git.
+- Every command that writes creates a new JSON file; existing files are never overwritten.
+- The SQLite schema is v2; v1 data is kept and migrated automatically, with old facts typed `other` and no tags.
+- `search --profile` is kept for the synthetic examples, and its `confirmed` field is only a claim in the input file; use `--facts-db` for real use.
+- Jobs come from public Greenhouse, Lever and Ashby boards and from pasted JDs. Sites that need a login, such as LinkedIn, are not scraped, and there is no whole-web job discovery. Paste jobs from Chinese company sites.
+- The web page finds requirements with DeepSeek first and falls back to the heading rules; the command-line `propose` uses only the heading rules (`section-lines-v3`). Across 8,787 jobs downloaded in 2026-09, the heading rules found no requirement line for 9% of Greenhouse, 7% of Ashby and 1% of Lever jobs; for those, add lines by hand with `add` or the page's "Add missed requirement".
+- TypeSafe only judges JD requirements. With the user's consent, DeepSeek receives the text of confirmed facts (for rewording, structure changes, matching and gap suggestions), but never the name, contact details, schools, companies or project names.
+- There is no application tracking, no automatic applying and no prediction of offers. Fact text cannot yet be edited on the web page (use the command line). The location filter only matches text; there is no country filter such as "US only".
 
-运行全部测试：
+Run all tests:
 
 ```sh
 python3 -m unittest -v

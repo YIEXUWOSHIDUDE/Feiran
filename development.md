@@ -48,7 +48,8 @@
 ├── test_web.py                   # 未安装 FastAPI 时自动跳过
 ├── test_end_to_end.py            # 粘贴 JD 到审核结果的离线全流程
 ├── examples/                     # 合成输入样例（含中文 JD 与事实导入文件）
-├── README.md                     # 运行入口和当前限制
+├── README.md                     # 运行入口和当前限制（英文）
+├── README.zh-CN.md               # 同一内容的中文版
 ├── development.md                # 开发方向与已确认设计
 └── .local/
     ├── workbench.db              # 本机候选人事实库，不提交 Git
