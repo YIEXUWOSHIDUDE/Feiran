@@ -102,6 +102,13 @@ class CVPlanTests(unittest.TestCase):
             "reasons": [{"target": "sections", "reason": "Skills repeat the bullets."}]}))
         self.assertEqual([(item["id"], item["reason"]) for item in planned["plan"]["changes"]],
                          [("cut:skills", "Skills repeat the bullets.")])
+        # Found in review by Codex: with more than one change to the section list, that reason
+        # may explain any of them, so a cut without its own reason stays without one.
+        both = plan_draft(self.draft, decided_job(), chat=FakePlanner({
+            "sections": ["education"], "entries": [],
+            "reasons": [{"target": "sections", "reason": "Skills repeat the bullets."}]}))
+        self.assertEqual({item["id"]: item["reason"] for item in both["plan"]["changes"]},
+                         {"cut:experience": None, "cut:skills": None})
 
     def test_plan_orders_and_cuts_with_reasons_and_sends_no_names(self):
         planner = FakePlanner(CUT_API)

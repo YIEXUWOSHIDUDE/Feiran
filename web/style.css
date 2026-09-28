@@ -319,6 +319,7 @@ details summary::marker { color: #8da0ee; }
 ul.evidence { margin: 0 0 6px; padding-left: 18px; }
 ul.evidence li { margin: 3px 0; }
 ul.evidence button { margin-left: 8px; padding: 3px 10px; font-size: 12px; }
+.beside { font-size: 12px; }
 .option { display: flex; gap: 8px; align-items: flex-start; padding: 4px 0 4px 8px; cursor: pointer; }
 .option input { margin-top: 4px; }
 

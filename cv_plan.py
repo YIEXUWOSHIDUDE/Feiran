@@ -67,14 +67,16 @@ def _facts_named(content: dict[str, Any], back: dict[str, str]) -> dict[str, Any
 
 def _with_reasons(changes: list[dict[str, str]], reasons: dict[str, str], kinds: list[str]) -> list[dict[str, Any]]:
     """Attach the model's reason for each change's target; a section may be named by id or kind.
-    A cut section with no reason of its own takes the one given for the section list, where
-    DeepSeek tends to explain leaving a section out."""
+    When the only change to the section list is one cut section, a reason given for the
+    section list explains that cut: DeepSeek tends to put it there."""
+    section_changes = [change for change in changes
+                       if change["id"] == "order:sections" or (change["type"] == "cut" and change["id"][4:] in kinds)]
     result = []
     for change in changes:
         target = change["id"].split(":", 1)[1]
         section = re.fullmatch(r"s(\d+)", target)
         names = [target] + ([kinds[int(section[1])]] if section else [])
-        if change["type"] == "cut" and target in kinds:
+        if section_changes == [change] and change["type"] == "cut":
             names.append("sections")
         reason = next((reasons[name] for name in names if name in reasons), None)
         result.append({**change, "reason": reason})

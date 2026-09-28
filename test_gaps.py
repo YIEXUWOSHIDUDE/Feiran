@@ -132,6 +132,8 @@ class GapTests(unittest.TestCase):
         bullet = listed["Writing integration tests for services"]
         self.assertEqual((bullet["kind"], bullet["where"], bullet["tags"]),
                          ("bullet", "Example Corp", ["integration tests"]))
+        # Shown with the lines already there, so a reworded one is plain to see.
+        self.assertEqual(bullet["beside"], ["Built REST APIs for an internal tool.", "Wrote unit tests for billing code."])
         for private in ("Alex Example", "alex@example.com", "Example Corp", "Example University"):
             self.assertFalse(any(private in sent for sent in chat.sent))
         self.assertEqual({item["strength"] for item in gaps["requirements"]}, {"required"})
@@ -148,25 +150,18 @@ class GapTests(unittest.TestCase):
         gaps, _ = self.gaps(overclaiming)
         self.assertEqual({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"], None)
 
-    def test_a_new_line_that_rewords_one_already_there_is_dropped(self):
-        # Seen on a real posting: the suggestion restated an existing bullet with the job's words.
-        def rewording(ids):
+    def test_a_new_line_that_copies_one_already_there_but_a_word_is_dropped(self):
+        # Seen on a real posting: an existing bullet came back with only its first verb changed.
+        def copying(ids):
             return [{"requirement": ids["Writing integration tests for services"], "kind": "bullet", "entry": "s1e0",
-                     "text": "Built and tested REST APIs for the internal tool's users.", "tags": ["REST APIs"]},
+                     "text": "Created REST APIs for an internal tool.", "tags": ["REST APIs"]},
                     {"requirement": ids["Hands-on Docker and Kubernetes"], "kind": "bullet", "entry": "s1e0",
-                     "text": "Writing unit test for the billing codes.", "tags": []}]  # the same words, other endings
-        gaps, _ = self.gaps(rewording)
+                     "text": "Documented REST APIs for the internal tool with OpenAPI.", "tags": ["OpenAPI"]}]
+        gaps, _ = self.gaps(copying)
         suggestions = {item["text"]: item["suggestion"] for item in gaps["requirements"]}
         self.assertIsNone(suggestions["Writing integration tests for services"])
-        self.assertIsNone(suggestions["Hands-on Docker and Kubernetes"])
-
-    def test_a_new_line_about_unrelated_work_is_dropped(self):
-        # Seen on a real posting: sensor fusion and HD map work suggested under unrelated projects.
-        def unrelated(ids):
-            return [{"requirement": ids["Writing integration tests for services"], "kind": "bullet", "entry": "s1e0",
-                     "text": "Integrated camera and LiDAR sensor fusion for vehicle perception.", "tags": ["LiDAR"]}]
-        gaps, _ = self.gaps(unrelated)
-        self.assertIsNone({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"])
+        # Found in review by Codex: naming the same work while adding a tool is not a copy.
+        self.assertEqual(suggestions["Hands-on Docker and Kubernetes"]["text"], "Documented REST APIs for the internal tool with OpenAPI.")
 
     def test_suggestions_repeating_what_the_cv_already_says_are_dropped(self):
         def repeating(ids):

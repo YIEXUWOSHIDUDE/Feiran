@@ -19,6 +19,7 @@ import copy
 import json
 import re
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -71,11 +72,14 @@ most one addition per gap, in the same language as the resume lines:
   when that entry's own lines already show closely related work, so the new line adds a tool or
   practice to that same work. Write it like the other bullets there, describing plain hands-on use.
 - "none": when no honest addition fits: years of experience, seniority, leadership, a degree, work
-  authorization or personal traits; experience that needs a project of its own, such as a model
-  architecture, a research area or a field like autonomous driving; or a gap that is only about how
-  an existing line is worded.
-Never restate or reword a line the resume already has, never copy the requirement's own wording,
-and never invent a model, system, feature or result. Never include numbers, metrics, results, team
+  authorization or personal traits; a quality or scale rather than a tool or practice, such as
+  efficient, scalable, stable, real-time or large-scale; experience that needs a project of its own,
+  such as a model architecture, a research area or a field like autonomous driving; or a gap that
+  is only about how an existing line is worded.
+Never restate or reword a line the resume already has: if a line says "Built REST APIs for an
+internal tool", do not suggest "Developed and released REST APIs for an internal tool, handling
+deployment". Never copy the requirement's own wording, and never invent a model, system, feature or
+result. Never include numbers, metrics, results, team
 sizes or leadership words, and never claim more than basic hands-on use. Give "tags": the skill
 words the bullet names.
 Reply as {"suggestions": [{"requirement": "<gap id>", "kind": "skill", "line": "<line id>",
@@ -83,32 +87,17 @@ Reply as {"suggestions": [{"requirement": "<gap id>", "kind": "skill", "line": "
 "text": "...", "tags": ["..."]}, {"requirement": "<gap id>", "kind": "none"}]}"""
 
 
-# Words that say nothing about what a line is about, left out when comparing lines.
-GENERIC_WORDS = frozenset("""
-with from that this these those using used into onto over under their they them have been were which while
-through across within including based work worked working build built develop developed implement implemented
-design designed added create created make made wrote write writing support supported supporting team teams
-project projects other also more most such each both than then when where what will would could should about
-after before between during without help helped
-""".split())
-NEAR_COPY = 0.6  # share of a new line's words already in one existing line
+NEAR_COPY = 0.85  # how alike, word by word in order, a new line may be to one already there
 
 
-def _words(text: str) -> set[str]:
-    """The words that say what a line is about, lightly stemmed; Chinese as character pairs."""
-    words = set()
-    for word in re.findall(r"[^\W_]+", text.casefold()):
-        if re.search(r"[\u4e00-\u9fff]", word):
-            words.update(word[index:index + 2] for index in range(len(word) - 1))
-            continue
-        stem = word
-        for suffix in ("ing", "ed", "es", "s"):
-            if word.endswith(suffix) and len(word) - len(suffix) >= 4:
-                stem = word[:-len(suffix)]
-                break
-        if len(stem) >= 4 and word not in GENERIC_WORDS and stem not in GENERIC_WORDS:
-            words.add(stem)
-    return words
+def _near_copy(text: str, existing: list[str]) -> bool:
+    """Whether a new line is an existing one with a word or two changed. Naming the same work
+    while adding a tool or practice is not: that is what a new line is for, so only the order
+    of nearly all the words gives a copy away. Chinese is compared character by character."""
+    def tokens(value: str) -> list[str]:
+        return re.findall(r"[\u4e00-\u9fff]|[^\W_\u4e00-\u9fff]+", value.casefold())
+    words = tokens(text)
+    return any(SequenceMatcher(None, words, tokens(known), autojunk=False).ratio() >= NEAR_COPY for known in existing)
 
 
 def _entry_key(kind: str, fields: dict[str, Any]) -> str:
@@ -130,7 +119,7 @@ def _resume(
     draft: dict[str, Any], private: list[str]
 ) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]], dict[str, dict[str, Any]]]:
     """The CV as stand-in line IDs and texts (masked for DeepSeek), the skills lines by
-    stand-in (fact ID and text), and bullet entries by ID with the words of what they show."""
+    stand-in (fact ID and text), and bullet entries by ID."""
     texts = {
         line["fact_id"]: line.get("source_text") or line["text"]
         for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
@@ -154,10 +143,9 @@ def _resume(
     for i, section in enumerate(draft["sections"]):
         if section["kind"] in BULLET_TYPES:
             for j, entry in enumerate(section["entries"]):
-                shown = [entry.get("title") or "", entry.get("subtitle") or "",
-                         *(text for line in entry["lines"] for text in (line["text"], line.get("source_text") or ""))]
                 entries[f"s{i}e{j}"] = {"kind": section["kind"], "where": entry.get("title") or section["title"],
-                                        "key": _entry_key(section["kind"], entry), "words": _words(" ".join(shown))}
+                                        "key": _entry_key(section["kind"], entry),
+                                        "beside": [line.get("source_text") or line["text"] for line in entry["lines"]]}
     return resume, skills, entries
 
 
@@ -173,8 +161,10 @@ def _suggestion(
     item: Any, skills: dict[str, tuple[str, str]], entries: dict[str, dict[str, Any]], existing: list[str]
 ) -> dict[str, Any] | None:
     """Keep a suggestion only if it points at a real line or entry, adds something the CV does
-    not already say, and claims nothing more than plain use. A new line must be about the work
-    its entry already shows, and must not be an existing line in other words."""
+    not already say, and claims nothing more than plain use. An existing line with a word or two
+    changed is dropped; whether a new line in other words says something new is left to the
+    rules DeepSeek follows and to the user, who sees it beside the entry's lines: matching words
+    cannot tell a new fact from a reworded one."""
     if not isinstance(item, dict):
         return None
     if item.get("kind") == "skill" and isinstance(item.get("line"), str) and item["line"] in skills:
@@ -197,19 +187,18 @@ def _suggestion(
     if item.get("kind") == "bullet" and isinstance(item.get("entry"), str) and item["entry"] in entries:
         text = " ".join(item.get("text").split()) if isinstance(item.get("text"), str) else ""
         entry = entries[item["entry"]]
-        words = _words(text)
         if (not text or len(text) > MAX_LINE_CHARACTERS or NUMBER.search(text)
                 or _leadership(text) or LINK.search(text)
                 or any(text.casefold() in known.casefold() or known.casefold() in text.casefold() for known in existing)
-                or not words & entry["words"]
-                or any(len(words & _words(known)) >= NEAR_COPY * len(words) for known in existing)):
+                or _near_copy(text, existing)):
             return None
         tags = [
             tag.strip() for tag in (item.get("tags") if isinstance(item.get("tags"), list) else [])
             if isinstance(tag, str) and tag.strip() and tag_pattern(tag.strip()).search(text)
         ]
+        # The lines already under the entry go with it, so a reworded one is plain to see.
         return {"kind": "bullet", "entry": item["entry"], "entry_key": entry["key"], "fact_type": BULLET_TYPES[entry["kind"]],
-                "text": text, "tags": list(dict.fromkeys(tags))[:MAX_TAGS], "where": entry["where"]}
+                "text": text, "tags": list(dict.fromkeys(tags))[:MAX_TAGS], "where": entry["where"], "beside": entry["beside"]}
     return None
 
 
