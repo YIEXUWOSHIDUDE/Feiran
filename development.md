@@ -27,6 +27,7 @@
 ├── cv.py                         # 简历草稿、DeepSeek 改写与 PDF
 ├── cv_layout.py                  # 每个岗位显示哪些栏目/条目/行及顺序（护栏、改动列表、撤销）
 ├── cv_plan.py                    # DeepSeek 提出按岗位的结构调整，经护栏后使用
+├── cv_import.py                  # 上传的 PDF 简历 → 待确认事实与 profile（联系方式留在本机）
 ├── gaps.py                       # 简历尚未说明的要求、补充建议与用户确认后加入
 ├── claims.py                     # 改写行的确定性事实检查
 ├── deepseek_client.py            # DeepSeek JSON 调用与 key 读取
@@ -45,6 +46,7 @@
 ├── test_claims.py
 ├── test_deepseek_client.py
 ├── test_workspace.py
+├── test_cv_import.py             # 读 PDF 的一项在未安装 pypdf 时跳过
 ├── test_web.py                   # 未安装 FastAPI 时自动跳过
 ├── test_end_to_end.py            # 粘贴 JD 到审核结果的离线全流程
 ├── examples/                     # 合成输入样例（含中文 JD 与事实导入文件）
@@ -236,9 +238,34 @@ v3 根据 2026-09 下载的 8,787 个公开岗位补充了各公司常用的要�
 
 同时修复了中文翻译被误拒：事实检查原来只按字面比对，把“前端”“后端”（英文原句中的 frontend、backend 的翻译）和单复数不同的 “API/APIs” 当成新增技能，导致这些行退回英文。`claims.EQUIVALENTS` 列出常见中英技术词的对应关系，并把英文单复数视为同一词；原句在任何语言中都没有的词仍会被拒绝。论文标题保持英文原题，这也是中文简历的常见做法。
 
+## 证据与审核的可靠性（2026-09-27，第一轮）
+
+依据一份外部改进计划（保持现有方向：自动准备、用户审核批准；不增加 agent 或服务），先做了三项确定性修正：
+
+- **事实检查**（`claims.check_rewrite`）：原来只检查新增数字、技术词和领导词，计划中的四个歪曲例子全部通过。现在另外拒绝：数字挪到别的对象（“2 services in 3 weeks” → “3 services in 2 weeks”，比较“数字 + 其后名词”）；原文有而改写没有的否定（not/never/without，中文用“没有、未、不是”等明确词判断原文，改写只要含“不、没、未、无、非”等即算保留，避免误拒正确翻译）；丢掉的限定词（prototype、course/class project、helped、contributed、partially、studied、in progress、internal 等，含中文对应）；新增的范围词（million、production、customers、enterprise、organization、revenue 等）；领导词按词比对（原文 “Managed” 不再支持改写中的 “Led”）。“机器学习”中的“学习”、“未来”中的“未”不算。测试含上述拒绝例子和应通过的改写、翻译；用户职位文件夹中已保存的 27 条真实 DeepSeek 改写在新规则下仍全部通过。改写提示也加入了保留限定与否定、不加范围词的要求。
+- **缺口建议绑定**（`gaps.accept_gap`）：新行建议按条目内容（栏目、名称、角色、地点、日期）而非位置 `s1e0` 找到所属条目；条目改名、消失或出现两个相同条目时拒绝并提示重新检查；技能建议要求该技能行文字未变。每一步都可重复：事实按内容去重、已确认的版本再确认无副作用、profile 中已有该事实就不再添加、已改好的技能行直接确认，缺口状态最后才写为 added，因此中途失败后再点一次即可完成且不重复。旧的缺口文件没有条目标识，新行建议需要重新检查。
+- **要求的来源与强度**（`requirement_flow`）：每条候选要求记录 `strength`（required/preferred/unclear）与 `section`（所在标题）。强度依次按该行自身用词（a plus、preferred、nice to have、must、required…）、DeepSeek 给的 kind、所在标题判断；都没有就是 unclear，不再默认为必需。`apply_requirement_decisions` 记录 `decided_by`：网页自动计入为 auto，用户保存或手动添加为 user；补充漏掉的行时保留用户已做的决定。`selected_requirements` 带上 strength 与 decided_by，改写、结构调整和缺口建议的请求都附带强度（旧文件缺省为 unclear）；页面显示每行的强度与“自动计入/经你审核”，缺口显示非必需要求的强度。另把 “must-have skills”“nice-to-have skills” 加入要求标题。
+
+之后请 Codex（gpt-6-astra，high，只读）审查这些改动，它用合成输入复现了 7 个问题，均已修正并加为测试：数字换位只看数字后第一个词（“3 backend services in 2 calendar weeks” 和中文“2 周内完成 3 个服务”可绕过；现在取数字后名词短语的中心词，并按“时间/百分比/数量”类别比较，跨语言也能发现时间与数量互换）；否定只看有没有否定词（新增的 “without downtime” 掩盖了删掉的 “did not deploy”；现在英文逐个比对被否定的词，翻译中已知译名须紧跟否定，“not only … but also” 不算否定，中文原文的“不”计入但排除“不断、不同、不仅”等）；billion 与“亿”相差十倍；“客户”同时属于 customer 与 client 两组导致误拒（现在一个词只要任一所属组在原文有支持即可）；缺口重试会确认别人未审核过标签的待确认版本（现在拒绝并提示先在 Facts 页核对）；事实已在其他条目下时被当作添加成功（现在拒绝）；“优先队列”被当作“优先”，“not required” 被当作必需。修正后 188 个测试通过，27 条真实改写仍全部通过。
+
+尚未做（计划第 4–7 项）：各步骤失败原因持久化并显示；区分“有证据”与“在这份简历中显示”；语义复核的测试集与 DeepSeek/Jev 对比；文档整体更新。
+
+## 上传简历（2026-09-27）
+
+用户问为什么不能上传简历。此前事实和 profile 只能手写 JSON 再用命令行导入。用户选择“上传，联系方式留在本机”：
+
+- `cv_import.read_pdf`：用 pypdf 的 layout 模式在本机读 PDF。每行按 3 个以上空格拆成从左到右的几部分（名称与右侧的地点、日期分开），同时修正普通模式的字距错误（“PyT orch”）。另外读出 PDF 中的网页链接及链接框覆盖的文字（mailto 链接忽略）。
+- `split_private`：第一行姓名，以及其下、第一个常见栏目标题之前含邮箱、电话或网址的行，只留在本机，用来预填表单。其余各行发给 DeepSeek 前，把邮箱、网址和姓名中的词替换为 `[email]`、`[link]`、`[name]`（论文作者列表里常有姓名）。
+- `structure_cv`：DeepSeek 只按行号回答每个栏目的标题行与类型、每个条目的名称/地点/角色/日期在第几行第几部分、每条事实由哪几行组成（换行的要点列出全部行）以及技能词。程序照原文复制文字，并检查：行号存在且未被使用；一条事实是连续的行，且只有第一行可以带项目符号（防止把两条要点合成一条）；标签必须出现在该事实原文中；只接受 education/experience/projects/skills/publications 五类，其他（如奖项、兴趣）列为未导入。链接在本机放回：条目标题旁单独的 “GitHub” 之类成为 `title_link`，事实中的链接文字成为短语链接，都按阅读顺序对应，比较时忽略空格。
+- `build_profile` 与网页：`POST /api/cv/upload`（原始 PDF，最多 5 MB）返回结构建议和本机读到的联系方式，建议暂存在 `.local/cv-uploads/`；用户核对后 `POST /api/cv/uploads/{id}/save`：新行以 `fact-cv-<类型>-<文本哈希>` 导入为 pending，与已有事实文字完全相同的行复用原 ID（不重复）；profile 先备份到 `profile-history/` 再替换，然后删除暂存文件。没有 profile 的新用户直接创建。
+
+实测（用户真实简历，不保存）：45 行、7 个网页链接，DeepSeek 3.1 秒给出结构；5 个栏目、17 条事实全部正确，换行要点都合并正确，2 个项目的 GitHub 链接、一个经历中的链接和 2 篇论文 DOI 都放对位置，没有未导入的行；请求中不含姓名、邮箱、电话和链接。网页中在副本上走完上传、核对、保存：17 行都与已有事实相同，因此没有新增事实；新 profile 生成的简历含全部 7 个链接。
+
+限制：扫描件（没有文字层）无法读取；标题文字本身带链接（而不是旁边的 “GitHub”）时链接不会保留，列在未导入中；只识别上述五类栏目；上传后的事实文字不能在网页中修改。
+
 ## 本地网页（B 已实现）
 
-2026-09-24 用户选择 FastAPI + 原生 HTML/JS，开发和测试仍用命令行。依赖只用于网页，固定在 `requirements.txt`（fastapi 0.141.1、uvicorn 0.53.0，测试用 httpx2 2.13.1；Starlette 1.7 建议以 httpx2 取代 httpx），安装在项目内 `.venv`，命令行工具仍只用标准库。
+2026-09-24 用户选择 FastAPI + 原生 HTML/JS，开发和测试仍用命令行。依赖只用于网页，固定在 `requirements.txt`（fastapi 0.141.1、uvicorn 0.53.0，读取上传简历用 pypdf 6.19.0，测试用 httpx2 2.13.1；Starlette 1.7 建议以 httpx2 取代 httpx），安装在项目内 `.venv`，命令行工具仍只用标准库。
 
 `web.py` 是薄层：每个接口只读取岗位文件夹中的上一步、调用已有函数（`propose_requirements`、`apply_match_decisions`、`build_draft`、`tailor_draft`、`approve_draft`、`export_pdf` 等），再通过 `workspace.py` 写入这一步。规则仍只在原模块中，网页不复制业务逻辑。`workspace.py` 为每个岗位保存每一步的当前文件；重做某一步时先把这一步和所有后续文件移入 `history/<时间>/`，因此文件夹中永远是一条前后一致的链，旧版本不会被覆盖或删除。英文和中文简历的草稿、改写、批准、PDF 各自独立。
 
@@ -246,7 +273,9 @@ v3 根据 2026-09 下载的 8,787 个公开岗位补充了各公司常用的要�
 
 验证：`test_workspace.py` 覆盖历史归档、语言隔离和路径越界；`test_web.py` 用 FastAPI TestClient 覆盖令牌与 Host 检查、事实确认、粘贴 JD、补充与确认要求、匹配与证据、简历从草稿到下载。另外用真实服务器、真实 DeepSeek 和无界面 Chrome 截图检查了各页面（合成数据）。实测时 DeepSeek 把“internal scheduling tool”译为“内部排班工具”（语义偏向排班），词面检查无法发现，说明改动对照表和人工逐行核对是必要的。
 
-当前限制：网页中不能编辑事实原文或导入事实文件（用命令行）；没有投递记录。结构调整的质量取决于 DeepSeek，目前只在少量真实岗位上检查过；删减偏保守。
+2026-09-27 完成本地网页的第一轮视觉整理。没有引入前端框架或新依赖，继续使用现有 HTML、原生 JavaScript 和 CSS；统一了颜色、间距、卡片、表格、状态、按钮与输入框，增加清晰的当前导航、键盘焦点和窄屏布局。界面层只增加用于定向样式的 class，没有改变 API、状态转换或批准规则。用合成事实与合成岗位在真实本地服务中检查了事实库和岗位工作区的桌面渲染，并通过全部离线测试、JavaScript 语法检查和 diff 空白检查。
+
+当前限制：网页中不能编辑事实原文（用命令行）；没有投递记录。结构调整的质量取决于 DeepSeek，目前只在少量真实岗位上检查过；删减偏保守。
 
 ## TypeSafe/Jev 语义判断（第一小步已实现）
 

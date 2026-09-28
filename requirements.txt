@@ -3,5 +3,7 @@
 #   python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 fastapi==0.141.1
 uvicorn==0.53.0
+# Reads an uploaded CV PDF.
+pypdf==6.19.0
 # Used by the web tests (fastapi.testclient).
 httpx2==2.13.1

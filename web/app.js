@@ -8,7 +8,7 @@ const message = document.getElementById("message");
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
-    headers: { "Content-Type": "application/json", "X-Workbench-Token": TOKEN },
+    headers: { "Content-Type": "application/json", ...options.headers, "X-Workbench-Token": TOKEN },
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -52,6 +52,98 @@ async function run(action) {
   }
 }
 
+function foundEntryHead(entry) {
+  const left = [entry.title, entry.subtitle].filter(Boolean).join(" — ");
+  const right = [entry.location, entry.dates].filter(Boolean).join(" · ");
+  if (!left && !right) return "";
+  return el("div", {},
+    el("strong", {}, left),
+    entry.title_link ? el("span", { class: "muted" }, ` | ${entry.title_link.label}`) : "",
+    right ? el("span", { class: "muted" }, `${left ? " · " : ""}${right}`) : "");
+}
+
+// What DeepSeek found in an uploaded CV, and the name and contact details read locally for the
+// user to check. Nothing is stored until Save.
+function uploadReview(proposal, onSaved, onCancel) {
+  const found = proposal.private;
+  const text = (value) => el("input", { type: "text", value: value || "" });
+  const inputs = { name: text(found.name), location: text(found.location), phone: text(found.phone), email: text(found.email) };
+  const linkRows = el("div", { class: "link-rows" });
+  const addLink = (link = { label: "", url: "" }) => {
+    const label = el("input", { type: "text", value: link.label, placeholder: "Label, e.g. GitHub" });
+    const url = el("input", { type: "url", value: link.url, placeholder: "https://" });
+    const row = el("div", { class: "link-row" }, label, url);
+    row.append(el("button", { class: "secondary", type: "button", onclick: () => row.remove() }, "Remove"));
+    row.link = () => ({ label: label.value.trim(), url: url.value.trim() });
+    linkRows.append(row);
+  };
+  found.links.forEach(addLink);
+  const facts = proposal.sections.flatMap((section) => section.entries.flatMap((entry) => entry.facts));
+  const known = facts.filter((fact) => fact.known).length;
+  const layout = proposal.sections.map((section) => el("div", { class: "found-section" },
+    el("h4", {}, section.title || section.kind),
+    section.entries.map((entry) => el("div", { class: "found-entry" },
+      foundEntryHead(entry),
+      entry.facts.length ? el("ul", {}, entry.facts.map((fact) => el("li", {},
+        fact.text, fact.known ? el("span", { class: "muted" }, " · already in your facts") : ""))) : ""))));
+  const save = el("button", {}, proposal.has_profile ? "Replace my CV with this" : "Save as my CV");
+  save.addEventListener("click", () => run(async () => {
+    const body = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value.trim()]));
+    body.links = [...linkRows.children].map((row) => row.link()).filter((link) => link.url);
+    const result = await api(`/api/cv/uploads/${proposal.upload_id}/save`, { method: "POST", body: JSON.stringify(body) });
+    await onSaved(result);
+  }));
+  return el("div", { class: "upload-review" },
+    el("h3", {}, "1. Check your name and contact details"),
+    el("p", { class: "muted" }, "Read from the top of your CV on this computer and never sent to DeepSeek. They go on the header of every CV."),
+    el("div", { class: "grid" }, field("Name *", inputs.name), field("Location", inputs.location), field("Phone", inputs.phone), field("Email", inputs.email)),
+    el("div", { class: "field" }, el("span", {}, "Links"), linkRows,
+      el("div", {}, el("button", { class: "secondary", type: "button", onclick: () => addLink() }, "Add link"))),
+    found.other.length ? el("p", { class: "muted" }, "Also at the top of your CV, not used: ", found.other.join(" · ")) : "",
+    el("h3", {}, `2. What was found: ${facts.length} lines`),
+    el("p", { class: "muted" },
+      "Copied word for word from your PDF. After saving, each line waits in the list below until you confirm it",
+      known ? `; ${known} already match facts you have.` : "."),
+    layout,
+    proposal.not_imported.length
+      ? el("details", {}, el("summary", {}, `${proposal.not_imported.length} line(s) not imported`),
+        el("ul", {}, proposal.not_imported.map((line) => el("li", {}, line))))
+      : "",
+    proposal.has_profile ? el("p", { class: "warning" }, "Saving replaces your current CV layout; the old one is kept in profile-history.") : "",
+    el("div", { class: "toolbar" }, save, el("button", { class: "secondary", type: "button", onclick: onCancel }, "Cancel")));
+}
+
+function uploadPanel() {
+  const input = el("input", { type: "file", accept: "application/pdf,.pdf" });
+  const box = el("div", {});
+  const reset = () => { box.replaceChildren(); input.value = ""; };
+  const saved = async (result) => {
+    await renderFacts();
+    if (!result.imported) show(`Saved your CV. All ${result.reused} lines match facts you already had.`, "ok");
+    else show(`Saved your CV. ${result.imported} new line(s) wait below for you to confirm`
+      + (result.reused ? `; ${result.reused} matched facts you already had.` : "."), "ok");
+  };
+  input.addEventListener("change", () => run(async () => {
+    const file = input.files[0];
+    if (!file) return;
+    box.replaceChildren(el("p", { class: "muted" }, `Reading ${file.name}…`));
+    try {
+      const proposal = await api("/api/cv/upload", { method: "POST", body: file, headers: { "Content-Type": "application/pdf" } });
+      box.replaceChildren(uploadReview(proposal, saved, reset));
+    } catch (error) {
+      reset();
+      throw error;
+    }
+  }));
+  return el("section", { class: "panel cv-upload-panel" },
+    el("h2", {}, "Your CV"),
+    el("p", { class: "muted" },
+      "Upload your CV as a PDF: each line becomes a fact for you to confirm, and its layout is the base of every job's CV. ",
+      "Your name, email, phone and links stay on this computer; DeepSeek sees the other lines to tell sections, entries and bullets apart."),
+    el("label", { class: "file-pick" }, el("span", {}, "Choose a PDF"), input),
+    box);
+}
+
 async function renderFacts() {
   const { facts } = await api("/api/facts");
   const pending = facts.filter((fact) => fact.status !== "confirmed");
@@ -92,7 +184,7 @@ async function renderFacts() {
         updateButton();
       });
     }
-    return el("tr", { class: fact.status },
+    return el("tr", { class: `fact-row ${fact.status}` },
       el("td", {}, box),
       el("td", {}, el("code", {}, fact.id), el("div", { class: "muted" }, `v${fact.version} · ${fact.fact_type}`)),
       el("td", {}, fact.text, el("div", { class: "tags" }, fact.tags.map((tag) => el("span", { class: "tag" }, tag)))),
@@ -100,13 +192,14 @@ async function renderFacts() {
     );
   });
   app.replaceChildren(
-    el("section", { class: "panel" },
+    uploadPanel(),
+    el("section", { class: "panel facts-panel" },
       el("h2", {}, "Facts"),
       el("p", { class: "muted" },
         `${facts.length} facts, ${pending.length} pending. Only confirmed facts can be matched or used in a CV. `,
         "Read each one carefully before confirming."),
       facts.length === 0
-        ? el("p", {}, "No facts yet. Import them with: python3 facts.py import .local/my-facts.json")
+        ? el("p", {}, "No facts yet. Upload your CV above: each of its lines becomes a fact to confirm here.")
         : el("div", {},
           el("div", { class: "toolbar" }, confirmButton),
           el("table", {},
@@ -149,8 +242,8 @@ async function renderJobs() {
         el("td", {}, progress(job.steps)),
       ))));
   app.replaceChildren(
-    el("section", { class: "panel" }, el("h2", {}, "Jobs"), list),
-    el("section", { class: "panel" },
+    el("section", { class: "panel jobs-panel" }, el("h2", {}, "Jobs"), list),
+    el("section", { class: "panel new-job-panel" },
       el("h2", {}, "New job"),
       el("p", { class: "muted" }, "Paste a job description from any site. Its requirements are found and your CV is prepared for it automatically."),
       el("div", { class: "grid" }, field("Title *", inputs.title), field("Company", inputs.company), field("Official link", inputs.url, "Leave empty if unknown; the source is then recorded as unknown."), field("Location", inputs.location)),
@@ -357,7 +450,7 @@ async function renderFind() {
   }
 
   app.replaceChildren(
-    el("section", { class: "panel" },
+    el("section", { class: "panel find-panel" },
       el("h2", {}, "Jobs that match your skills"),
       el("p", { class: "muted" },
         "Most matched first: how many of your confirmed skills each posting mentions. ",
@@ -367,7 +460,7 @@ async function renderFind() {
         refreshAll),
       status,
       listBox),
-    el("section", { class: "panel" }, companiesBox),
+    el("section", { class: "panel companies-panel" }, companiesBox),
   );
   await Promise.all([drawList(), drawCompanies()]);
   const { sources } = await api("/api/sources");
@@ -381,6 +474,20 @@ function progress(steps) {
     el("span", { class: `pill ${steps.includes(step) ? "done" : ""}` }, label)));
 }
 
+const STRENGTH_LABELS = { required: "Required", preferred: "Preferred (nice to have)", unclear: "Not marked required or preferred" };
+
+function strengthLabel(strength) {
+  return STRENGTH_LABELS[strength] || STRENGTH_LABELS.unclear;
+}
+
+// Who decided a line counts: the page by itself, or the user.
+function decidedLabel(item) {
+  if (item.extraction_method === "manual-quote-v1") return "added by you";
+  if (item.decided_by === "user") return "reviewed by you";
+  if (item.decided_by === "auto") return "counted automatically, not reviewed";
+  return "";
+}
+
 function requirementsPanel(view, refresh) {
   const choices = new Map();
   const rows = (view.candidates || []).map((item) => {
@@ -390,7 +497,7 @@ function requirementsPanel(view, refresh) {
     confirm.addEventListener("change", () => choices.set(item.id, "confirmed"));
     exclude.addEventListener("change", () => choices.set(item.id, "excluded"));
     return el("tr", {},
-      el("td", {}, item.text, el("div", { class: "muted" }, item.extraction_method === "manual-quote-v1" ? "added by you" : (item.section || ""))),
+      el("td", {}, item.text, el("div", { class: "muted" }, [strengthLabel(item.strength), item.section, decidedLabel(item)].filter(Boolean).join(" · "))),
       el("td", { class: "choice" }, el("label", {}, confirm, " Requirement")),
       el("td", { class: "choice" }, el("label", {}, exclude, " Not a requirement")),
     );
@@ -423,11 +530,13 @@ function requirementsPanel(view, refresh) {
     el("div", { class: "toolbar" }, save, findAgain),
   ];
   const counted = (view.selected_requirements || []).length;
+  const automatic = (view.selected_requirements || []).filter((item) => item.decided_by === "auto").length;
+  const summary = `${counted} requirement(s)${automatic ? `, ${automatic} counted automatically and not reviewed by you` : ""} — open to review or change`;
   // Once requirements count, the CV is what matters; the list folds away until needed.
-  return el("section", { class: "panel" },
+  return el("section", { class: "panel step-panel requirements-panel" },
     el("h2", {}, "1. What this job asks for"),
-    el("p", { class: "muted" }, foundBy, " All of them count, and your CV below is adjusted to them. If a line is not really a requirement, choose Not a requirement and Save."),
-    counted ? el("details", {}, el("summary", {}, `${counted} requirement(s) — open to review or change`), body) : body,
+    el("p", { class: "muted" }, foundBy, " All of them count, and your CV below is adjusted to them. If a line is not really a requirement, choose Not a requirement and Save; saving also marks the list as reviewed by you."),
+    counted ? el("details", {}, el("summary", {}, summary), body) : body,
   );
 }
 
@@ -535,7 +644,7 @@ function cvBlock(view, language, refresh) {
 function cvPanel(view, refresh) {
   const main = view.language || "en";
   const other = main === "en" ? "zh" : "en";
-  return el("section", { class: "panel" },
+  return el("section", { class: "panel step-panel cv-panel" },
     el("h2", {}, "2. Your CV for this job"),
     el("p", { class: "muted" },
       "Made from your confirmed facts and adjusted for this job: the most relevant parts first, what does not help cut, ",
@@ -579,13 +688,14 @@ function gapsPanel(view, refresh) {
           actionButton("True for me — add it", post(`/${gap.requirement_id}/accept`)),
           actionButton("Not true", post(`/${gap.requirement_id}/decline`), true)));
     }
-    return el("div", { class: `requirement ${gap.status}` }, el("div", { class: "requirement-text" }, gap.text), detail);
+    const strength = gap.strength && gap.strength !== "required" ? el("span", { class: "muted auto" }, ` · ${strengthLabel(gap.strength)}`) : "";
+    return el("div", { class: `requirement ${gap.status}` }, el("div", { class: "requirement-text" }, gap.text, strength), detail);
   });
   const notes = [];
   if (gaps && gaps.suggesting && gaps.suggesting.fallback_reason) {
     notes.push(el("p", { class: "warning" }, `No suggestions this time (DeepSeek: ${gaps.suggesting.fallback_reason}). Use Check again.`));
   }
-  return el("section", { class: "panel" },
+  return el("section", { class: "panel step-panel gaps-panel" },
     el("h2", {}, gaps ? `3. Not on your CV yet (${open})` : "3. Not on your CV yet"),
     el("p", { class: "muted" },
       "Requirements none of your confirmed facts shows. For each, DeepSeek may suggest a line you could add if it is true for you. ",
@@ -600,7 +710,7 @@ async function renderJob(jobId) {
     const view = await api(`/api/jobs/${jobId}`);
     const jd = view.jd;
     app.replaceChildren(
-      el("section", { class: "panel" },
+      el("section", { class: "panel job-hero" },
         el("h2", {}, jd.title || jobId),
         el("p", { class: "muted" },
           [jd.company, jd.location].filter(Boolean).join(" · ") || "Company unknown", " · captured ", localDate(jd.captured_at)),

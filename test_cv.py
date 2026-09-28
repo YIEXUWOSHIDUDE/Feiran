@@ -298,6 +298,9 @@ class CVTailorTests(unittest.TestCase):
         self.assertEqual(rejected["tailoring"]["status"], "rejected")
         self.assertTrue(any("40" in reason for reason in rejected["tailoring"]["reasons"]))
         self.assertEqual((tailored["tailoring"]["accepted"], tailored["tailoring"]["rejected"]), (3, 1))
+        # A requirement saved before strengths were kept counts as unclear, never as required.
+        self.assertEqual(json.loads(chat.messages[-1]["content"])["job_requirements"],
+                         [{"text": "Requirement number 0", "strength": "unclear"}])
 
     def test_request_holds_only_lines_and_requirements_never_contact_or_papers(self):
         profile = copy.deepcopy(PROFILE)

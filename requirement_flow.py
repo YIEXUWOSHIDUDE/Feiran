@@ -25,7 +25,9 @@ Do not pick headings or sub-headings (short title-like lines that introduce a gr
 such as "Technical Leadership & Systems Architecture"), duties or responsibilities (what the
 person will do), locations, benefits, pay, company or team descriptions, legal or
 equal-opportunity text, or how to apply.
-Reply as {"requirements": [{"line": <line number>, "kind": "required" or "preferred"}]}."""
+Give each line's "kind": "required", "preferred" (nice-to-have, a plus, bonus) or "unclear" when
+the posting does not say which.
+Reply as {"requirements": [{"line": <line number>, "kind": "required", "preferred" or "unclear"}]}."""
 TARGET_HEADINGS = {
     "requirements",
     "qualifications",
@@ -63,6 +65,10 @@ TARGET_HEADINGS = {
     "must have",
     "must haves",
     "must-haves",
+    "must-have skills",
+    "must have skills",
+    "nice-to-have skills",
+    "nice to have skills",
     "your profile",
     "your qualifications",
     "eligibility requirements",
@@ -218,6 +224,18 @@ class RequirementError(Exception):
     """An invalid extraction input or decision."""
 
 
+STRENGTHS = ("required", "preferred", "unclear")
+DECIDERS = ("auto", "user")
+# Whether a line is required or only preferred, from its own words first, then its heading.
+# A line with no such sign stays "unclear" rather than being counted as required.
+PREFERRED_LINE = re.compile(r"\b(?:a plus|nice[- ]to[- ]have|preferred|bonus|ideally)\b|加分|优先(?!队列|级)", re.IGNORECASE)
+NOT_REQUIRED_LINE = re.compile(
+    r"\bnot (?:required|necessary|mandatory|a must)\b|\bnot a requirement\b|不要求|不限|非必须|不是必须", re.IGNORECASE)
+REQUIRED_LINE = re.compile(r"\b(?:must|required)\b|必须", re.IGNORECASE)
+PREFERRED_HEADING = re.compile(r"prefer|nice|bonus|plus|desir|optional|加分|优先")
+REQUIRED_HEADING = re.compile(r"requir|must|minimum|basic|essential|mandatory|任职要求|岗位要求|任职资格|必备|必须")
+
+
 def _heading_key(line: str) -> str:
     """Normalize "**1. Requirements:**", "【岗位要求】" or "二、任职要求：" to a set key."""
     value = re.sub(r"^[\W_]+", "", line.strip())
@@ -238,6 +256,36 @@ def _section_kind(key: str) -> str | None:
         or (words <= STOP_WORDS_MAX_WORDS and any(word in key for word in STOP_WORDS))
     ):
         return "stop"
+    return None
+
+
+def _strength(heading: str | None, text: str, said: Any = None) -> str:
+    """required, preferred or unclear: the line's own words, then what DeepSeek said, then the heading."""
+    if NOT_REQUIRED_LINE.search(text):
+        return "unclear"  # "A degree is not required" is not a requirement of either strength
+    if PREFERRED_LINE.search(text):
+        return "preferred"
+    if said in ("required", "preferred"):
+        return said
+    if REQUIRED_LINE.search(text):
+        return "required"
+    key = _heading_key(heading) if heading else ""
+    if PREFERRED_HEADING.search(key):
+        return "preferred"
+    if REQUIRED_HEADING.search(key):
+        return "required"
+    return "unclear"
+
+
+def _heading_above(lines: list[str], number: int) -> str | None:
+    """The heading JD line ``number`` (from 1) sits under: its own inline heading or the nearest above."""
+    for index in range(number - 1, -1, -1):
+        line = lines[index].strip()
+        inline = INLINE_HEADING.match(line)
+        if inline and _section_kind(_heading_key(inline.group(1))):
+            return inline.group(1).strip()
+        if index < number - 1 and _section_kind(_heading_key(line)):
+            return line.rstrip(":：")
     return None
 
 
@@ -290,11 +338,11 @@ def find_requirements_with_model(
     picks = reply["content"].get("requirements")
     if not isinstance(picks, list):
         raise RequirementError("DeepSeek 的回答缺少 requirements 数组")
-    chosen: dict[int, str] = {}
+    chosen: dict[int, Any] = {}
     for pick in picks:
         number = pick.get("line") if isinstance(pick, dict) else None
         if isinstance(number, int) and not isinstance(number, bool) and 1 <= number <= len(lines):
-            chosen.setdefault(number, "Preferred" if pick.get("kind") == "preferred" else "Required")
+            chosen.setdefault(number, pick.get("kind"))
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     for number in sorted(chosen):
@@ -302,10 +350,12 @@ def find_requirements_with_model(
         if text is None or text.casefold() in seen or text not in jd_text:
             continue
         seen.add(text.casefold())
+        section = _heading_above(lines, number)
         candidates.append({
             "id": _candidate_id(text),
             "text": text,
-            "section": chosen[number],
+            "section": section,
+            "strength": _strength(section, text, said=chosen[number]),
             "status": "pending",
             "fact_id": None,
             "extraction_method": MODEL_METHOD,
@@ -345,6 +395,7 @@ def extract_requirement_candidates(jd_text: str) -> list[dict[str, Any]]:
             "id": _candidate_id(text),
             "text": text,
             "section": active_section,
+            "strength": _strength(active_section, text),
             "status": "pending",
             "fact_id": None,
             "extraction_method": EXTRACTION_METHOD,
@@ -441,10 +492,14 @@ def add_manual_requirements(data: Any, texts: list[str]) -> dict[str, Any]:
         if candidate_id in existing_ids:
             raise RequirementError(f"候选要求已存在：{candidate_id}")
         existing_ids.add(candidate_id)
+        lines = jd_text.splitlines()
+        number = next((index for index, line in enumerate(lines, 1) if text.splitlines()[0] in line), 0)
+        section = _heading_above(lines, number) if number else None
         result["requirement_candidates"].append({
             "id": candidate_id,
             "text": text,
-            "section": None,
+            "section": section,
+            "strength": _strength(section, text),
             "status": "pending",
             "fact_id": None,
             "extraction_method": MANUAL_METHOD,
@@ -467,8 +522,15 @@ def apply_requirement_decisions(
     data: Any,
     confirmations: set[str],
     exclusions: set[str],
+    decided_by: str = "user",
 ) -> dict[str, Any]:
-    """Apply explicit decisions and rebuild selected requirements from confirmed candidates."""
+    """Apply decisions and rebuild selected requirements from confirmed candidates.
+
+    ``decided_by`` records who decided: "user" for a person's review, "auto" when the web page
+    counts every found requirement by itself, so automatic inclusion never reads as a review.
+    """
+    if decided_by not in DECIDERS:
+        raise RequirementError(f"decided_by 必须是：{', '.join(DECIDERS)}")
     if not isinstance(data, dict) or not isinstance(data.get("requirement_candidates"), list):
         raise RequirementError("输入缺少 requirement_candidates 数组")
     if not confirmations and not exclusions:
@@ -502,15 +564,14 @@ def apply_requirement_decisions(
         raise RequirementError(f"候选要求 ID 不存在：{sorted(unknown)[0]}")
     for candidate_id in confirmations:
         candidate = candidates_by_id[candidate_id]
-        candidate["status"] = "confirmed"
-        candidate["fact_id"] = None
+        candidate.update(status="confirmed", fact_id=None, decided_by=decided_by)
     for candidate_id in exclusions:
         candidate = candidates_by_id[candidate_id]
-        candidate["status"] = "excluded"
-        candidate["fact_id"] = None
+        candidate.update(status="excluded", fact_id=None, decided_by=decided_by)
 
     result["selected_requirements"] = [
-        {"id": candidate["id"], "text": candidate["text"], "fact_id": None}
+        {"id": candidate["id"], "text": candidate["text"], "fact_id": None,
+         "strength": candidate.get("strength", "unclear"), "decided_by": candidate.get("decided_by")}
         for candidate in candidates
         if candidate.get("status") == "confirmed"
     ]
@@ -574,6 +635,7 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         "id": item["id"],
                         "section": item["section"],
+                        "strength": item["strength"],
                         "text": item["text"],
                         **({"semantic_judgment": item["semantic_judgment"]} if "semantic_judgment" in item else {}),
                     }

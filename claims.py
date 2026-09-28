@@ -17,6 +17,73 @@ LEADERSHIP_EN = re.compile(
     re.IGNORECASE,
 )
 LEADERSHIP_ZH = ("主导", "带领", "领导", "牵头", "负责", "统筹")
+# A leadership word is supported only by itself or its own translation: "managed a class
+# project" does not support "led the engineering organization".
+LEADERSHIP_GROUPS = (
+    ("led", "lead", "leading", "带领", "领导", "主导", "牵头"),
+    ("managed", "manage", "managing"),
+    ("owned", "owning", "responsible for", "负责"),
+    ("spearheaded", "主导", "牵头"),
+    ("headed", "领导"),
+    ("directed", "领导", "统筹"),
+    ("orchestrated", "统筹"),
+)
+# Words that claim more scale, reach or real-world use than a source lacking them in every
+# language: "used by 2 testers" is not "used by 2 million customers".
+SCALE_TERMS = (
+    ("million", "millions", "百万"),
+    ("billion", "billions", "十亿"),
+    ("hundred million", "亿"),
+    ("thousand", "thousands"),
+    ("production", "生产环境"),
+    ("customer", "customers", "客户"),
+    ("client", "clients", "客户"),
+    ("enterprise", "企业级"),
+    ("organization", "organisation"),
+    ("company-wide", "全公司"),
+    ("global", "globally", "worldwide", "全球"),
+    ("large-scale", "大规模"),
+    ("revenue", "营收", "收入"),
+    ("profit", "利润"),
+)
+# Qualifiers a rewrite must keep in some language: without them, help reads as ownership
+# and a course prototype as finished work.
+QUALIFIERS = (
+    ("prototype", "prototypes", "原型"),
+    ("proof of concept", "proof-of-concept", "POC", "概念验证"),
+    ("demo", "demos", "demonstration", "演示"),
+    ("course", "coursework", "class project", "课程"),
+    ("assisted", "assist", "helped", "help", "协助", "辅助", "帮助"),
+    ("contributed", "contribute", "contributing", "参与"),
+    ("partially", "partial", "部分"),
+    ("studied", "学习"),
+    ("in progress", "ongoing", "进行中", "在读", "修读中"),
+    ("planned", "计划"),
+    ("internal", "in-house", "内部"),
+)
+NEGATION_EN = re.compile(r"\b(?:not|never|no|without|none|cannot)\b|n't\b", re.IGNORECASE)
+NOT_NEGATION = re.compile(r"\bnot (?:only|just|merely|simply)\b", re.IGNORECASE)  # "not only built but…"
+NEGATION_WORDS = {"not", "never", "no", "without", "none", "cannot"}
+NEGATION_HELPERS = {"be", "been", "being", "have", "has", "had", "to", "a", "an", "the", "any", "yet", "ever", "even"}
+# A source counts as negated only on clear words; a rewrite keeps the negation with any of
+# these characters, so a correct translation is never rejected for wording it differently.
+NEGATION_ZH = ("没有", "并未", "尚未", "从未", "未曾", "未能", "并非", "不是", "无法", "不会", "不能", "不再", "未", "不")
+NEGATION_ZH_ANY = "不没未无非勿别"
+CJK = re.compile(r"[\u4e00-\u9fff]")
+# Compounds that contain a listed word without its meaning: 机器学习 is not "studied".
+COMPOUNDS = {
+    "学习": ("机器学习", "深度学习", "强化学习", "迁移学习", "监督学习", "联邦学习"),
+    "未": ("未来", "未知"),
+    "不": ("不断", "不同", "不仅", "不少", "不久", "不错", "不但", "不过", "不管", "不论", "不如", "不止", "不只", "不光"),
+}
+QUANTITY = re.compile(r"(?<![A-Za-z0-9.,])(\d+(?:[.,]\d+)*)")
+FOLLOWING_WORDS = re.compile(r"(?:\s+|-)([A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*){0,2})")
+NOT_UNITS = {
+    "a", "an", "and", "the", "or", "to", "of", "in", "on", "at", "for", "with", "by", "from",
+    "per", "than", "more", "over", "about", "across", "into", "plus", "that", "which", "who",
+}
+TIME_UNITS = {"second", "minute", "hour", "day", "week", "month", "quarter", "semester", "year"}
+TIME_UNITS_ZH = ("秒", "分钟", "小时", "天", "日", "周", "星期", "个月", "月", "季度", "学期", "年")
 # Terms a translation may use for words its source line already has, in either direction:
 # "linking the frontend" may become "连接前端". A term missing from the source in every
 # language is still a new claim.
@@ -77,6 +144,133 @@ def _supported(term: str, source_text: str, tags: set[str]) -> bool:
     return any(name.casefold() in tags or _mentioned(name, source_text) for name in names)
 
 
+def _present(term: str, text: str) -> bool:
+    for compound in COMPOUNDS.get(term, ()):
+        text = text.replace(compound, "")
+    return _mentioned(term, text)
+
+
+def _stated(group: tuple[str, ...], text: str) -> str | None:
+    """The first term of the group that the text states, if any."""
+    return next((term for term in group if _present(term, text)), None)
+
+
+def _leadership_supported(word: str, source_text: str) -> bool:
+    groups = [group for group in LEADERSHIP_GROUPS if word.casefold() in (term.casefold() for term in group)]
+    return any(_stated(group, source_text) for group in groups or [(word,)])
+
+
+def _negated(text: str, clearly: bool) -> bool:
+    if NEGATION_EN.search(NOT_NEGATION.sub("", text)):
+        return True
+    if clearly:
+        return any(_present(word, text) for word in NEGATION_ZH)
+    return any(character in text for character in NEGATION_ZH_ANY)
+
+
+def _stem(word: str) -> str:
+    """deploy, deployed, deploying and deployment all become "deploy"."""
+    for suffix in ("ment", "ing", "ed", "es", "s", "e"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 2:
+            return word[: -len(suffix)]
+    return word
+
+
+def _negated_heads(text: str) -> list[str]:
+    """The English words a negation applies to: "did not deploy it" -> ["deploy"]."""
+    words = [word.casefold() for word in re.findall(r"[A-Za-z][A-Za-z'-]*", NOT_NEGATION.sub("", text))]
+    heads = []
+    for index, word in enumerate(words):
+        if word in NEGATION_WORDS or word.endswith("n't"):
+            following = [later for later in words[index + 1:] if later not in NEGATION_HELPERS]
+            if following:
+                heads.append(_stem(following[0]))
+    return list(dict.fromkeys(heads))
+
+
+def _negations_dropped(text: str, source_text: str) -> list[str]:
+    """Negated words of the source that the rewrite no longer negates. Each English word must
+    stay negated; in a translation, a word with a known translation must appear right after a
+    negation; otherwise any negation in the rewrite is accepted."""
+    heads = _negated_heads(source_text)
+    if not heads:
+        return [] if _negated(text, clearly=False) else ["否定"]
+    if CJK.search(text):
+        missing = []
+        for head in heads:
+            names = {name for term, others in _OTHER_NAMES.items() if term.isascii() and _stem(term) == head
+                     for name in others if not name.isascii()}
+            negation = f"[{NEGATION_ZH_ANY}][^，。；、,.;]{{0,3}}"
+            if (not any(re.search(negation + re.escape(name), text) for name in names)
+                    if names else not _negated(text, clearly=False)):
+                missing.append(head)
+        return missing
+    kept = _negated_heads(text)
+    return [head for head in heads if head not in kept]
+
+
+def _quantities(text: str) -> list[tuple[str, str | None, str]]:
+    """Each number with the English noun it counts (singular, or None) and its kind: time,
+    percent or count. "3 backend services in 2 calendar weeks" -> (3, service, count), (2, week, time)."""
+    found = []
+    for match in QUANTITY.finditer(text):
+        rest = text[match.end():]
+        noun, kind = None, "count"
+        if rest.startswith(("%", "％")):
+            noun, kind = "%", "percent"
+        elif following := FOLLOWING_WORDS.match(rest):
+            words = []
+            for word in following.group(1).split():
+                word = word.casefold()
+                if word in NOT_UNITS:
+                    break
+                words.append(word)
+            if words:
+                noun = words[-1]
+                noun = noun[:-3] + "y" if noun.endswith("ies") and len(noun) > 4 else (
+                    noun[:-1] if noun.endswith("s") and not noun.endswith("ss") and len(noun) > 3 else noun)
+                kind = "time" if noun in TIME_UNITS else "count"
+        elif rest.lstrip().startswith(TIME_UNITS_ZH):
+            kind = "time"
+        found.append((match.group(1), noun, kind))
+    return found
+
+
+def _swapped(text: str, source_text: str) -> list[str]:
+    """Numbers moved onto something else the source counts: "2 services in 3 weeks" ->
+    "3 services in 2 weeks", or in Chinese "2 周内完成 3 个服务" (a time and a count trade places)."""
+    source = _quantities(source_text)
+    swapped = []
+    for number, noun, kind in _quantities(text):
+        by_noun = noun is not None and (number, noun) not in {(n, x) for n, x, _ in source} and (
+            any(n == number and x for n, x, _ in source) and any(x == noun and n != number for n, x, _ in source))
+        by_kind = (number, kind) not in {(n, k) for n, _, k in source} and (
+            any(n == number for n, _, _ in source) and any(k == kind and n != number for n, _, k in source))
+        if by_noun or by_kind:
+            swapped.append(f"{number} {noun}" if noun else number)
+    return list(dict.fromkeys(swapped))
+
+
+def _added_terms(groups: tuple[tuple[str, ...], ...], text: str, source_text: str) -> list[str]:
+    """Terms the rewrite states that the source supports under none of the groups holding them."""
+    added = []
+    for group in groups:
+        term = _stated(group, text)
+        if term and term not in added and not any(_stated(other, source_text) for other in groups if term in other):
+            added.append(term)
+    return added
+
+
+def _dropped_terms(groups: tuple[tuple[str, ...], ...], text: str, source_text: str) -> list[str]:
+    """Terms the source states that the rewrite keeps under none of the groups holding them."""
+    dropped = []
+    for group in groups:
+        term = _stated(group, source_text)
+        if term and term not in dropped and not any(_stated(other, text) for other in groups if term in other):
+            dropped.append(term)
+    return dropped
+
+
 def _technical(token: str) -> bool:
     """Words shaped like product or technology names: Qwen3-32B, Vue.js, C++, REST, FastAPI."""
     return (
@@ -108,11 +302,21 @@ def check_rewrite(
         reasons.append(f"改写超过 {MAX_LINE_LENGTH} 个字符")
     if LINK.search(text) and not LINK.search(source_text):
         reasons.append("改写中不能加入链接或邮箱")
-    claimed = _leadership(text)
-    if claimed and not _leadership(source_text):
-        reasons.append(f"表述强度超过原事实：{', '.join(dict.fromkeys(claimed))}")
+    claimed = [word for word in dict.fromkeys(_leadership(text)) if not _leadership_supported(word, source_text)]
+    if claimed:
+        reasons.append(f"表述强度超过原事实：{', '.join(claimed)}")
     for number in sorted(_numbers(text) - _numbers(source_text)):
         reasons.append(f"原事实中没有这个数字：{number}")
+    for pair in _swapped(text, source_text):
+        reasons.append(f"数字对应的内容与原事实不同：{pair}")
+    for term in _added_terms(SCALE_TERMS, text, source_text):
+        reasons.append(f"表述范围超过原事实：{term}")
+    for term in _dropped_terms(QUALIFIERS, text, source_text):
+        reasons.append(f"改写去掉了原事实中的限定：{term}")
+    if _negated(source_text, clearly=True):
+        dropped = _negations_dropped(text, source_text)
+        if dropped:
+            reasons.append(f"改写去掉了原事实中的否定：{', '.join(dropped)}")
     source = source_text.casefold()
     tags = {tag.casefold() for tag in source_tags}
     for token in dict.fromkeys(WORD.findall(text)):
