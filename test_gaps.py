@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from cv import build_draft
-from facts import list_facts, revise_fact
+from facts import add_fact, list_facts, revise_fact
 from gaps import SUGGEST_RULES, accept_gap, decline_gap, find_gaps
 from matching import MATCH_RULES
 from requirement_flow import apply_requirement_decisions, propose_requirements
@@ -192,6 +192,18 @@ class GapTests(unittest.TestCase):
         saved["sections"][1]["entries"].append({"title": "Other Co", "dates": "2024", "facts": [line]})
         with self.assertRaisesRegex(ValueError, "重新检查缺口"):
             accept_gap(gaps, bullet, self.database, saved)
+
+    def test_a_refused_acceptance_changes_nothing(self):
+        # Found in review by Codex: the pending fact was confirmed before the placement check
+        # refused the acceptance.
+        gaps, _ = self.gaps()
+        bullet = next(item["requirement_id"] for item in gaps["gaps"] if "integration" in item["text"])
+        pending, _ = add_fact(self.database, "Wrote integration tests for internal services.", "experience", ["integration tests"])
+        moved = copy.deepcopy(PROFILE)
+        moved["sections"][1]["entries"].append({"title": "Other Co", "dates": "2024", "facts": [pending["id"]]})
+        with self.assertRaisesRegex(ValueError, "重新检查缺口"):
+            accept_gap(gaps, bullet, self.database, moved)
+        self.assertEqual(next(fact for fact in list_facts(self.database) if fact["id"] == pending["id"])["status"], "pending")
 
     def test_a_declined_or_unsuggested_gap_stays_off_the_cv(self):
         gaps, _ = self.gaps()

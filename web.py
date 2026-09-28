@@ -11,6 +11,7 @@ import re
 import secrets
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -59,6 +60,7 @@ from listings import (
     remove_source,
 )
 from matching import MatchingError, apply_match_decisions, first_candidates, propose_matches
+from privacy import private_terms
 from requirement_flow import (
     RequirementError,
     add_manual_requirements,
@@ -75,6 +77,7 @@ ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by", "extraction_method")
 CV_LANGUAGES = ("en", "zh")
 QUERY_TOKEN_PATHS = ("/preview/", "/download/")
+UPLOAD_KEEP_SECONDS = 24 * 3600
 
 
 class ConfirmRequest(BaseModel):
@@ -478,7 +481,8 @@ def create_app(
         """Optional talking points: the confirmed fact that best speaks to each requirement."""
         if not Path(facts_db).exists():
             raise FactStoreError("还没有事实库；请先导入并确认事实")
-        matches = propose_matches(require(job_id, "decided"), facts_db, chat=chat)
+        private = private_terms(load_profile()) if Path(profile_path).exists() else []
+        matches = propose_matches(require(job_id, "decided"), facts_db, chat=chat, private=private)
         workspace.write(job_id, "matches", matches)
         links, no_match = first_candidates(matches)
         linked = apply_match_decisions(matches, facts_db, links, no_match, decided_by="auto")
@@ -531,11 +535,20 @@ def create_app(
     # details. What it proposes waits in cv-uploads/ until the user checks the details and saves.
     uploads = Path(profile_path).parent / "cv-uploads"
 
+    def upload_path(upload_id: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{16}", upload_id):
+            raise CVImportError("找不到这次上传；请重新上传 PDF")
+        return uploads / f"{upload_id}.json"
+
     def propose_cv(data: bytes) -> dict:
         pdf = read_pdf(data)
         proposal = structure_cv(pdf["lines"], chat, links=pdf["links"])
         upload_id = secrets.token_hex(8)
         uploads.mkdir(parents=True, exist_ok=True)
+        # An upload holds contact details; one neither saved nor cancelled is not kept for long.
+        for forgotten in uploads.glob("*.json"):
+            if time.time() - forgotten.stat().st_mtime > UPLOAD_KEEP_SECONDS:
+                forgotten.unlink(missing_ok=True)
         (uploads / f"{upload_id}.json").write_text(json.dumps(proposal, ensure_ascii=False), encoding="utf-8")
         known = {fact["text"] for fact in list_facts(facts_db)} if Path(facts_db).exists() else set()
         for section in proposal["sections"]:
@@ -556,8 +569,8 @@ def create_app(
     @app.post("/api/cv/uploads/{upload_id}/save")
     def save_uploaded_cv(upload_id: str, request: SaveCVRequest) -> dict:
         """Import the CV's lines as pending facts and make it the CV layout, old one backed up."""
-        path = uploads / f"{upload_id}.json"
-        if not re.fullmatch(r"[0-9a-f]{16}", upload_id) or not path.exists():
+        path = upload_path(upload_id)
+        if not path.exists():
             raise CVImportError("找不到这次上传；请重新上传 PDF")
         proposal = json.loads(path.read_text(encoding="utf-8"))
         profile, items, reused = build_profile(proposal, request.model_dump(), facts_db)
@@ -566,6 +579,11 @@ def create_app(
         save_profile(profile)
         path.unlink()
         return {"imported": len(items), "reused": reused}
+
+    @app.delete("/api/cv/uploads/{upload_id}")
+    def cancel_upload(upload_id: str) -> dict:
+        upload_path(upload_id).unlink(missing_ok=True)
+        return {"cancelled": True}
 
     def started_jobs() -> dict[str, str]:
         """Official posting link -> the newest job already made from it."""

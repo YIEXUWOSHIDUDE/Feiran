@@ -20,6 +20,7 @@ from claims import check_rewrite
 from cv_layout import shown_sections
 from deepseek_client import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, load_current_facts
+from privacy import mask, private_terms
 from review import build_report
 
 
@@ -682,8 +683,10 @@ def tailor_draft(
     """Rewrite bullet, skill and coursework lines for one job, keeping only checked rewrites.
 
     Only line text, the job title and its confirmed requirements are sent: never the name,
-    contact details, entry titles or publications. A rewrite that fails check_rewrite is
-    recorded with its reasons while the line keeps the confirmed fact word for word.
+    contact details, entry titles or publications. A line that itself holds any of them (such
+    as a link or an employer's name) is not sent and stays as confirmed. A rewrite that fails
+    check_rewrite is recorded with its reasons while the line keeps the confirmed fact word
+    for word.
     """
     if isinstance(draft, dict) and "approval" in draft:
         raise CVError("已批准的文件不能再改写；请从 cv.py draft 生成的原始草稿开始")
@@ -691,10 +694,11 @@ def tailor_draft(
         raise CVError("草稿已经改写过；请从 cv.py draft 生成的原始草稿开始")
     current = _verify_draft(draft, facts_db)
     job_summary = _job_summary(job)
+    private = private_terms(draft)
     requested = [
         {"fact_id": line["fact_id"], "section": section["kind"], "text": line["text"]}
         for section in draft["sections"] if section["kind"] in TAILOR_KINDS
-        for entry in section["entries"] for line in entry["lines"]
+        for entry in section["entries"] for line in entry["lines"] if mask(line["text"], private) == line["text"]
     ]
     if not requested:
         raise CVError("草稿中没有可改写的行")
@@ -722,6 +726,8 @@ def tailor_draft(
             continue
         for entry in section["entries"]:
             for line in entry["lines"]:
+                if line["fact_id"] not in rewrites:
+                    continue  # it holds private details, so it was not sent and stays as confirmed
                 fact = current[line["fact_id"]]
                 rewrite = rewrites[line["fact_id"]]
                 reasons = check_rewrite(rewrite, fact["text"], fact["tags"], vocabulary)

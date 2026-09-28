@@ -265,10 +265,10 @@ def _strength(heading: str | None, text: str, said: Any = None) -> str:
         return "unclear"  # "A degree is not required" is not a requirement of either strength
     if PREFERRED_LINE.search(text):
         return "preferred"
-    if said in ("required", "preferred"):
-        return said
     if REQUIRED_LINE.search(text):
         return "required"
+    if said in ("required", "preferred"):
+        return said
     key = _heading_key(heading) if heading else ""
     if PREFERRED_HEADING.search(key):
         return "preferred"

@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from cv import CVError, _job_summary, requirement_briefs
+from privacy import mask, private_terms
 from cv_layout import describe_changes, guarded_layout, original_layout
 from deepseek_client import DEFAULT_MODEL, DeepSeekError, chat_json
 
@@ -79,8 +80,9 @@ def plan_draft(
         layout = original_layout(draft)
     except ValueError as exc:
         raise CVError(str(exc)) from exc
+    private = private_terms(draft)  # a line may still hold the name, a link or an employer
     texts = {
-        line["fact_id"]: line.get("source_text") or line["text"]
+        line["fact_id"]: mask(line.get("source_text") or line["text"], private)
         for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
     }
     request = {

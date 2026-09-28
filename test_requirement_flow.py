@@ -251,6 +251,13 @@ Planning meetings with the team
         self.assertEqual(sent["lines"][3], {"n": 4, "text": "Mastery of Python"})
         self.assertEqual(details["model"], "deepseek-flash")
 
+    def test_the_lines_own_words_outrank_what_deepseek_says(self):
+        # Found in review by Codex: DeepSeek's "preferred" overrode an explicit "must".
+        jd = "Requirements:\nYou must know Python\nNice to have:\nKubernetes experience is a plus"
+        finder = FakeFinder([{"line": 2, "kind": "preferred"}, {"line": 4, "kind": "required"}])
+        candidates, _ = find_requirements_with_model(jd, finder)
+        self.assertEqual([item["strength"] for item in candidates], ["required", "preferred"])
+
     def test_heading_rules_keep_whether_a_line_is_required_preferred_or_unclear(self):
         jd = (BOARD_JD + "Qualifications\nFamiliarity with Go\nRequirements\nExperience with Airflow is a plus\n"
               "A degree is not required\n任职要求\n熟悉优先队列和图算法\n有开源经验者优先\n")

@@ -129,7 +129,11 @@ function uploadPanel() {
     box.replaceChildren(el("p", { class: "muted" }, `Reading ${file.name}…`));
     try {
       const proposal = await api("/api/cv/upload", { method: "POST", body: file, headers: { "Content-Type": "application/pdf" } });
-      box.replaceChildren(uploadReview(proposal, saved, reset));
+      const cancel = () => run(async () => {
+        await api(`/api/cv/uploads/${proposal.upload_id}`, { method: "DELETE" });
+        reset();
+      });
+      box.replaceChildren(uploadReview(proposal, saved, cancel));
     } catch (error) {
       reset();
       throw error;

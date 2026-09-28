@@ -17,8 +17,9 @@ from claims import LINK, NUMBER, _leadership
 from cv import CVError, _localized
 from cv_layout import original_layout
 from deepseek_client import DEFAULT_MODEL, DeepSeekError
-from facts import add_fact, confirm_fact, load_current_facts, revise_fact, tag_pattern
+from facts import add_fact, confirm_fact, list_facts, load_current_facts, revise_fact, tag_pattern
 from matching import propose_matches
+from privacy import mask, private_terms
 
 
 GAPS_VERSION = 1
@@ -60,15 +61,18 @@ def _profile_entry_key(kind: str, entry: Any, language: str) -> str | None:
 
 
 def _resume(draft: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, tuple[str, str, str]]]:
-    """The CV as ids and line texts, the skills lines by fact ID, and bullet entries by ID."""
+    """The CV as ids and line texts (masked for DeepSeek), the skills lines by fact ID, and
+    bullet entries by ID."""
     texts = {
         line["fact_id"]: line.get("source_text") or line["text"]
         for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
     }
+    private = private_terms(draft)
     layout = original_layout(draft)
     resume = [
         {"section": section["kind"], "entries": [
-            {"entry": entry["entry"], "lines": [{"id": fact_id, "text": texts[fact_id]} for fact_id in entry["lines"]]}
+            {"entry": entry["entry"], "lines": [{"id": fact_id, "text": mask(texts[fact_id], private)}
+                                                for fact_id in entry["lines"]]}
             for entry in section["entries"]
         ]}
         for section in layout
@@ -143,7 +147,7 @@ def find_gaps(
     effort: str = "none",
 ) -> dict[str, Any]:
     """The requirements no confirmed fact covers, each with at most one checked suggestion."""
-    matches = propose_matches(decided, facts_db, chat=chat, effort=effort)
+    matches = propose_matches(decided, facts_db, chat=chat, effort=effort, private=private_terms(draft))
     covered = {item["requirement_id"] for item in matches["match_candidates"]}
     gaps = [
         {"requirement_id": item["id"], "text": item["text"], "strength": item.get("strength") or "unclear",
@@ -240,16 +244,21 @@ def accept_gap(
         ]
         if len(places) != 1:
             raise ValueError(f"建议所属的条目（{suggestion['where']}）已经改变，请重新检查缺口")
-        fact, _ = add_fact(facts_db, suggestion["text"], suggestion["fact_type"], suggestion["tags"])
-        confirm_fact(facts_db, fact["id"], fact["version"])
-        fact_id = fact["id"]
         section, entry = places[0]
         elsewhere = {
             known for i, other in enumerate(profile["sections"]) for j, listed in enumerate(other.get("entries", []))
             if (i, j) != (section, entry) for known in listed.get("facts") or []
         }
-        if fact_id in elsewhere:
+        # The fact add_fact would return for this line, if it exists already: checked before
+        # anything is written, so a refused acceptance changes nothing.
+        tags = sorted({tag.casefold() for tag in suggestion["tags"]})
+        same = {fact["id"] for fact in list_facts(facts_db) if fact["text"] == suggestion["text"]
+                and fact["fact_type"] == suggestion["fact_type"] and sorted({tag.casefold() for tag in fact["tags"]}) == tags}
+        if same & elsewhere:
             raise ValueError(f"这一行已在简历的其他条目下，不在 {suggestion['where']}；请重新检查缺口")
+        fact, _ = add_fact(facts_db, suggestion["text"], suggestion["fact_type"], suggestion["tags"])
+        confirm_fact(facts_db, fact["id"], fact["version"])
+        fact_id = fact["id"]
         if fact_id not in (profile["sections"][section]["entries"][entry].get("facts") or []):
             new_profile = copy.deepcopy(profile)
             new_profile["sections"][section]["entries"][entry].setdefault("facts", []).append(fact_id)

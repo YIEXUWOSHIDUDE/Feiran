@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,9 +43,11 @@ class FakeDeepSeek(FakeChat):
         self.cv_structure = None
         self.tailor_error = None
         self.sent = []
+        self.systems = []
 
     def __call__(self, messages, model, effort):
         self.sent.append(messages[-1]["content"])
+        self.systems.append(messages[0]["content"])
         if self.tailor_error and messages[0]["content"].startswith("You rewrite resume lines"):
             raise self.tailor_error
         if messages[0]["content"] == STRUCTURE_RULES:
@@ -199,6 +202,49 @@ class WebTests(unittest.TestCase):
             "每周至少实习4天": ("excluded", "user"), "参与后端服务开发与测试": ("confirmed", "user"),
         })
         self.assertEqual({item["text"]: item["strength"] for item in later["selected_requirements"]}["有开源项目经历"], "unclear")
+
+    def test_private_details_inside_facts_never_reach_deepseek(self):
+        # Found in review by Codex: a fact copied from an uploaded CV can hold the name or a link,
+        # and every later request built from CV lines must still leave them out.
+        paper = {"id": "fact-paper", "type": "achievement", "tags": ["parser"],
+                 "text": "Alex Example and Sam Lee. Parser design. https://alex.example.com/paper. alex@example.com"}
+        demo = {"id": "fact-demo", "type": "experience", "tags": ["parser"],
+                "text": "Showed the Example Corp parser demo at https://alex.example.com/demo."}
+        import_facts(self.database, CV_FACTS + [paper, demo])
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS + [paper, demo]])
+        profile = json.loads(json.dumps(PROFILE))
+        profile["sections"][1]["entries"][0]["facts"].append("fact-demo")
+        profile["sections"].append({"kind": "publications", "entries": [{"facts": ["fact-paper"]}]})
+        self.profile_path.write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
+        self.chat.plan = {"sections": ["education", "experience", "skills", "publications"], "entries": [], "reasons": []}
+        self.chat.gap_suggestions = lambda ids: []
+        job_id = self.client.post("/api/jobs", headers=self.headers,
+                                  json={"title": "Parser Intern", "text": "Requirements:\n- Parser design\n- Kubernetes operations"}).json()["job_id"]
+        self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers)
+        self.client.post(f"/api/jobs/{job_id}/matches/propose", headers=self.headers)
+        sent = "\n".join(self.chat.sent)
+        preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}").text
+        self.assertTrue(any(SUGGEST_RULES == message for message in self.chat.systems))  # gap suggestions were asked for
+        self.assertIn("Parser design", sent)  # the rest of the line still counts
+        for private in ("Alex", "alex.example.com", "alex@example.com", "Example University", "Example Corp", "Los Angeles"):
+            self.assertNotIn(private, sent)
+        self.assertIn("Alex Example and Sam Lee. Parser design.", preview)  # the CV itself is unchanged
+
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_a_cancelled_or_forgotten_upload_leaves_no_personal_data_behind(self):
+        from test_cv_import import minimal_pdf
+
+        uploads = self.profile_path.parent / "cv-uploads"
+        uploads.mkdir()
+        forgotten = uploads / "0123456789abcdef.json"
+        forgotten.write_text("{}", encoding="utf-8")
+        os.utime(forgotten, (0, 0))  # an upload never saved or cancelled, long ago
+        self.chat.cv_structure = {"sections": [{"kind": "skills", "heading": 2, "entries": [{"facts": [{"lines": [3], "tags": []}]}]}]}
+        pdf = minimal_pdf([(72, 740, "ALEX EXAMPLE"), (72, 700, "SKILLS"), (72, 686, "Languages: Python, Java")])
+        upload = self.client.post("/api/cv/upload", content=pdf, headers={**self.headers, "Content-Type": "application/pdf"}).json()
+        cancelled = self.client.delete(f"/api/cv/uploads/{upload['upload_id']}", headers=self.headers)
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(list(uploads.glob("*.json")), [])
 
     def test_the_cv_says_which_stage_did_not_work_and_why(self):
         import_facts(self.database, CV_FACTS)

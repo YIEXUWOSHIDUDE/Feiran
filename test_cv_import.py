@@ -6,7 +6,7 @@ from pathlib import Path
 
 from cv import build_draft
 from cv_import import STRUCTURE_RULES, build_profile, split_private, structure_cv
-from facts import add_fact, confirm_fact, confirm_facts, import_facts
+from facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
 
 HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
 if HAS_PYPDF:
@@ -151,6 +151,59 @@ class CVImportTests(unittest.TestCase):
         for private in ("https://", "github.io", "help@example.com"):
             self.assertNotIn(private, chat.sent)
 
+    # The next three were found in review by Codex (gpt-6-astra, 2026-09-27).
+    def test_a_name_and_contact_details_on_one_line_stay_local(self):
+        lines = [["Alex Example alex@example.com 213-555-0199"], ["SKILLS"], ["Languages: Python"],
+                 ["References: call 213-555-0199"]]
+        answer = {"sections": [{"kind": "skills", "heading": 2, "entries": [{"facts": [{"lines": [3], "tags": ["Python"]}]}]}]}
+        chat = FakeStructurer(answer)
+        private = structure_cv(lines, chat)["private"]
+        self.assertEqual((private["name"], private["email"], private["phone"]), ("Alex Example", "alex@example.com", "213-555-0199"))
+        for text in ("Alex", "Example", "alex@", "213-555-0199"):
+            self.assertNotIn(text, chat.sent)
+
+    def test_links_with_the_same_text_stay_on_their_own_line(self):
+        lines = [["ALEX EXAMPLE"], ["alex@example.com"], ["PROJECTS"], ["Alpha", "Python"], ["• See GitHub for source."],
+                 ["Beta", "GitHub", "Go"], ["• Built a parser."]]
+        links = [{"url": "https://example.com/first", "pieces": ["GitHub"]},
+                 {"url": "https://example.com/second", "pieces": ["GitHub"]}]
+        answer = {"sections": [{"kind": "projects", "heading": 3, "entries": [
+            {"title": [4, 1], "location": [4, 2], "facts": [{"lines": [5], "tags": []}]},
+            {"title": [6, 1], "location": [6, 3], "facts": [{"lines": [7], "tags": []}]}]}]}
+        alpha, beta = structure_cv(lines, FakeStructurer(answer), links=links)["sections"][0]["entries"]
+        self.assertEqual((alpha["title_link"], alpha["links"]), (None, {"GitHub": "https://example.com/first"}))
+        self.assertEqual((beta["title_link"], beta["links"]), ({"label": "GitHub", "url": "https://example.com/second"}, {}))
+
+    def test_a_link_skips_the_same_words_written_without_a_link(self):
+        # Seen on a real CV: "GitHub Actions" in a bullet sat between two projects' GitHub links.
+        lines = [["ALEX EXAMPLE"], ["alex@example.com"], ["PROJECTS"], ["Alpha |", "GitHub", "Python"],
+                 ["• Added GitHub Actions to build it."], ["Beta |", "GitHub", "Go"], ["• Built a parser."]]
+        links = [{"url": "https://example.com/alpha", "pieces": ["GitHub"], "context": "Alpha | GitHub Python"},
+                 {"url": "https://example.com/beta", "pieces": ["GitHub"], "context": "Beta | GitHub Go"}]
+        answer = {"sections": [{"kind": "projects", "heading": 3, "entries": [
+            {"title": [4, 1], "location": [4, 3], "facts": [{"lines": [5], "tags": []}]},
+            {"title": [6, 1], "location": [6, 3], "facts": [{"lines": [7], "tags": []}]}]}]}
+        alpha, beta = structure_cv(lines, FakeStructurer(answer), links=links)["sections"][0]["entries"]
+        self.assertEqual((alpha["title_link"]["url"], beta["title_link"]["url"]), ("https://example.com/alpha", "https://example.com/beta"))
+        self.assertEqual(alpha["links"], {})
+
+    def test_uploading_an_old_cv_again_never_undoes_a_later_correction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "workbench.db"
+            proposal = structure_cv(LINES, FakeStructurer())
+            _, items, _ = build_profile(proposal, proposal["private"], database)
+            import_facts(database, items)
+            built = items[1]
+            revise_fact(database, built["id"], text="Helped build REST APIs for an internal tool.")
+            confirm_fact(database, built["id"], 2)
+            _, again, _ = build_profile(proposal, proposal["private"], database)
+            import_facts(database, again)
+            corrected = next(fact for fact in list_facts(database) if fact["id"] == built["id"])
+        self.assertEqual((corrected["text"], corrected["version"], corrected["status"]),
+                         ("Helped build REST APIs for an internal tool.", 2, "confirmed"))
+        self.assertEqual([item["text"] for item in again], [built["text"]])  # a separate new fact to check
+        self.assertNotEqual(again[0]["id"], built["id"])
+
     @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
     def test_a_pdf_is_read_as_columns_with_the_text_each_link_covers(self):
         data = minimal_pdf(
@@ -159,7 +212,7 @@ class CVImportTests(unittest.TestCase):
         )
         self.assertEqual(read_pdf(data), {
             "lines": [["Example Corp", "Chengdu, China"], ["Built REST APIs."], ["GitHub"]],
-            "links": [{"url": "https://github.com/alex-example", "pieces": ["GitHub"]}],
+            "links": [{"url": "https://github.com/alex-example", "pieces": ["GitHub"], "context": "GitHub"}],
         })
 
 
