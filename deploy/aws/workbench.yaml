@@ -1,0 +1,453 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Job Fit Workbench, single-user beta: one EC2 host runs the container and is reached only
+  through a Session Manager port forward (no inbound ports); an encrypted data volume that
+  outlives the host and the stack; private S3 backups; CloudWatch logs and alarms.
+  See docs/aws-deployment.md.
+
+Parameters:
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Where the host and its data volume live. A kept data volume can only be attached in its own zone.
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      An Amazon Linux 2023 x86_64 AMI, given by ID so that a stack update never replaces the host
+      by surprise (docs/aws-deployment.md shows how to look up the current one).
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.small, t3.medium, t3a.small, t3a.medium]
+    Description: 2 GB is enough for the app and Chromium printing one CV at a time.
+  DataVolumeId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(vol-[0-9a-f]{8,17})?$"
+    Description: A data volume kept from an earlier stack, attached instead of making a new one. Empty the first time.
+  DataVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 200
+    Description: GiB for a new data volume (facts, CV profile, jobs and their history).
+  DeepSeekSecretArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+)?$"
+    Description: >-
+      The ARN of the Secrets Manager secret holding the DeepSeek key (never the key itself).
+      Empty to run without DeepSeek.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Where alarms are emailed (confirm the subscription AWS sends). Empty to watch alarms in the console only.
+  BackupRetentionDays:
+    Type: Number
+    Default: 35
+    MinValue: 7
+    MaxValue: 3650
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+
+Conditions:
+  CreateDataVolume: !Equals [!Ref DataVolumeId, ""]
+  HasDeepSeekSecret: !Not [!Equals [!Ref DeepSeekSecretArn, ""]]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Mappings:
+  # Amazon Linux 2023 has no Compose plugin; this release is checked against its published SHA-256.
+  Compose:
+    Pinned:
+      Version: v5.5.1
+      Sha256: db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576
+
+Resources:
+  # One small public subnet with an internet gateway: the host needs to reach AWS, DeepSeek and
+  # the job boards, and a public address costs far less than a NAT gateway or VPC endpoints.
+  # Nothing can connect in: the security group has no inbound rule at all.
+  Network:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.60.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: job-fit-workbench}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: job-fit-workbench}]
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Network
+      InternetGatewayId: !Ref InternetGateway
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Network
+      CidrBlock: 10.60.0.0/26
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: job-fit-workbench}]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Network
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  SubnetRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+  HostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: The workbench host. Nothing comes in; only HTTPS goes out.
+      VpcId: !Ref Network
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: AWS APIs, the registry, S3, packages, DeepSeek and the job boards
+
+  # What the host may do: be managed through Session Manager, pull releases from this stack's
+  # registry, send logs to this stack's log group, write and read backups (never delete them),
+  # report its health, and read the one DeepSeek secret named. The container gets none of it:
+  # the metadata service answers only one network hop away, which a container is not. Session
+  # Manager needs only these actions; AWS's managed policy for it would also let the host read
+  # every parameter in Parameter Store.
+  HostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: workbench-host
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BeManagedThroughSessionManager
+                Effect: Allow
+                Action:
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+                Resource: "*"
+              - Sid: PullReleases
+                Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt Repository.Arn
+              - Sid: SignInToTheRegistry
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: SendLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroup}:*
+              - Sid: WriteAndReadBackups
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub ${BackupBucket.Arn}/backups/*
+              - Sid: ListBackups
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BackupBucket.Arn
+                Condition:
+                  StringLike: {"s3:prefix": ["backups/*"]}
+              - Sid: ReportHealth
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: {"cloudwatch:namespace": Workbench}
+              - !If
+                - HasDeepSeekSecret
+                - Sid: ReadTheDeepSeekKey
+                  Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref DeepSeekSecretArn
+                - !Ref AWS::NoValue
+  HostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref HostRole]
+
+  Host:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref HostProfile
+      CreditSpecification: {CPUCredits: standard}  # no extra charge for bursts beyond the credits
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref Subnet
+          AssociatePublicIpAddress: true
+          GroupSet: [!Ref HostSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 30
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags: [{Key: Name, Value: job-fit-workbench}]
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # First boot: Docker with the pinned Compose plugin, the registry's credential helper,
+            # this host's settings, and workbench-release, which installs a release by digest.
+            set -euo pipefail
+            dnf install -y docker amazon-ecr-credential-helper
+            curl -fsSL -o /tmp/docker-compose \
+                https://github.com/docker/compose/releases/download/${ComposeVersion}/docker-compose-linux-x86_64
+            echo "${ComposeSha256}  /tmp/docker-compose" | sha256sum -c -
+            install -D -m 0755 /tmp/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
+            rm -f /tmp/docker-compose
+            install -d -m 0700 /root/.docker
+            echo '{"credHelpers": {"${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com": "ecr-login"}}' > /root/.docker/config.json
+            systemctl enable --now docker
+            install -d -m 0755 /etc/workbench /opt/workbench/releases /var/lib/workbench
+            cat > /etc/workbench/env <<'EOF'
+            AWS_REGION=${AWS::Region}
+            LOG_GROUP=${LogGroup}
+            BACKUP_BUCKET=${BackupBucket}
+            DEEPSEEK_SECRET_ARN=${DeepSeekSecretArn}
+            DEEPSEEK_KEY_FILE=/run/workbench/deepseek_api_key
+            DATA_DEVICE=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VolumeName}
+            DATA_VOLUME_NEW=${VolumeNew}
+            DATA_MOUNT=/srv/workbench
+            WORKBENCH_DATA_DIR=/srv/workbench/data
+            EOF
+            cat > /usr/local/sbin/workbench-release <<'EOF'
+            #!/bin/bash
+            # Install the workbench release in an image, given by digest: pull it, take install.sh
+            # from that same image and run it.
+            set -euo pipefail
+            image=${!1:?usage: workbench-release <repository@sha256:digest>}
+            docker pull "$image"
+            container=$(docker create "$image")
+            trap 'docker rm -f "$container" > /dev/null' EXIT
+            docker cp "$container:/app/deploy/aws/host/install.sh" /usr/local/sbin/workbench-install
+            chmod 0755 /usr/local/sbin/workbench-install
+            /usr/local/sbin/workbench-install "$image"
+            EOF
+            chmod 0755 /usr/local/sbin/workbench-release
+          - ComposeVersion: !FindInMap [Compose, Pinned, Version]
+            ComposeSha256: !FindInMap [Compose, Pinned, Sha256]
+            VolumeName: !Join ["", !Split ["-", !If [CreateDataVolume, !Ref DataVolume, !Ref DataVolumeId]]]
+            VolumeNew: !If [CreateDataVolume, "1", "0"]  # only a volume this stack made may be formatted
+
+  # The data volume is kept when the host or the whole stack is deleted: pass its ID as
+  # DataVolumeId to a new stack to carry on with the same data. A new one is blank, and nothing
+  # formats it by itself: format-data.sh <its ID> does, once (docs/aws-deployment.md).
+  DataVolume:
+    Type: AWS::EC2::Volume
+    Condition: CreateDataVolume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      Tags: [{Key: Name, Value: job-fit-workbench-data}]
+  DataAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref Host
+      VolumeId: !If [CreateDataVolume, !Ref DataVolume, !Ref DataVolumeId]
+      Device: /dev/sdf
+
+  # Releases, tagged with their Git commit and never retagged; installed by digest. Tagged
+  # releases are kept (one may be running, or the one to go back to); only untagged leftovers,
+  # such as an interrupted push, expire. Old releases are deleted by hand.
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+      EncryptionConfiguration: {EncryptionType: AES256}
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules": [{"rulePriority": 1,
+          "description": "Untagged leftovers only; tagged releases stay",
+          "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 7},
+          "action": {"type": "expire"}}]}
+
+  # Backups: private, encrypted, over TLS only, kept BackupRetentionDays days. Versioning keeps
+  # an overwritten backup for 30 more days. The bucket is kept when the stack is deleted.
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: backups-expire
+            Status: Enabled
+            Prefix: backups/
+            ExpirationInDays: !Ref BackupRetentionDays
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+          - Id: expired-delete-markers
+            Status: Enabled
+            Prefix: backups/
+            ExpiredObjectDeleteMarker: true
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OnlyOverTls
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt BackupBucket.Arn, !Sub "${BackupBucket.Arn}/*"]
+            Condition:
+              Bool: {"aws:SecureTransport": "false"}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AWS::StackName}/app
+      RetentionInDays: !Ref LogRetentionDays
+  ErrorLines:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogGroup
+      FilterPattern: '{ $.level = "error" }'
+      MetricTransformations:
+        - MetricNamespace: Workbench
+          MetricName: AppErrors
+          MetricValue: "1"
+          DefaultValue: 0
+
+  Alerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Job Fit Workbench
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref Alerts
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+  NotAnsweringAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: >-
+        The workbench has not answered its health check for 15 minutes, or the host stopped
+        reporting (stopped, or down).
+      Namespace: Workbench
+      MetricName: Healthy
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+  BackupTooOldAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: No backup has reached S3 for more than 26 hours.
+      Namespace: Workbench
+      MetricName: BackupAgeHours
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 26
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching  # silence is the not-answering alarm's to report
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+  AppErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The workbench logged an unexpected error (by type and place only; see the log group).
+      Namespace: Workbench
+      MetricName: AppErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+  HostStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: EC2 status checks are failing on the workbench host.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [{Name: InstanceId, Value: !Ref Host}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+
+Outputs:
+  HostId:
+    Value: !Ref Host
+  OpenTheWorkbench:
+    Description: Run on your computer, then open http://127.0.0.1:8765/ (needs the Session Manager plugin).
+    Value: !Sub >-
+      aws ssm start-session --region ${AWS::Region} --target ${Host}
+      --document-name AWS-StartPortForwardingSession --parameters portNumber=8765,localPortNumber=8765
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  DataVolumeId:
+    Description: Kept if the stack is deleted; give it to a new stack as DataVolumeId.
+    Value: !If [CreateDataVolume, !Ref DataVolume, !Ref DataVolumeId]
+  LogGroupName:
+    Value: !Ref LogGroup

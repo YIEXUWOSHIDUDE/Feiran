@@ -30,7 +30,7 @@ jobs:
           if grep -E "\.\.\. skipped" test-output.txt; then echo "::error::Tests were skipped (listed above)"; exit 1; fi
 
   host:
-    name: EC2 host files
+    name: EC2 host files (scripts, CloudFormation)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -40,6 +40,14 @@ jobs:
         run: deploy/aws/test-host-scripts.sh
       - name: The data volume is formatted only on purpose and mounted only when it holds the data (loop devices)
         run: deploy/aws/test-mount-data.sh
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: The CloudFormation template passes cfn-lint and keeps its guarantees
+        run: |
+          python -m pip install cfn-lint==1.57.1
+          cfn-lint deploy/aws/workbench.yaml
+          python deploy/aws/check-template.py deploy/aws/workbench.yaml
 
   container:
     name: Container (linux/amd64)
