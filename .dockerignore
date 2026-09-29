@@ -1,0 +1,9 @@
+# Only what the app needs goes into the image, named one by one. Everything else stays out,
+# above all .local/ (personal data), keys and local notes such as AGENTS.override.md.
+*
+!*.py
+!web/
+!examples/
+!deploy/smoke.py
+!starter_boards.json
+!requirements.txt

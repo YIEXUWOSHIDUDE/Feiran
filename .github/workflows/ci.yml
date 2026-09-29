@@ -1,0 +1,121 @@
+# Linux checks for every pull request and for main. DeepSeek is never called: tests and the
+# smoke run use scripted answers. Paid live-model checks are not part of CI.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (Python 3.14 on Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install the app's packages
+        run: python -m pip install -r requirements.txt
+      - name: Run every test; none may be skipped
+        run: |
+          if ! python -m unittest discover -p "test_*.py" -v 2> test-output.txt; then tail -80 test-output.txt; exit 1; fi
+          tail -3 test-output.txt
+          # Web and PDF tests skip themselves when a package is missing; here everything is installed.
+          if grep -E "\.\.\. skipped" test-output.txt; then echo "::error::Tests were skipped (listed above)"; exit 1; fi
+
+  container:
+    name: Container (linux/amd64)
+    runs-on: ubuntu-24.04
+    env:
+      # compose.yaml runs this image with the same settings as on the EC2 host.
+      WORKBENCH_IMAGE: job-fit-workbench:ci
+      WORKBENCH_DATA_DIR: ${{ github.workspace }}/ci-data
+      WORKBENCH_REQUIRE_DATA: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: The Docker and kernel settings Chromium's sandbox depends on
+        run: |
+          docker version --format 'Docker {{.Server.Version}}'
+          docker compose version
+          sysctl user.max_user_namespaces kernel.apparmor_restrict_unprivileged_userns || true
+      - name: Build the image for linux/amd64
+        run: |
+          docker build --platform linux/amd64 -t "$WORKBENCH_IMAGE" .
+          test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$WORKBENCH_IMAGE")" = linux/amd64
+      - name: Nothing personal or local is in the image, and it runs as its own user
+        run: |
+          docker run --rm --entrypoint sh "$WORKBENCH_IMAGE" -c 'ls -A /app'
+          docker run --rm --entrypoint sh "$WORKBENCH_IMAGE" -c \
+            'for name in .local .venv .git .jj .claude AGENTS.override.md .env; do test ! -e "/app/$name" || { echo "found $name"; exit 1; }; done'
+          test "$(docker run --rm --entrypoint id "$WORKBENCH_IMAGE" -u)" = 10001
+      - name: The tests pass inside the image too
+        run: docker run --rm "$WORKBENCH_IMAGE" python -m unittest discover -p "test_*.py"
+      - name: Prepare a data folder the way the data volume is prepared
+        run: |
+          mkdir -p ci-data empty
+          touch ci-data/.workbench-data
+          sudo chown -R 10001:10001 ci-data empty
+      - name: The container may make the namespaces Chromium's sandbox uses, and no others
+        run: |
+          in_container() { docker compose run --rm --no-deps --entrypoint unshare workbench "$@"; }
+          in_container --user --pid --net --fork true
+          for other in --mount --ipc --uts --cgroup --time; do
+            if in_container --user "$other" true 2> refused.txt; then echo "::error::unshare --user $other was allowed"; exit 1; fi
+            grep -q "Operation not permitted" refused.txt || { cat refused.txt; exit 1; }
+          done
+      - name: Refuse to start on a folder that is not the data volume
+        run: |
+          set +e
+          WORKBENCH_DATA_DIR="$PWD/empty" docker compose run --rm --no-deps workbench
+          code=$?
+          set -e
+          test "$code" = 2
+      - name: The whole workflow, with real Chromium PDFs in English and Chinese
+        run: docker compose run --rm --no-deps workbench python deploy/smoke.py create --data /data --out /data/smoke
+      - name: A new container finds everything the last one left
+        run: docker compose run --rm --no-deps workbench python deploy/smoke.py verify --data /data
+      - name: Served on the loopback only, behind the host and token checks; recreated, the data stays
+        run: |
+          healthy() {
+            for attempt in $(seq 40); do
+              status=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q workbench)")
+              [ "$status" = healthy ] && return 0
+              sleep 2
+            done
+            docker compose logs; return 1
+          }
+          docker compose up -d --no-build
+          healthy
+          curl -fsS http://127.0.0.1:8765/healthz
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' http://127.0.0.1:8765/healthz)" = 403
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/api/jobs)" = 403
+          token=$(curl -fsS http://127.0.0.1:8765/ | sed -n 's/.*name="workbench-token" content="\([^"]*\)".*/\1/p')
+          test -n "$token"
+          curl -fsS -H "X-Workbench-Token: $token" http://127.0.0.1:8765/api/jobs | grep -q job_id
+          curl -s -o /dev/null "http://127.0.0.1:8765/preview/none/en?token=$token"
+          # Docker's own record of what it published; NAT-only publishing would not show in ss.
+          ports=$(docker inspect -f '{{json .NetworkSettings.Ports}}' "$(docker compose ps -q workbench)")
+          echo "published: $ports"
+          echo "$ports" | jq -e 'keys == ["8765/tcp"] and (.["8765/tcp"] | length > 0 and all(.HostIp == "127.0.0.1"))'
+          ss -ltnH 'sport = :8765' | tee listening.txt
+          if grep -v '127.0.0.1:8765' listening.txt; then echo "::error::listening beyond the loopback"; exit 1; fi
+          docker compose logs > compose.log
+          if grep -q -- "$token" compose.log; then echo "::error::the page token reached the logs"; exit 1; fi
+          docker compose down
+          docker compose up -d --no-build
+          healthy
+          docker compose exec -T workbench python deploy/smoke.py verify --data /data
+          docker compose down
+      - name: Keep the PDFs to look at
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-pdfs
+          path: ci-data/smoke/*.pdf
+          if-no-files-found: ignore

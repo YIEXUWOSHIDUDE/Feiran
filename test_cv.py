@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 from cv import (
     CVError,
+    print_with_chrome,
     approve_draft,
     build_draft,
     export_pdf,
@@ -516,6 +518,37 @@ class CVCommandLineTests(unittest.TestCase):
                     ])
             self.assertTrue((root / "cv-en.pdf").exists() and (root / "cv-zh.pdf").exists())
 
+
+
+class ChromeTests(unittest.TestCase):
+    def test_when_chrome_prints_nothing_its_own_last_words_say_why(self):
+        # On a server a refused sandbox or a missing library is only visible in Chrome's output.
+        with tempfile.TemporaryDirectory() as directory:
+            chrome = Path(directory) / "chrome"
+            chrome.write_text("#!/bin/sh\necho 'starting' >&2\necho 'No usable sandbox! Update your kernel' >&2\nexit 1\n")
+            chrome.chmod(0o755)
+            html = Path(directory) / "cv.html"
+            html.write_text("<p>CV</p>", encoding="utf-8")
+            with patch.dict(os.environ, {"CHROME_PATH": str(chrome)}):
+                with self.assertRaisesRegex(CVError, "退出码 1.*No usable sandbox"):
+                    print_with_chrome(html, Path(directory) / "cv.pdf")
+
+    def test_chrome_always_keeps_its_sandbox(self):
+        # A container that refuses the sandbox is given a seccomp profile (deploy/), never --no-sandbox.
+        with tempfile.TemporaryDirectory() as directory:
+            chrome = Path(directory) / "chrome"
+            chrome.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args.txt\"\n"
+                "for arg in \"$@\"; do case \"$arg\" in --print-to-pdf=*)"
+                " printf '%%PDF-1.4\\n%%%%EOF\\n' > \"${arg#--print-to-pdf=}\";; esac; done\n")
+            chrome.chmod(0o755)
+            html = Path(directory) / "cv.html"
+            html.write_text("<p>CV</p>", encoding="utf-8")
+            with patch.dict(os.environ, {"CHROME_PATH": str(chrome)}):
+                print_with_chrome(html, Path(directory) / "cv.pdf")
+            arguments = (Path(directory) / "args.txt").read_text().splitlines()
+            self.assertIn("--headless=new", arguments)
+            self.assertEqual([argument for argument in arguments if "sandbox" in argument], [])
 
 
 class PrivateLineTests(unittest.TestCase):

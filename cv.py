@@ -48,7 +48,8 @@ LABEL_KINDS = {"education", "skills"}
 STYLE = """
 * { box-sizing: border-box; }
 body { margin: 0; color: #111; font-size: 10.5pt; line-height: 1.2;
-  font-family: "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Hiragino Sans GB", "Heiti SC", sans-serif; }
+  font-family: "Helvetica Neue", Helvetica, Arial, "Liberation Sans", "PingFang SC", "Hiragino Sans GB", "Heiti SC",
+    "Noto Sans CJK SC", sans-serif; }
 body.zh { line-height: 1.32; }
 a { color: inherit; text-decoration: underline; text-decoration-thickness: 0.5pt; text-underline-offset: 1.5pt; }
 header { text-align: center; margin-bottom: 4pt; }
@@ -468,6 +469,14 @@ def _pdf_complete(path: Path) -> bool:
         return False
 
 
+def _last_words(log: Any) -> str:
+    """The last line Chrome wrote to its error output: on a server, a refused sandbox or a
+    missing library shows only there. The CV itself is never in it."""
+    log.seek(0)
+    lines = [line.strip() for line in log.read().decode("utf-8", "replace").splitlines() if line.strip()]
+    return lines[-1][:300] if lines else "没有输出"
+
+
 def print_with_chrome(html_path: Path, pdf_path: Path) -> None:
     """Print local HTML to PDF with headless Chrome in a throwaway profile.
 
@@ -477,7 +486,8 @@ def print_with_chrome(html_path: Path, pdf_path: Path) -> None:
     chrome = _find_chrome()
     if chrome is None:
         raise CVError("找不到 Chrome；请安装 Google Chrome 或设置 CHROME_PATH")
-    with tempfile.TemporaryDirectory(prefix="cv-chrome-") as profile:
+    with tempfile.TemporaryDirectory(prefix="cv-chrome-") as profile, \
+            tempfile.TemporaryFile(prefix="cv-chrome-log-") as log:
         process = subprocess.Popen(
             [
                 chrome, "--headless=new", "--disable-gpu", "--no-first-run",
@@ -486,13 +496,13 @@ def print_with_chrome(html_path: Path, pdf_path: Path) -> None:
                 "--no-pdf-header-footer", f"--print-to-pdf={pdf_path}", Path(html_path).as_uri(),
             ],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=log,
         )
         try:
             deadline = time.monotonic() + CHROME_TIMEOUT_SECONDS
             while not _pdf_complete(pdf_path):
                 if process.poll() is not None and not _pdf_complete(pdf_path):
-                    raise CVError(f"Chrome 没有生成 PDF（退出码 {process.returncode}）")
+                    raise CVError(f"Chrome 没有生成 PDF（退出码 {process.returncode}）：{_last_words(log)}")
                 if time.monotonic() > deadline:
                     raise CVError("Chrome 生成 PDF 超时")
                 time.sleep(0.2)

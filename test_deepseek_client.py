@@ -1,6 +1,8 @@
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
@@ -80,6 +82,20 @@ class DeepSeekClientTests(unittest.TestCase):
             with self.assertRaises(DeepSeekError) as header:
                 _post({"model": "deepseek-flash"}, "sk-x y")
         self.assertNotIn("sk-x", str(header.exception))
+
+    def test_a_key_file_works_where_there_is_no_keychain(self):
+        # On a server the key is handed over as a file, so it never sits in the environment.
+        # As on a server, there is no Keychain: a test must never read the developer's real key.
+        with tempfile.TemporaryDirectory() as directory, patch("deepseek_client.sys.platform", "linux"):
+            key = Path(directory) / "deepseek"
+            key.write_text("sk-synthetic-file\n", encoding="utf-8")
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "", "DEEPSEEK_API_KEY_FILE": str(key)}):
+                self.assertEqual(load_api_key(), "sk-synthetic-file")
+            # A key file that was named but is missing is an error, never a reason to look elsewhere.
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "", "DEEPSEEK_API_KEY_FILE": str(Path(directory) / "gone")}):
+                with self.assertRaises(DeepSeekError) as missing:
+                    load_api_key()
+        self.assertEqual(missing.exception.reason, "missing_key")
 
     def test_each_failure_says_what_kind_it_is_so_the_page_can_explain_it(self):
         with self.assertRaises(DeepSeekError) as unusable:
