@@ -117,6 +117,13 @@ jobs:
           if grep -v '127.0.0.1:8765' listening.txt; then echo "::error::listening beyond the loopback"; exit 1; fi
           docker compose logs > compose.log
           if grep -q -- "$token" compose.log; then echo "::error::the page token reached the logs"; exit 1; fi
+          # One JSON object per line, as CloudWatch will hold it, startup lines too; routes, not the paths sent.
+          docker compose logs --no-log-prefix workbench > app.log
+          jq -e -s 'length > 0 and all(type == "object")' app.log > /dev/null \
+            || { echo "::error::a log line is not JSON"; cat app.log; exit 1; }
+          jq -e -s 'any(.event == "request" and .route == "/api/jobs" and .status == 200 and (.request_id | length) == 16)
+                    and any(.event == "request" and .route == "/preview/{job_id}/{language}")
+                    and all(has("path") | not)' app.log > /dev/null
           docker compose down
           docker compose up -d --no-build
           healthy

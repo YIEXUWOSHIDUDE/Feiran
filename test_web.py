@@ -23,6 +23,7 @@ from cv_plan import PLAN_RULES
 from gaps import EVIDENCE_RULES, SUGGEST_RULES
 from matching import MATCH_RULES
 from requirement_flow import FIND_RULES
+import run_log
 from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
 from test_gaps import resume_ids, sent_lines
 from test_listings import FakeBoards, posting
@@ -230,12 +231,12 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.client.get("/healthz").status_code, 503)
 
     def test_the_access_log_never_holds_the_page_token(self):
-        # Preview and download links carry the token in their address; logs keep only the path.
+        # Preview and download links carry the token in their address; logs keep only the route.
         with self.assertLogs("workbench.access", level="INFO") as logs:
             self.client.get(f"/preview/20260101-000000-abcdef/en?token={TOKEN}")
             self.client.get("/api/facts", headers=self.headers)
         self.assertEqual(len(logs.output), 2)
-        self.assertIn("/preview/20260101-000000-abcdef/en", logs.output[0])
+        self.assertIn("route=/preview/{job_id}/{language} job_id=20260101-000000-abcdef", logs.output[0])
         self.assertFalse(any(TOKEN in line for line in logs.output))
 
     def test_facts_page_confirms_only_the_selected_versions(self):
@@ -401,6 +402,73 @@ class WebTests(unittest.TestCase):
         pdf = minimal_pdf([(72, 740, "ALEX EXAMPLE"), (72, 700, "SKILLS"), (72, 686, "Languages: Python, Java")])
         upload = self.client.post("/api/cv/upload", content=pdf, headers={**self.headers, "Content-Type": "application/pdf"})
         self.assertEqual(upload.status_code, 200, upload.text)
+
+    def test_each_request_is_one_line_without_its_query_string(self):
+        job_id = self.planned_job()
+        with self.assertLogs("workbench.access", level="INFO") as logs:
+            preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}&v=stale")
+            self.client.get("/healthz")  # a passing health check is not logged
+        [record] = logs.records
+        line = json.loads(run_log.JsonLines().format(record))
+        self.assertEqual({key: line[key] for key in ("event", "method", "route", "job_id", "status")},
+                         {"event": "request", "method": "GET", "route": "/preview/{job_id}/{language}", "job_id": job_id,
+                          "status": 409})
+        self.assertEqual(line["request_id"], preview.headers["X-Request-Id"])
+        self.assertIsInstance(line["duration_ms"], int)
+        self.assertNotIn(TOKEN, json.dumps(line))
+
+    def test_a_path_the_sender_chose_never_reaches_a_log(self):
+        with self.assertLogs("workbench.access", level="INFO") as logs:
+            self.client.get("/api/jobs/Alex-Example-at-Acme")  # no token: refused before it is routed
+            self.client.get("/api/jobs/Alex-Example-at-Acme", headers=self.headers)  # routed, not a job ID
+            self.client.get("/Alex-Example-at-Acme")
+        lines = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
+        self.assertEqual([(line["route"], line["status"]) for line in lines],
+                         [("/api/jobs/{job_id}", 403), ("/api/jobs/{job_id}", 400), ("(no route)", 404)])
+        self.assertNotIn("Alex", json.dumps(lines))
+
+    def test_a_method_the_sender_made_up_never_reaches_a_log(self):
+        with self.assertLogs("workbench.access", level="INFO") as logs:
+            self.client.request("ALEX-EXAMPLE", "/api/jobs", headers=self.headers)
+            self.client.request("ALEX-EXAMPLE", "/api/jobs")  # no token: refused before it is routed
+        lines = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
+        self.assertEqual([line["method"] for line in lines], ["(other)", "(other)"])
+        self.assertNotIn("ALEX", json.dumps(lines))
+
+    def test_an_unexpected_error_is_logged_by_its_type_never_its_words(self):
+        job_id = self.planned_job()
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("Alex Example, Acme Corporation")  # words from a CV, in an error nobody expected
+
+        client = TestClient(self.app, base_url="http://127.0.0.1:8765", raise_server_exceptions=False)
+        with patch("web.plan_draft", broken), self.assertLogs("workbench.access", level="ERROR") as logs:
+            response = client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+        self.assertEqual(response.status_code, 500)
+        [line] = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
+        self.assertEqual((line["event"], line["route"], line["status"], line["error"]),
+                         ("request", "/api/jobs/{job_id}/cv/{language}/plan", 500, "RuntimeError"))
+        self.assertEqual(response.headers.get("X-Request-Id"), line["request_id"])  # the page can quote it
+        self.assertNotIn("Alex", response.text)
+        self.assertRegex(line["at"], r"^test_web\.py:\d+$")
+        self.assertNotIn("Alex", json.dumps(line))
+
+    def test_each_stage_is_logged_with_its_outcome_and_time_never_its_text(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.chat.tailor_error = DeepSeekError("DeepSeek answered: Alex Example", reason="rate_limited")
+        with self.assertLogs("workbench.stages", level="INFO") as logs:
+            self.client.post("/api/jobs", json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"},
+                             headers=self.headers)
+        lines = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
+        self.assertEqual([(line["stage"], line["status"], line["reason"]) for line in lines],
+                         [("draft", "done", None), ("rewording", "fallback", "rate_limited"), ("layout", "fallback", "unreachable")])
+        self.assertTrue(all(isinstance(line["duration_ms"], int) and line["language"] == "en" for line in lines))
+        self.assertEqual(len({line["request_id"] for line in lines}), 1)  # all from the one request
+        allowed = {"time", "level", "logger", "event", "request_id", "job_id", "language", "stage", "status", "reason",
+                   "duration_ms"}
+        self.assertTrue(all(set(line) <= allowed for line in lines), lines)  # no message, nothing from the CV
+        self.assertNotIn("Alex", json.dumps(lines))
 
     def test_nothing_is_sent_when_the_private_details_cannot_be_read(self):
         # Found in review by Codex: an unreadable profile gave an empty list of private words,
@@ -1373,7 +1441,8 @@ class ServerSettingsTests(unittest.TestCase):
         self.assertEqual((container.facts_db, container.host, container.port, container.require_data),
                          (Path("/data/workbench.db"), "0.0.0.0", 9000, True))
         local = server_settings([], {})
-        self.assertEqual((local.facts_db, local.require_data), (Path(".local/workbench.db"), False))
+        self.assertEqual((local.facts_db, local.require_data, local.json_logs), (Path(".local/workbench.db"), False, False))
+        self.assertTrue(server_settings([], {"WORKBENCH_LOG_FORMAT": "json"}).json_logs)  # as the image sets it
 
     def test_a_required_data_folder_must_be_the_marked_volume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1386,7 +1455,7 @@ class ServerSettingsTests(unittest.TestCase):
     def test_startup_refuses_a_data_folder_that_is_not_the_volume(self):
         # Logging is set up for the whole process when the server starts; not in a test run.
         said, complained = io.StringIO(), io.StringIO()
-        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, \
+        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch.dict(os.environ, {}, clear=True), \
                 patch("web.logging.basicConfig"), redirect_stdout(said), redirect_stderr(complained):
             self.assertEqual(main(["--data", directory, "--require-data"]), 2)
             run.assert_not_called()
@@ -1394,6 +1463,31 @@ class ServerSettingsTests(unittest.TestCase):
             (Path(directory) / DATA_MARKER).write_text("", encoding="utf-8")
             self.assertEqual(main(["--data", directory, "--require-data", "--host", "0.0.0.0"]), 0)
         self.assertEqual((run.call_args.kwargs["host"], run.call_args.kwargs["access_log"]), ("0.0.0.0", False))
+        self.assertNotIn("log_config", run.call_args.kwargs)  # on a terminal, uvicorn's own log setup
+
+    def test_in_a_container_every_line_is_json_from_the_first(self):
+        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, \
+                patch("web.run_log.configure") as configure, patch("web.logging.basicConfig") as plain:
+            with self.assertLogs("workbench", level="ERROR") as refused:
+                self.assertEqual(main(["--data", directory, "--require-data", "--json-logs"]), 2)
+            self.assertIn(DATA_MARKER, refused.records[0].fields["reason"])  # the refusal, as an event
+            (Path(directory) / DATA_MARKER).write_text("", encoding="utf-8")
+            self.assertEqual(main(["--data", directory, "--require-data", "--json-logs"]), 0)
+        configure.assert_called_with(sys.stderr)
+        plain.assert_not_called()
+        self.assertIsNone(run.call_args.kwargs["log_config"])  # uvicorn's lines go through the JSON format too
+
+    def test_a_failure_to_start_is_logged_by_its_type_never_its_words(self):
+        def broken(*args, **kwargs):
+            raise RuntimeError("Alex Example, Acme Corporation")  # say, a damaged database quoting a fact
+
+        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("web.run_log.configure"), \
+                patch("web.create_app", broken), self.assertLogs("workbench", level="ERROR") as logs:
+            self.assertEqual(main(["--data", directory, "--json-logs"]), 1)
+        run.assert_not_called()
+        [line] = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
+        self.assertEqual((line["event"], line["error"]), ("failed_to_start", "RuntimeError"))
+        self.assertNotIn("Alex", json.dumps(line))
 
 
 @unittest.skipUnless(HAS_FASTAPI and HAS_PYPDF, "the smoke run needs the packages in requirements.txt")
