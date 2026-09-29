@@ -47,7 +47,18 @@ from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, str
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs
-from gaps import GAPS_VERSION, accept_gap, coverage, decline_gap, find_gaps, places, write_line
+from gaps import (
+    GAPS_VERSION,
+    accept_gap,
+    addition,
+    coverage,
+    decline_gap,
+    find_gaps,
+    line_to_write,
+    places,
+    suggested_addition,
+    write_line,
+)
 from job_search import (
     SearchError,
     fetch_board,
@@ -381,12 +392,14 @@ def create_app(
     for folder in (Path(profile_path).parent, Path(profile_path).parent / "profile-history", uploads, unfinished):
         remove_leftovers(folder)
 
+    running: set[str] = set()  # this process's actions under way: theirs are not notices yet
+
     def read_notices() -> list[dict]:
         """Actions that did not finish, oldest first, each with the id the page dismisses it by.
         A record that cannot be read is shown as an unknown action and kept for a person to see."""
         notices = []
         for path in unfinished.glob("*.json"):
-            if not NOTICE_ID.fullmatch(path.stem) or path.is_symlink():
+            if not NOTICE_ID.fullmatch(path.stem) or path.is_symlink() or path.stem in running:
                 continue
             try:
                 notice = json.loads(path.read_text(encoding="utf-8"))
@@ -413,26 +426,31 @@ def create_app(
         name = hashlib.sha256(json.dumps([kind, job_id, key]).encode("utf-8")).hexdigest()[:16]
         path = unfinished / f"{name}.json"
         earlier = path.exists()  # the same action stopped before: its notice stays until this one is done
-        if not earlier:
-            write_atomically(path, json.dumps({"kind": kind, "job_id": job_id, "key": key, **shown,
-                                               "started_at": datetime.now(timezone.utc).isoformat()},
-                                              ensure_ascii=False).encode("utf-8"))
+        running.add(name)
         try:
-            yield
-        except (OSError, sqlite3.Error, FactStoreError):
-            raise  # part of the action may be done: the file stays as the notice
-        except Exception:
             if not earlier:
-                remove_durably(path)
-            raise
-        remove_durably(path)
+                write_atomically(path, json.dumps({"kind": kind, "job_id": job_id, "key": key, **shown,
+                                                   "started_at": datetime.now(timezone.utc).isoformat()},
+                                                  ensure_ascii=False).encode("utf-8"))
+            try:
+                yield
+            except (OSError, sqlite3.Error, FactStoreError):
+                raise  # part of the action may be done: the file stays as the notice
+            except Exception:
+                if not earlier:
+                    remove_durably(path)
+                raise
+            remove_durably(path)
+        finally:
+            running.discard(name)
 
-    def added_line(gaps: dict, requirement_id: str, what: object, line: str | None) -> dict:
-        """How a notice names a line being added: its requirement, the line, and in the key a
-        fingerprint of exactly what is added, so another line is another action."""
+    def added_line(gaps: dict, requirement_id: str, adds: dict) -> dict:
+        """How a notice names a line being added: its requirement and the line, and in the key
+        a fingerprint of what goes where (see gaps.addition). So another line is another action,
+        and the same line, accepted or written, the same one."""
         requirement = next((item for item in gaps["requirements"] if item["requirement_id"] == requirement_id), {})
-        digest = hashlib.sha256(json.dumps(what, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-        return {"key": f"{requirement_id}:{digest[:12]}", "requirement": requirement.get("text"), "line": line,
+        digest = hashlib.sha256(json.dumps(adds, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        return {"key": f"{requirement_id}:{digest[:12]}", "requirement": requirement.get("text"), "line": adds["text"],
                 "language": gaps.get("language")}
     # Next to the fact store by default, so tests with a temporary fact store stay temporary too.
     listings_db = Path(listings_db or Path(facts_db).parent / "listings.db")
@@ -1026,15 +1044,13 @@ def create_app(
     def accept_suggestion(job_id: str, requirement_id: str) -> dict:
         """The user says the suggested line is true: it becomes a confirmed fact on the CV."""
         gaps = require(job_id, "gaps")
-        suggestion = next((item["suggestion"] for item in gaps["requirements"]
-                           if item["requirement_id"] == requirement_id), None) or {}
-        line = suggestion.get("new_text") or suggestion.get("text")
-        with operation("add_line", job_id, **added_line(gaps, requirement_id, suggestion, line)):
+        adds = suggested_addition(gaps, requirement_id)
+        with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
             updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
             if profile is not None:
                 save_profile(profile)
             workspace.write(job_id, "gaps", updated)
-        prepare_again(job_id, gaps["language"])  # its own steps are journaled
+            prepare_again(job_id, gaps["language"])  # the notice stays until the CV has been prepared again
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/write")
@@ -1044,13 +1060,13 @@ def create_app(
         _, head = cv_head(job_id, gaps["language"])
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历")
-        line = " ".join(request.text.split())
-        with operation("add_line", job_id, **added_line(gaps, requirement_id, {"place": request.place, "text": line}, line)):
+        adds = addition(line_to_write(gaps, requirement_id, request.place, request.text, head))  # refused before any write
+        with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
             updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile())
             if profile is not None:
                 save_profile(profile)
             workspace.write(job_id, "gaps", updated)
-        prepare_again(job_id, gaps["language"])  # its own steps are journaled
+            prepare_again(job_id, gaps["language"])  # the notice stays until the CV has been prepared again
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/decline")

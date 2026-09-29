@@ -1017,9 +1017,11 @@ def upload_and_save():
         self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line["text"]), 1)
 
     def test_accepting_a_skill_cut_short_is_reported_and_can_be_repeated(self):
-        # Cut short before the requirement check recorded it as added, and just after.
+        # Cut short before the requirement check recorded it as added, just after, and while the
+        # CV was being prepared again.
         for index, (label, crash_point) in enumerate((("before", dies_before_renaming_into("gaps.json")),
-                                                      ("after", dies_after_renaming_into("gaps.json")))):
+                                                      ("after", dies_after_renaming_into("gaps.json")),
+                                                      ("preparing", dies_before_renaming_into("cv-draft-en.json")))):
             with self.subTest(label):
                 if index:  # a fresh workbench for each crash point
                     self.tearDown()
@@ -1040,17 +1042,64 @@ def upload_and_save():
                 self.assertEqual([(fact["text"], fact["status"]) for fact in languages],
                                  [("Languages: Python, Java, Go", "confirmed")])
 
-    def test_an_action_that_finished_just_before_a_crash_leaves_no_notice(self):
-        # The line is in; the process dies preparing the CV again, which is not part of adding it.
+    def test_a_crash_while_the_cv_is_prepared_again_keeps_the_notice_until_it_is(self):
+        # The line is in; the process dies preparing the CV again, which the notice waits for.
         job_id, gaps = self.line_job()
         requirement, line = self.own_line(gaps)
         write = f"/api/jobs/{job_id}/gaps/{requirement}/write"
         self.die_in_app(f"client.post({write!r}, headers=headers, json={line!r})",
                         dies_before_renaming_into("cv-draft-en.json"))
-        view = self.restarted().get(f"/api/jobs/{job_id}", headers=self.headers).json()
-        self.assertNotIn("interrupted_operations", view)
+        client = self.restarted()
+        view = client.get(f"/api/jobs/{job_id}", headers=self.headers).json()
         self.assertEqual(view["interrupted"]["step"], "cv-draft-en")  # the CV says it was cut short
+        self.assertEqual([notice["line"] for notice in view["interrupted_operations"]], [line["text"]])
+        again = client.post(write, headers=self.headers, json=line)  # the same line: saved already, so only the CV is prepared
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertNotIn("interrupted_operations", again.json())
+        self.assertIn(line["text"], client.get(f"/preview/{job_id}/en?token={TOKEN}").text)
         self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line["text"]), 1)
+
+    def test_a_retry_that_stops_just_before_its_notice_goes_leaves_the_notice(self):
+        job_id, gaps = self.line_job()
+        requirement, line = self.own_line(gaps)
+        write = f"client.post({f'/api/jobs/{job_id}/gaps/{requirement}/write'!r}, headers=headers, json={line!r})"
+        self.die_in_app(write, dies_before_renaming_into("gaps.json"))  # the first try leaves a notice
+        self.die_in_app(write, dies_after_renaming_into("cv-status-en.json"))  # the retry prepares the CV, then dies
+        client = self.restarted()
+        [notice] = client.get(f"/api/jobs/{job_id}", headers=self.headers).json()["interrupted_operations"]
+        self.assertEqual(notice["line"], line["text"])
+        self.assertIn(line["text"], client.get(f"/preview/{job_id}/en?token={TOKEN}").text)
+        self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line["text"]), 1)
+
+    def test_writing_the_suggested_line_yourself_finishes_the_same_action(self):
+        job_id, gaps = self.line_job(suggestions=lambda ids: [
+            {"requirement": ids["Hands-on Docker and Kubernetes"], "kind": "bullet", "entry": "s1e0",
+             "text": "Deployed the internal tool with Docker.", "tags": ["Docker"]}])
+        [record] = gaps["requirements"]
+        accept = f"/api/jobs/{job_id}/gaps/{record['requirement_id']}/accept"
+        self.die_in_app(f"client.post({accept!r}, headers=headers)", dies_before_renaming_into("gaps.json"))
+        own = {"place": f"entry:{record['suggestion']['entry_key']}", "text": record["suggestion"]["text"]}
+        done = self.restarted().post(f"/api/jobs/{job_id}/gaps/{record['requirement_id']}/write", headers=self.headers, json=own)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertNotIn("interrupted_operations", done.json())
+
+    def test_an_action_still_under_way_is_not_shown_as_unfinished(self):
+        job_id, gaps = self.line_job()
+        requirement, line = self.own_line(gaps)
+        self.chat.plan = {"sections": ["education", "skills", "experience"], "entries": [], "reasons": []}
+        gate = self.chat.while_planning = Gate()
+        unfinished = self.profile_path.parent / "unfinished"
+        with TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(1) as pool:
+            try:
+                adding = pool.submit(client.post, f"/api/jobs/{job_id}/gaps/{requirement}/write", headers=self.headers,
+                                     json=line)
+                self.assertTrue(gate.arrived.acquire(timeout=5))  # the line is saved; the CV is being prepared again
+                self.assertEqual(len(list(unfinished.glob("*.json"))), 1)  # its file is there, in case the process dies
+                self.assertNotIn("interrupted_operations", client.get(f"/api/jobs/{job_id}", headers=self.headers).json())
+            finally:
+                gate.release.set()
+            self.assertEqual(adding.result(10).status_code, 200)
+        self.assertEqual(list(unfinished.glob("*.json")), [])
 
     def test_finishing_another_line_leaves_the_notice_about_this_one(self):
         job_id, gaps = self.line_job(("Hands-on Docker and Kubernetes", "Experience with Go"))

@@ -865,17 +865,19 @@ function unfinishedNote(notice, refresh) {
         + "prepare the CV again so the CV shows it."
       : "A change did not finish, and its record could not be read. Check your facts and your CV, and repeat what "
         + "you were doing.";
-  const tools = [];
-  if (notice.kind === "add_line" && notice.job_id && notice.language) {
-    tools.push(actionButton("Prepare the CV again", async () => {
-      await api(`/api/jobs/${notice.job_id}/cv/${notice.language}/prepare`, { method: "POST" });
-      await refresh();
-    }, true));
-  }
-  tools.push(actionButton("Dismiss", async () => {
+  const dismiss = async () => {
     await api("/api/notices/dismiss", { method: "POST", body: JSON.stringify({ id: notice.id }) });
     await refresh();
-  }, true));
+  };
+  const tools = [];
+  if (notice.kind === "add_line" && notice.job_id && notice.language) {
+    // Once the CV is prepared again with the line recorded, adding it is done: the notice goes.
+    tools.push(actionButton("Prepare the CV again", async () => {
+      await api(`/api/jobs/${notice.job_id}/cv/${notice.language}/prepare`, { method: "POST" });
+      await dismiss();
+    }, true));
+  }
+  tools.push(actionButton("Dismiss", dismiss, true));
   return el("p", { class: "warning" }, text, " ", ...tools);
 }
 

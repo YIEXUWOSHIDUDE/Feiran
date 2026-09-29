@@ -7,7 +7,7 @@ from cv import build_draft, tailor_draft
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError
 from facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
-from gaps import EVIDENCE_RULES, SUGGEST_RULES, accept_gap, coverage, decline_gap, find_gaps, places, write_line
+from gaps import EVIDENCE_RULES, SUGGEST_RULES, accept_gap, addition, coverage, decline_gap, find_gaps, places, write_line
 from requirement_flow import apply_requirement_decisions, propose_requirements
 from test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
 from test_cv_plan import FakePlanner
@@ -119,6 +119,17 @@ class GapTests(unittest.TestCase):
         self.assertEqual(sent["other_facts"], [])  # every confirmed fact is on this CV
         for private in ("Alex Example", "Example Corp", "Example University", "Los Angeles", *(fact["id"] for fact in FACTS)):
             self.assertNotIn(private, chat.sent[0])
+
+    def test_what_a_suggestion_adds_is_where_it_goes_and_the_text_there(self):
+        bullet = {"kind": "bullet", "entry_key": "k1", "fact_type": "experience", "text": "Built X.",
+                  "tags": ["A", "B"], "where": "Intern", "beside": "Wrote tests."}
+        # Tags and where it was shown do not change it, so a check run again finds the same action.
+        self.assertEqual(addition(bullet), addition({**bullet, "tags": ["B", "A"], "beside": "Other line.", "written": True}))
+        self.assertNotEqual(addition(bullet), addition({**bullet, "text": "Built Y."}))
+        self.assertNotEqual(addition(bullet), addition({**bullet, "entry_key": "k2"}))
+        skill = {"kind": "skill", "fact_id": "fact-skills", "items": ["Go"], "where": "Languages: Python",
+                 "new_text": "Languages: Python, Go"}
+        self.assertEqual(addition(skill), {"where": "skill:fact-skills", "text": "Languages: Python, Go"})
 
     def test_what_nothing_shows_gets_an_honest_suggestion(self):
         gaps, chat = self.gaps()
