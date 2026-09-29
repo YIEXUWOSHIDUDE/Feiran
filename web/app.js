@@ -149,7 +149,7 @@ function uploadPanel() {
 }
 
 async function renderFacts() {
-  const { facts } = await api("/api/facts");
+  const { facts, interrupted } = await api("/api/facts");
   const pending = facts.filter((fact) => fact.status !== "confirmed");
   const selected = new Set();
   const confirmButton = el("button", { disabled: true }, "Confirm selected");
@@ -199,6 +199,11 @@ async function renderFacts() {
     uploadPanel(),
     el("section", { class: "panel facts-panel" },
       el("h2", {}, "Facts"),
+      interrupted ? el("p", { class: "warning" }, interrupted.kind === "save_cv"
+        ? "The workbench stopped while saving your uploaded CV. Some of its lines may already be here, waiting for "
+          + "confirmation, and your CV layout may still be the old one. Upload the PDF again and save: lines already "
+          + "saved are reused, never added twice."
+        : "The workbench stopped in the middle of a change. Check your facts and your CV, and repeat what you were doing.") : null,
       el("p", { class: "muted" },
         `${facts.length} facts, ${pending.length} pending. Only confirmed facts can be matched or used in a CV. `,
         "Read each one carefully before confirming."),
@@ -866,6 +871,9 @@ async function renderJob(jobId) {
         jd.source ? el("p", {}, el("a", { href: jd.source, target: "_blank", rel: "noopener noreferrer" }, jd.source)) : el("p", { class: "muted" }, "Source: unknown"),
         el("details", {}, el("summary", {}, "Job description"), el("pre", { class: "jd" }, jd.text)),
         interruptedNote(view.interrupted),
+        view.interrupted_operation ? el("p", { class: "warning" },
+          "The workbench stopped while adding a line you confirmed. If it is not on your CV below, add it again: "
+          + "it will not be added twice.") : null,
       ),
       requirementsPanel(view, refresh),
       cvPanel(view, refresh),

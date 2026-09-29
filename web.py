@@ -16,9 +16,10 @@ import sqlite3
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, NamedTuple
+from typing import Callable, Iterable, Iterator, Mapping, NamedTuple
 
 import anyio
 from fastapi import FastAPI, Request
@@ -96,6 +97,11 @@ OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload")
 # told to try again.
 CHANGE_WAIT_SECONDS = 90
 BUSY = "Another change is still being made (DeepSeek can take a minute). Try again in a moment."
+# Changes that span the fact store, the CV profile and a job's files: saving an uploaded CV, and
+# adding a line the user confirmed. The marker is there while one runs; the notice after a stop.
+OPERATIONS = ("save_cv", "add_line")
+OPERATION_MARKER = "operation-in-progress.json"
+OPERATION_NOTICE = "interrupted-operation.json"
 UPLOAD_KEEP_SECONDS = 24 * 3600
 
 
@@ -356,6 +362,47 @@ def create_app(
     uploads = Path(profile_path).parent / "cv-uploads"
     for folder in (Path(profile_path).parent, Path(profile_path).parent / "profile-history", uploads):
         remove_leftovers(folder)
+    operation_marker = Path(profile_path).parent / OPERATION_MARKER
+    operation_notice = Path(profile_path).parent / OPERATION_NOTICE
+    if operation_marker.exists():
+        # The last run stopped inside a change that spans the facts, the profile and a job: say
+        # so on the page. Nothing is replayed.
+        try:
+            marker = json.loads(operation_marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            marker = None
+        marker = marker if isinstance(marker, dict) else {}
+        notice = {"kind": marker.get("kind") if marker.get("kind") in OPERATIONS else "unknown",
+                  "job_id": marker.get("job_id") if isinstance(marker.get("job_id"), str) else None,
+                  "stopped_at": datetime.now(timezone.utc).isoformat()}
+        write_atomically(operation_notice, json.dumps(notice).encode("utf-8"))
+        operation_marker.unlink()
+        logging.getLogger("workbench").warning("an operation was cut short by a stop: %s", notice["kind"])
+
+    def read_notice() -> dict | None:
+        try:
+            notice = json.loads(operation_notice.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return notice if isinstance(notice, dict) else None
+
+    @contextmanager
+    def operation(kind: str, job_id: str | None = None) -> Iterator[None]:
+        """A change that spans the fact store, the CV profile and a job's files, which no single
+        journal covers. A marker says so while it runs; if the workbench stops inside it, the
+        next start turns the marker into a notice. Nothing is replayed: repeating the action is
+        safe, since a saved CV's lines are reused and a line is never added twice."""
+        write_atomically(operation_marker, json.dumps(
+            {"kind": kind, "job_id": job_id, "started_at": datetime.now(timezone.utc).isoformat()}).encode("utf-8"))
+        try:
+            yield
+        except Exception:
+            operation_marker.unlink(missing_ok=True)  # the page shows the error itself
+            raise
+        operation_marker.unlink(missing_ok=True)
+        notice = read_notice()
+        if notice and notice.get("kind") == kind and notice.get("job_id") == job_id:
+            operation_notice.unlink(missing_ok=True)  # the same action went through this time
     # Next to the fact store by default, so tests with a temporary fact store stay temporary too.
     listings_db = Path(listings_db or Path(facts_db).parent / "listings.db")
     initialize(listings_db, load_starter() if starter is None else starter)
@@ -483,6 +530,9 @@ def create_app(
         interrupted = workspace.read_note(job_id, "interrupted")
         if interrupted:
             view["interrupted"] = interrupted
+        notice = read_notice()
+        if notice and notice.get("job_id") == job_id:
+            view["interrupted_operation"] = notice
         gaps = workspace.read(job_id, "gaps")
         if gaps:
             view["gaps"] = gaps_view(job_id, gaps)
@@ -720,9 +770,11 @@ def create_app(
 
     @app.get("/api/facts")
     def facts() -> dict:
+        notice = read_notice()
+        stopped = {"interrupted": notice} if notice and not notice.get("job_id") else {}
         if not Path(facts_db).exists():
-            return {"facts": []}
-        return {"facts": list_facts(facts_db)}
+            return {"facts": [], **stopped}
+        return {"facts": list_facts(facts_db), **stopped}
 
     @app.post("/api/facts/confirm")
     def confirm(request: ConfirmRequest) -> dict:
@@ -770,11 +822,12 @@ def create_app(
         if not path.exists():
             raise CVImportError("找不到这次上传；请重新上传 PDF")
         proposal = json.loads(path.read_text(encoding="utf-8"))
-        profile, items, reused = build_profile(proposal, request.model_dump(), facts_db)
-        if items:
-            import_facts(facts_db, items)
-        save_profile(profile)
-        path.unlink()
+        with operation("save_cv"):
+            profile, items, reused = build_profile(proposal, request.model_dump(), facts_db)
+            if items:
+                import_facts(facts_db, items)
+            save_profile(profile)
+            path.unlink()
         return {"imported": len(items), "reused": reused}
 
     @app.delete("/api/cv/uploads/{upload_id}")
@@ -928,11 +981,12 @@ def create_app(
     def accept_suggestion(job_id: str, requirement_id: str) -> dict:
         """The user says the suggested line is true: it becomes a confirmed fact on the CV."""
         gaps = require(job_id, "gaps")
-        updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
-        if profile is not None:
-            save_profile(profile)
-        workspace.write(job_id, "gaps", updated)
-        prepare_again(job_id, gaps["language"])
+        with operation("add_line", job_id):
+            updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
+            if profile is not None:
+                save_profile(profile)
+            workspace.write(job_id, "gaps", updated)
+        prepare_again(job_id, gaps["language"])  # its own steps are journaled
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/write")
@@ -942,11 +996,12 @@ def create_app(
         _, head = cv_head(job_id, gaps["language"])
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历")
-        updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile())
-        if profile is not None:
-            save_profile(profile)
-        workspace.write(job_id, "gaps", updated)
-        prepare_again(job_id, gaps["language"])
+        with operation("add_line", job_id):
+            updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile())
+            if profile is not None:
+                save_profile(profile)
+            workspace.write(job_id, "gaps", updated)
+        prepare_again(job_id, gaps["language"])  # its own steps are journaled
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/decline")

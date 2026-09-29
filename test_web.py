@@ -31,6 +31,7 @@ HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
 if HAS_FASTAPI:
     from fastapi.testclient import TestClient
 
+    import web as web_module
     from web import DATA_MARKER, create_app, data_problem, main, server_settings
 
 TOKEN = "test-token"
@@ -843,6 +844,75 @@ class WebTests(unittest.TestCase):
         self.assertEqual(stranger.status_code, 403)
         cut = next(item for item in self.job(job_id)["cv"]["en"]["changes"] if item["id"] == "cut:fact-intern-api")
         self.assertFalse(cut["undone"])  # the refused change was not made
+
+    def restarted(self):
+        """A client for the next start of the workbench, on the same folders."""
+        return TestClient(create_app(
+            facts_db=self.database, jobs_root=Path(self.directory.name) / "jobs", token=TOKEN,
+            profile_path=self.profile_path, chat=self.chat, printer=FakePrinter(), starter=[],
+        ), base_url="http://127.0.0.1:8765")
+
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_saving_an_uploaded_cv_cut_short_is_reported_and_can_be_repeated(self):
+        from test_cv_import import minimal_pdf
+
+        pdf = minimal_pdf([
+            (72, 740, "ALEX EXAMPLE"), (72, 726, "Los Angeles, CA | 000-000-0000 | alex@example.com"),
+            (72, 700, "EXPERIENCE"), (72, 686, "Example Corp"), (430, 686, "Chengdu, China"),
+            (72, 672, "Software Intern"), (430, 672, "Jun 2025 - Aug 2025"),
+            (72, 658, "- Built REST APIs for an internal tool."), (72, 630, "SKILLS"), (72, 616, "Languages: Python, Java"),
+        ])
+        self.chat.cv_structure = {"sections": [
+            {"kind": "experience", "heading": 3, "entries": [
+                {"title": [4, 1], "location": [4, 2], "subtitle": [5, 1], "dates": [5, 2],
+                 "facts": [{"lines": [6], "tags": ["REST APIs"]}]}]},
+            {"kind": "skills", "heading": 7, "entries": [{"facts": [{"lines": [8], "tags": ["Python", "Java"]}]}]},
+        ]}
+        contact = {"name": "Alex Example", "location": "Los Angeles, CA", "phone": "000-000-0000",
+                   "email": "alex@example.com", "links": []}
+
+        def upload_and_save(client):
+            proposal = client.post("/api/cv/upload", content=pdf, headers={**self.headers, "Content-Type": "application/pdf"}).json()
+            return client.post(f"/api/cv/uploads/{proposal['upload_id']}/save", json=contact, headers=self.headers)
+
+        real_write = web_module.write_atomically
+
+        def dies_placing_the_profile(path, data):
+            if Path(path).name == "cv-profile.json":
+                raise Crash()
+            real_write(path, data)
+
+        with patch("web.write_atomically", dies_placing_the_profile), self.assertRaises(BaseException):
+            upload_and_save(self.client)  # the facts are in, the new profile is not
+        client = self.restarted()
+        stopped = client.get("/api/facts", headers=self.headers).json()
+        self.assertEqual(stopped["interrupted"]["kind"], "save_cv")
+        self.assertEqual(json.loads(self.profile_path.read_text(encoding="utf-8"))["name"], PROFILE["name"])
+        again = upload_and_save(client)
+        self.assertEqual(again.json(), {"imported": 0, "reused": 2})  # the lines saved before are reused
+        self.assertNotIn("interrupted", client.get("/api/facts", headers=self.headers).json())
+        self.assertEqual(json.loads(self.profile_path.read_text(encoding="utf-8"))["name"], "Alex Example")
+
+    def test_adding_a_line_cut_short_is_reported_on_its_job_and_can_be_repeated(self):
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": "Requirements:\n- Hands-on Docker and Kubernetes"},
+                                  headers=self.headers).json()["job_id"]
+        self.chat.evidence = lambda request: [{"id": item["id"], "verdict": "none"} for item in request["requirements"]]
+        self.chat.gap_suggestions = lambda ids: []
+        gaps = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]
+        line = {"place": next(place["id"] for place in gaps["places"] if place["kind"] == "bullet"),
+                "text": "Deployed the internal tool with Docker."}
+        write = f"/api/jobs/{job_id}/gaps/{gaps['requirements'][0]['requirement_id']}/write"
+        with crash_when_writing("gaps.json"), self.assertRaises(BaseException):
+            self.client.post(write, headers=self.headers, json=line)  # the fact and profile are in, the rest is not
+        client = self.restarted()
+        self.assertEqual(client.get(f"/api/jobs/{job_id}", headers=self.headers).json()["interrupted_operation"]["kind"],
+                         "add_line")
+        again = client.post(write, headers=self.headers, json=line)
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertNotIn("interrupted_operation", again.json())
+        self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line["text"]), 1)  # not added twice
 
     def test_an_approval_cut_short_by_a_crash_is_no_approval_after_the_restart(self):
         job_id = self.planned_job()
