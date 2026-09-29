@@ -94,13 +94,23 @@ def ok(response, what: str) -> dict:
     return response.json()
 
 
+def font_name(font) -> str:
+    """A font's PostScript name without its subset tag. Chrome draws CFF fonts such as Noto Sans
+    CJK (and PingFang on a Mac) as Type3 fonts, which give the name only in their descriptor."""
+    font = font.get_object()
+    name = font.get("/BaseFont")
+    if name is None and "/FontDescriptor" in font:
+        name = font["/FontDescriptor"].get_object().get("/FontName")
+    return str(name).lstrip("/").split("+")[-1]
+
+
 def pdf_facts(path: Path) -> dict:
-    """What a PDF holds: its pages, its text with spacing removed, and the fonts it embeds. Text
-    comes out of a PDF with some CJK characters as look-alike radicals (⼈ for 人); NFKC maps
-    them back."""
+    """What a PDF holds: its pages, its text with spacing removed, and the fonts it embeds.
+    Chrome's text layer spells some characters as the Kangxi radicals that share their glyph
+    (⼈ for 人), on a Mac too; NFKC maps them back so these checks can read the words."""
     reader = PdfReader(str(path))
     text = unicodedata.normalize("NFKC", "".join(page.extract_text() or "" for page in reader.pages))
-    fonts = sorted({str(font.get_object().get("/BaseFont")) for page in reader.pages
+    fonts = sorted({font_name(font) for page in reader.pages
                     for font in (page.get("/Resources", {}).get("/Font", {}) or {}).values()})
     return {"pages": len(reader.pages), "text": re.sub(r"\s+", "", text), "fonts": fonts}
 
@@ -142,8 +152,9 @@ def create(data: Path, out: Path) -> None:
     for line in ("Built REST APIs for an internal tool.", "Languages: Python, Java", "Example Corp"):
         check(re.sub(r"\s+", "", line).casefold() in en["text"].casefold(), f"English CV shows {line!r}")
     check("DRAFT" not in en["text"], "approved CV has no watermark")
-    if LINUX:  # the fonts the image installs; a Mac prints with its own
-        check(any("Liberation" in font for font in en["fonts"]), f"English CV uses Liberation Sans: {en['fonts']}")
+    if LINUX:  # only the fonts the image installs, never a fallback; a Mac prints with its own
+        check(all(font.startswith("LiberationSans") for font in en["fonts"]),
+              f"English CV uses Liberation Sans only: {en['fonts']}")
 
     # A Chinese CV from the synthetic examples, printed the same way.
     with tempfile.TemporaryDirectory() as scratch:
@@ -160,7 +171,9 @@ def create(data: Path, out: Path) -> None:
     for word in ("示例候选人", "教育背景", "草稿"):
         check(word in zh["text"], f"Chinese CV shows {word}")
     if LINUX:
-        check(any("NotoSansCJK" in font for font in zh["fonts"]), f"Chinese CV uses Noto Sans CJK: {zh['fonts']}")
+        check(any(font.startswith("NotoSansCJK") for font in zh["fonts"])
+              and all(font.startswith(("NotoSansCJK", "LiberationSans")) for font in zh["fonts"]),
+              f"Chinese CV uses Noto Sans CJK and Liberation Sans only: {zh['fonts']}")
     (out / "summary.json").write_text(json.dumps({"job": job, "statuses": statuses, "english": {**en, "text": None},
                                                   "chinese": {**zh, "text": None}}, ensure_ascii=False, indent=1))
 
