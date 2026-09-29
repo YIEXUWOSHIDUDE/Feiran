@@ -836,6 +836,11 @@ function gapsPanel(view, refresh) {
 function interruptedNote(interrupted) {
   if (!interrupted) return null;
   const step = interrupted.step;
+  if (step === "unknown") {
+    return el("p", { class: "warning" },
+      "The workbench stopped in the middle of a change to this job and could not tell which one, so it left the files as they were. "
+      + "If the requirements or your CV look wrong, save the requirements again or use Start over.");
+  }
   const what = step.startsWith("cv-approved-") ? "approving your CV"
     : step.startsWith("cv-final-") ? "creating the final PDF"
       : step.startsWith("cv-") ? "preparing your CV"

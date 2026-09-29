@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -132,6 +133,32 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual([restarted.read(self.job, step) for step in ("cv-draft-en", "cv-tailored-en", "cv-planned-en")],
                          [{"version": 1}] * 3)
         self.assertEqual(self.files(), sorted(before + ["interrupted.json"]))
+
+    def test_recovery_never_puts_a_file_back_over_one_that_is_there(self):
+        # Two changes stamped alike (a clock set back) share a history folder; undoing the one
+        # that moved nothing must not bring back the other one's old files.
+        self.workspace.write(self.job, "cv-draft-en", {"version": 1})
+        self.workspace.write(self.job, "cv-draft-en", {"version": 2})  # version 1 goes to history
+        (stamp,) = [folder.name for folder in (self.root / self.job / "history").iterdir()]
+        journal = {"step": "cv-draft-en", "history": stamp, "moved": ["cv-draft-en.json"],
+                   "sha256": "0" * 64, "started_at": "2026-09-29T00:00:00+00:00"}
+        (self.root / self.job / "change-in-progress.json").write_text(json.dumps(journal), encoding="utf-8")
+        Workspace(self.root).recover()
+        self.assertEqual(self.workspace.read(self.job, "cv-draft-en"), {"version": 2})
+
+    def test_a_journal_that_cannot_be_read_neither_stops_the_start_nor_moves_anything(self):
+        for step in ("cv-draft-en", "cv-planned-en"):
+            self.workspace.write(self.job, step, {"version": 1})
+        before = self.files()
+        (self.root / self.job / "change-in-progress.json").write_text('{"step": "../../x", "moved": ["../../y"]}')
+        restarted = Workspace(self.root)
+        self.assertEqual(restarted.recover(), [{"job_id": self.job, "step": "unknown"}])
+        self.assertEqual(self.files(), sorted(before + ["change-in-progress.unreadable.json", "interrupted.json"]))
+        restarted.write(self.job, "gaps", {"version": 1})  # the page's own requirement check keeps the note
+        self.assertEqual(restarted.read_note(self.job, "interrupted")["step"], "unknown")
+        restarted.write(self.job, "cv-draft-en", {"version": 2})  # starting the CV over settles it
+        self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 2})
+        self.assertIsNone(restarted.read_note(self.job, "interrupted"))
 
     def test_a_step_written_in_full_before_a_crash_stands(self):
         for step in ("cv-draft-en", "cv-planned-en"):

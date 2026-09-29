@@ -31,8 +31,13 @@ JOB_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 # Small status files kept beside the steps and replaced in place: how the latest CV preparation
 # went, stage by stage. They are not part of the step chain.
 NOTES = (*(f"cv-status-{language}" for language in LANGUAGES), "interrupted")
-# Written before a step is replaced and removed once the new file is in place.
+# Written before a step is replaced and removed once the new file is in place. One this code
+# did not write is set aside under the second name, for a person to look at.
 JOURNAL = "change-in-progress.json"
+UNREADABLE_JOURNAL = "change-in-progress.unreadable.json"
+HISTORY_NAME = re.compile(r"\d{8}T\d{12}-[0-9a-f]{4}")
+# What a change of unknown extent is settled by: the requirements saved again, or a CV started over.
+RESTARTS = ("candidates", "decided", *(f"cv-draft-{language}" for language in LANGUAGES))
 
 
 def _sync_folder(folder: Path) -> None:
@@ -80,6 +85,22 @@ def _file_name(step: str) -> str:
 
 
 STEP_FILES = frozenset(_file_name(step) for step in STEPS)
+
+
+def _read_journal(directory: Path) -> dict[str, Any] | None:
+    """The journal of the change in progress, or None if it is not one this code wrote."""
+    try:
+        journal = json.loads((directory / JOURNAL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(journal, dict):
+        return None
+    history, moved, digest = journal.get("history"), journal.get("moved"), journal.get("sha256")
+    trusted = (journal.get("step") in STEPS
+               and (history is None or (isinstance(history, str) and HISTORY_NAME.fullmatch(history)))
+               and isinstance(moved, list) and all(isinstance(name, str) and name in STEP_FILES for name in moved)
+               and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest))
+    return journal if trusted else None
 
 
 def _later_steps(step: str) -> list[str]:
@@ -139,7 +160,8 @@ class Workspace:
         if (directory / JOURNAL).exists():
             self._finish(directory)
         moving = [path for path in (self.path(job_id, later) for later in _later_steps(step)) if path.exists()]
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        # Random too, so two changes never share a history folder even if the clock goes back.
+        stamp = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{secrets.token_hex(2)}"
         journal = {"step": step, "history": stamp if moving else None, "moved": [path.name for path in moving],
                    "sha256": hashlib.sha256(data).hexdigest(), "started_at": _now()}
         write_atomically(directory / JOURNAL, json.dumps(journal).encode("utf-8"))
@@ -159,20 +181,28 @@ class Workspace:
         # Redoing the cut-short step, or one it depends on, settles the note about it; other work
         # (the page checks requirements by itself) leaves it for the user to read.
         interrupted = self.read_note(job_id, "interrupted")
-        if interrupted and interrupted.get("step") in _later_steps(step):
+        cut_short = (interrupted or {}).get("step")
+        if interrupted and (cut_short in _later_steps(step) or (cut_short == "unknown" and step in RESTARTS)):
             self._note_path(job_id, "interrupted").unlink()
 
-    def _finish(self, directory: Path) -> bool:
-        """Close the change the journal describes. If its new file was written in full, it stands;
-        otherwise what it moved goes back. Returns whether it was undone. Nothing is written
-        here but files put back, so this can never approve a CV or confirm anything."""
-        journal = json.loads((directory / JOURNAL).read_text(encoding="utf-8"))
+    def _finish(self, directory: Path) -> str | None:
+        """Close the change the journal describes. If its new file was written in full, it stands
+        (None). Otherwise what it moved goes back, only into places now empty, since the files
+        it moved are exactly the ones missing, and the step is returned. A journal this code did
+        not write is set aside with nothing moved ("unknown"). Nothing is written here but files
+        put back, so this can never approve a CV or confirm anything."""
+        journal = _read_journal(directory)
+        if journal is None:
+            (directory / JOURNAL).rename(directory / UNREADABLE_JOURNAL)
+            remove_leftovers(directory)
+            _sync_folder(directory)
+            return "unknown"
         target = directory / _file_name(journal["step"])
         finished = target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == journal["sha256"]
         if not finished and journal["history"]:
             history = directory / "history" / journal["history"]
             for name in journal["moved"]:
-                if name in STEP_FILES and (history / name).exists():
+                if (history / name).exists() and not (directory / name).exists():
                     (history / name).rename(directory / name)
             for folder in (history, history.parent):  # history/ too, if this change made it
                 if folder.is_dir() and not any(folder.iterdir()):
@@ -180,7 +210,7 @@ class Workspace:
         remove_leftovers(directory)
         (directory / JOURNAL).unlink()
         _sync_folder(directory)
-        return not finished
+        return None if finished else journal["step"]
 
     def recover(self) -> list[dict[str, str]]:
         """At start, close every change a crash cut short, and say which were undone. A job so
@@ -192,8 +222,8 @@ class Workspace:
             if not directory.is_dir() or not JOB_ID.fullmatch(directory.name):
                 continue
             if (directory / JOURNAL).exists():
-                step = json.loads((directory / JOURNAL).read_text(encoding="utf-8"))["step"]
-                if self._finish(directory) and any(directory.iterdir()):
+                step = self._finish(directory)
+                if step and any(directory.iterdir()):
                     self.write_note(directory.name, "interrupted", {"step": step, "undone_at": _now()})
                     undone.append({"job_id": directory.name, "step": step})
             remove_leftovers(directory)
