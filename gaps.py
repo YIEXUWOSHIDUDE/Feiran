@@ -565,14 +565,16 @@ def accept_gap(
     A suggestion applies only to what it was made for: the skills line with the same text, or
     the entry with the same name, role, place and dates wherever it now sits. Every step
     can be repeated, so if saving stops before the caller records the gap as added, accepting
-    it again finishes the job without adding anything twice.
+    it again finishes the job without adding anything twice; accepting a suggestion recorded as
+    added writes nothing and succeeds, so a retry after a stop can finish (the caller then
+    prepares the CV again).
     """
     updated = copy.deepcopy(gaps)
     gap = _gap(updated, requirement_id)
     if gap["status"] == "declined":
         raise ValueError("这条建议已标记为不属实；如需添加请重新检查缺口")
     if gap["status"] == "added":
-        raise ValueError("这条建议已经添加过")
+        return updated, None
     suggestion = gap["suggestion"]
     if not suggestion:
         raise ValueError("这条要求没有可添加的建议")
@@ -702,6 +704,9 @@ def write_line(
         suggestion = {"kind": "bullet", "entry_key": place["entry_key"], "fact_type": place["fact_type"],
                       "text": text, "tags": named, "where": place["where"]}
     if gap["status"] == "added":
+        done = gap.get("suggestion") or {}
+        if done.get("written") and all(done.get(key) == value for key, value in suggestion.items()):
+            return copy.deepcopy(gaps), None  # the same line again, after a stop: saved already
         raise ValueError("这条要求已经添加过一行")
     updated = copy.deepcopy(gaps)
     _gap(updated, requirement_id).update(suggestion={**suggestion, "written": True}, status="open")

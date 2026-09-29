@@ -83,6 +83,12 @@ def write_atomically(path: Path, data: bytes) -> None:
     _sync_folder(path.parent)
 
 
+def remove_durably(path: Path) -> None:
+    """Delete a file, if there, and flush its folder so the deletion outlasts a power cut."""
+    path.unlink(missing_ok=True)
+    _sync_folder(path.parent)
+
+
 def remove_leftovers(folder: Path) -> None:
     """Delete the temporary files write_atomically left behind when the process died. Only
     files of its exact name pattern are touched."""
@@ -119,11 +125,13 @@ def _read_journal(directory: Path) -> dict[str, Any] | None:
         return None
     if not isinstance(journal, dict):
         return None
-    history, moved, digest = journal.get("history"), journal.get("moved"), journal.get("sha256")
-    trusted = (journal.get("step") in STEPS
-               and (history is None or (isinstance(history, str) and HISTORY_NAME.fullmatch(history)))
-               and isinstance(moved, list) and all(isinstance(name, str) and name in STEP_FILES for name in moved)
-               and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest))
+    step, history, moved, digest = journal.get("step"), journal.get("history"), journal.get("moved"), journal.get("sha256")
+    if step not in STEPS or not isinstance(moved, list) or not isinstance(digest, str):
+        return None
+    chain = {_file_name(later) for later in _later_steps(step)}
+    trusted = (all(isinstance(name, str) and name in chain for name in moved)  # only its own step's chain moves
+               and (history is None if not moved else isinstance(history, str) and bool(HISTORY_NAME.fullmatch(history)))
+               and re.fullmatch(r"[0-9a-f]{64}", digest))
     return journal if trusted else None
 
 
@@ -148,7 +156,7 @@ class Workspace:
         if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):
             raise WorkspaceError("岗位编号格式无效")
         directory = self.root / job_id
-        if not directory.is_dir():
+        if directory.is_symlink() or not directory.is_dir():  # a link is not a job this workbench made
             raise WorkspaceError(f"岗位不存在：{job_id}")
         return directory
 
@@ -296,8 +304,8 @@ class Workspace:
         if not self.root.is_dir():
             return undone
         for directory in sorted(self.root.iterdir()):
-            if not directory.is_dir() or not JOB_ID.fullmatch(directory.name):
-                continue
+            if directory.is_symlink() or not directory.is_dir() or not JOB_ID.fullmatch(directory.name):
+                continue  # a link is left alone, wherever it points
             if (directory / JOURNAL).exists():
                 step = self._finish(directory)
                 if step and step != "input":
@@ -348,7 +356,7 @@ class Workspace:
             return []
         summaries = []
         for directory in sorted(self.root.iterdir(), reverse=True):
-            if not directory.is_dir() or not JOB_ID.fullmatch(directory.name):
+            if directory.is_symlink() or not directory.is_dir() or not JOB_ID.fullmatch(directory.name):
                 continue
             jd = (self.read(directory.name, "input") or {}).get("jd", {})
             summaries.append({

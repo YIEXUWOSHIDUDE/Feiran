@@ -199,11 +199,7 @@ async function renderFacts() {
     uploadPanel(),
     el("section", { class: "panel facts-panel" },
       el("h2", {}, "Facts"),
-      interrupted ? el("p", { class: "warning" }, interrupted.kind === "save_cv"
-        ? "The workbench stopped while saving your uploaded CV. Some of its lines may already be here, waiting for "
-          + "confirmation, and your CV layout may still be the old one. Upload the PDF again and save: lines already "
-          + "saved are reused, never added twice."
-        : "The workbench stopped in the middle of a change. Check your facts and your CV, and repeat what you were doing.") : null,
+      (interrupted || []).map((notice) => unfinishedNote(notice, renderFacts)),
       el("p", { class: "muted" },
         `${facts.length} facts, ${pending.length} pending. Only confirmed facts can be matched or used in a CV. `,
         "Read each one carefully before confirming."),
@@ -856,6 +852,27 @@ function interruptedNote(interrupted) {
     `The workbench stopped while ${what}, so that change was undone and nothing half-done was kept. Do it again if you still want it.`);
 }
 
+// An action that spans the facts, the CV layout and a job did not finish (the workbench stopped,
+// or saving failed partway). Nothing is repeated for the user; repeating it is safe.
+function unfinishedNote(notice, refresh) {
+  const text = notice.kind === "save_cv"
+    ? "Saving an uploaded CV did not finish. Some of its lines may already be here, waiting for confirmation, and "
+      + "your CV layout may still be the old one. Upload the same PDF again and save: lines already saved are reused, "
+      + "never added twice."
+    : notice.kind === "add_line"
+      ? "Adding a line you confirmed did not finish. If it is not on your CV below, add it again with the same words: "
+        + "it will not be added twice. If you rebuilt the CV instead, check that the line is there."
+      : "A change did not finish. Check your facts and your CV, and repeat what you were doing.";
+  const dismiss = actionButton("Dismiss", async () => {
+    await api("/api/notices/dismiss", {
+      method: "POST",
+      body: JSON.stringify({ kind: notice.kind, job_id: notice.job_id || null, key: notice.key || null }),
+    });
+    await refresh();
+  }, true);
+  return el("p", { class: "warning" }, text, " ", dismiss);
+}
+
 async function renderJob(jobId) {
   // Requirements are checked against the CV once it exists, after the page shows, so Start
   // stays quick; and again, at most once per refresh, whenever the facts or the CV's wording
@@ -871,9 +888,7 @@ async function renderJob(jobId) {
         jd.source ? el("p", {}, el("a", { href: jd.source, target: "_blank", rel: "noopener noreferrer" }, jd.source)) : el("p", { class: "muted" }, "Source: unknown"),
         el("details", {}, el("summary", {}, "Job description"), el("pre", { class: "jd" }, jd.text)),
         interruptedNote(view.interrupted),
-        view.interrupted_operation ? el("p", { class: "warning" },
-          "The workbench stopped while adding a line you confirmed. If it is not on your CV below, add it again: "
-          + "it will not be added twice.") : null,
+        (view.interrupted_operations || []).map((notice) => unfinishedNote(notice, refresh)),
       ),
       requirementsPanel(view, refresh),
       cvPanel(view, refresh),

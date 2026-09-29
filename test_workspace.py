@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -9,26 +10,6 @@ from unittest.mock import patch
 
 import workspace as workspace_module
 from workspace import Workspace, WorkspaceError
-
-
-class Crash(BaseException):
-    """Stands in for the process dying in the web tests; the tests here kill a real process."""
-
-
-def crash_when_writing(name, written=False):
-    """Raise Crash as the file ``name`` is renamed into place: before the rename, or, with
-    ``written``, just after it."""
-    real = os.replace
-
-    def replace(source, destination):
-        if written:
-            real(source, destination)
-        if Path(destination).name == name:
-            raise Crash()
-        if not written:
-            real(source, destination)
-
-    return patch("workspace.os.replace", replace)
 
 
 REPO = Path(__file__).resolve().parent
@@ -45,12 +26,16 @@ os.replace = replace
 """
 
 
-def dies_after_renaming_into(name):
+def dies_after_renaming_into(name, times=1):
+    """Dies just after ``name`` is renamed into place for the ``times``-th time."""
     return f"""
+placed = []
 def replace(source, destination):
     real_replace(source, destination)
     if Path(destination).name == {name!r}:
-        os._exit({PROCESS_DIES})
+        placed.append(destination)
+        if len(placed) == {times}:
+            os._exit({PROCESS_DIES})
 os.replace = replace
 """
 
@@ -169,9 +154,6 @@ class WorkspaceTests(unittest.TestCase):
         )
         self.workspace.write(self.job, "cv-tailored-en", {"version": 2})
         self.assertEqual(self.workspace.state(self.job), ["input", "decided", "matches", "cv-draft-en", "cv-tailored-en"])
-
-    def files(self):
-        return sorted(str(path.relative_to(self.root / self.job)) for path in (self.root / self.job).rglob("*"))
 
     def files(self):
         return sorted(str(path.relative_to(self.root / self.job)) for path in (self.root / self.job).rglob("*"))
@@ -412,6 +394,63 @@ class WorkspaceTests(unittest.TestCase):
         restarted.write(self.job, "cv-draft-en", {"version": 2})  # starting the CV over settles it
         self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 2})
         self.assertIsNone(restarted.read_note(self.job, "interrupted"))
+
+    def test_a_journal_whose_parts_disagree_is_set_aside_without_stopping_the_start(self):
+        self.write_chain(("cv-draft-en",))
+        target = (self.root / self.job / "cv-draft-en.json").read_bytes()
+        cases = {
+            "files moved but no history folder": {"step": "cv-draft-en", "history": None, "moved": ["cv-draft-en.json"]},
+            "a file outside the step's chain": {"step": "gaps", "history": "20260929T000000000000-abcd",
+                                                "moved": ["cv-draft-en.json"]},
+            "a digest that is not a hash": {"step": "cv-draft-en", "history": None, "moved": [], "sha256": "not-a-hash"},
+        }
+        for label, parts in cases.items():
+            with self.subTest(label):
+                journal = {"sha256": hashlib.sha256(target).hexdigest(), "started_at": "2026-09-29T00:00:00+00:00", **parts}
+                (self.root / self.job / "change-in-progress.json").write_text(json.dumps(journal), encoding="utf-8")
+                self.assertEqual(Workspace(self.root).recover(), [{"job_id": self.job, "step": "unknown"}])
+                self.assertEqual(self.workspace.read(self.job, "cv-draft-en"), {"version": 1, "step": "cv-draft-en"})
+                (self.root / self.job / "change-in-progress.unreadable.json").unlink()
+
+    def test_a_job_folder_that_is_a_link_is_left_alone(self):
+        elsewhere = Path(self.directory.name + "-elsewhere")
+        elsewhere.mkdir()
+        self.addCleanup(lambda: [path.unlink() for path in elsewhere.iterdir()] and None or elsewhere.rmdir())
+        (elsewhere / "cv-draft-en.json").write_text("{}")
+        (elsewhere / "change-in-progress.json").write_text('{"step": "cv-draft-en"}')
+        linked = self.root / "20260101-000000-abcdef"
+        linked.symlink_to(elsewhere, target_is_directory=True)
+        Workspace(self.root).recover()
+        self.assertEqual(sorted(path.name for path in elsewhere.iterdir()), ["change-in-progress.json", "cv-draft-en.json"])
+        self.assertEqual([job["job_id"] for job in self.workspace.jobs()], [self.job])
+        with self.assertRaises(WorkspaceError):
+            self.workspace.read("20260101-000000-abcdef", "cv-draft-en")
+
+    def assert_nothing_moves_through(self, link):
+        """A change whose history is reached through a link: the job is marked, nothing moves."""
+        self.write_chain(("cv-draft-en",))
+        stamp = "20260929T000000000000-abcd"
+        elsewhere = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (elsewhere / stamp).mkdir()
+        (elsewhere / stamp / "cv-draft-en.json").write_text("{}")
+        folder = self.root / self.job
+        (folder / "cv-draft-en.json").unlink()  # as if moved into a history that is elsewhere
+        link(folder / "history", elsewhere, stamp)
+        journal = {"step": "cv-draft-en", "history": stamp, "moved": ["cv-draft-en.json"],
+                   "sha256": hashlib.sha256(b"new").hexdigest(), "started_at": "2026-09-29T00:00:00+00:00"}
+        (folder / "change-in-progress.json").write_text(json.dumps(journal), encoding="utf-8")
+        self.assertEqual(Workspace(self.root).recover(), [{"job_id": self.job, "step": "unknown"}])
+        self.assertEqual(sorted(path.name for path in (elsewhere / stamp).iterdir()), ["cv-draft-en.json"])
+        self.assertFalse((folder / "cv-draft-en.json").exists())
+
+    def test_a_history_folder_that_is_a_link_is_left_alone(self):
+        self.assert_nothing_moves_through(lambda history, elsewhere, stamp: history.symlink_to(elsewhere))
+
+    def test_a_change_in_history_that_is_a_link_is_left_alone(self):
+        def link(history, elsewhere, stamp):
+            history.mkdir()
+            (history / stamp).symlink_to(elsewhere / stamp)
+        self.assert_nothing_moves_through(link)
 
     def test_cleaning_up_after_a_crash_touches_only_its_own_temporary_files(self):
         folder = self.root / self.job
