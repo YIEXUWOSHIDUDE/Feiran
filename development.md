@@ -343,6 +343,26 @@ Jev 在这里是**语义判断器**，不是业务决策者。代码继续控制
 
 当前主要限制是“先规则提候选，再让 Jev 判断”：它能帮助识别要求、职责、福利和上下文之间的混淆，却不能发现规则从未提出的原文片段。下一次若要扩展，应先用一组真实但脱敏的 JD 标注“应提取的原文”，比较当前规则与更宽候选生成方案，再决定让 Jev 做过滤还是直接做受约束选择。
 
+## 容器与单用户 AWS 部署（2026-09-28，AWS 计划 PR 1）
+
+目标：在不改变现有工作方式的前提下，在一台 AWS 主机上为单个用户运行现有应用：一个容器、一个进程，SQLite 和岗位文件夹放在一个数据卷上，只能通过 SSM 端口转发访问。不重写、不迁移数据库、不引入新的 agent 架构。
+
+镜像（`Dockerfile`）：基于 `python:3.14-slim-trixie`，面向 linux/amd64，包含 Debian 的 Chromium、Liberation 字体（字宽与 Arial 相同，因此英文简历的排版与 Mac 上一致）、Noto Sans CJK 和 tini（回收 Chromium 的子进程），以 uid 10001 运行。`.dockerignore` 是白名单：只有代码、`web/`、合成示例、`deploy/smoke.py`、`starter_boards.json` 和 `requirements.txt` 会被放入；`.local/`、密钥和本地笔记从不放入。
+
+数据：一个目录（`--data` 或 `WORKBENCH_DATA`，默认 `.local`）存放 `workbench.db`、`listings.db`、`cv-profile.json` 和 `jobs/`；在容器中，它是挂载到 `/data` 的数据卷。准备好的数据卷中有一个空的 `.workbench-data` 文件。使用 `--require-data`（`WORKBENCH_REQUIRE_DATA=1`）时，如果该目录缺失、缺少该文件或不可写，应用会拒绝启动（退出码 2，原因输出到 stderr），因此即使挂载缺失，也不会启动一个空工作台并在其中写入新数据。
+
+网络与日志：在容器内部，应用监听 0.0.0.0:8765，这是 Docker 端口发布所需要的；compose 只把它发布到宿主机的 127.0.0.1:8765。Host 检查与页面令牌保持不变；Host 检查忽略端口，因此到任意本地端口的 SSM 端口转发都能工作。`GET /healthz` 返回 `{"status": "ok"}`，当数据目录不可用时返回 503；它不需要令牌，但仍受 Host 检查，且不返回任何其他信息。Uvicorn 的访问日志关闭，因为它会打印查询字符串，而预览和下载链接会携带页面令牌；应用自己的访问日志只记录请求方法、路径、状态码和耗时（毫秒）。
+
+DeepSeek 密钥：依次从 `DEEPSEEK_API_KEY`、由 `DEEPSEEK_API_KEY_FILE` 指定的文件（compose 把宿主机上的文件作为 secret 挂载到 `/run/secrets/deepseek_api_key`；文件缺失或为空是错误，绝不回退）以及 macOS 上的 Keychain 读取。密钥从不出现在镜像或 compose 的环境变量中。
+
+Chromium 的沙箱：Docker 默认 seccomp 配置阻止了 Chromium 沙箱所依赖的用户命名空间，而 Chromium 在没有沙箱时会拒绝启动（“No usable sandbox!”）。`deploy/seccomp-chromium.json` 是 Docker 29.8.1 的默认配置加上一条允许 `clone` 和 `unshare` 的规则。在自身的用户命名空间之外，容器永远没有 CAP_SYS_ADMIN，因此它仍然无法创建任何其他命名空间；`setns` 和 `mount` 仍被阻止。已拒绝：`--no-sandbox`（那样渲染器里的漏洞一旦被利用，就能以应用的权限访问全部数据）、`--cap-add SYS_ADMIN` 或特权容器（远超所需），以及 Chromium 的 SUID 沙箱辅助程序（它需要 setuid root，而 `no-new-privileges` 会阻止这点）。有一项测试确保 Chrome 命令行上没有任何沙箱标志。在 CI 中（Docker 28.0.4，Ubuntu 24.04，`kernel.apparmor_restrict_unprivileged_userns = 1`），无需改动宿主机即可工作，因为这项限制不作用于受 Docker AppArmor 配置约束的容器进程。
+
+其他容器设置（`compose.yaml`）：只读根文件系统、tmpfs `/tmp`、为 Chromium 提供 256 MB 的 `/dev/shm`、`no-new-privileges`、`restart: unless-stopped`，以及镜像的健康检查。
+
+验证：CI（`.github/workflows/ci.yml`，GitHub Actions，Ubuntu 24.04）在 Linux 上运行所有测试，如果有任何测试被跳过则失败。然后构建镜像；检查其中没有个人或本地内容，并且它以 uid 10001 运行；在镜像内运行测试；检查它在没有标记的目录上拒绝启动；运行 `deploy/smoke.py`（使用合成数据和脚本化的 DeepSeek 替身走完整个工作流，用容器中的 Chromium 打印真实的英文和中文 PDF，并检查其文本、字体和页数）；然后用 compose 启动服务，检查健康检查、Host 与令牌检查、只有回环地址在监听、令牌从不进入日志，以及重新创建的容器仍能找到事实、简历 profile、岗位和批准记录。CI 中从不调用 DeepSeek。容器中打印的中文 PDF 与 Mac 上的进行了目视比较：换行和布局相同。英文简历只嵌入 Liberation Sans；中文简历嵌入 Noto Sans CJK 和 Liberation Sans（Chrome 像 Mac 上的 PingFang 一样，将 Noto Sans CJK 作为 Type3 字体嵌入）。
+
+尚未验证：EC2 主机本身（Amazon Linux 2023、其内核的用户命名空间设置和其 Docker 版本）以及 arm64 镜像。
+
 ## 推荐但尚待确认的选择
 
 - 已接入 Greenhouse、Lever、Ashby。是否再支持 Workday 等大公司常用系统或直接解析单条岗位链接，取决于用户实际关注的公司。
