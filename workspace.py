@@ -36,9 +36,14 @@ NOTES = (*(f"cv-status-{language}" for language in LANGUAGES), "interrupted")
 # did not write is set aside under the second name, for a person to look at.
 JOURNAL = "change-in-progress.json"
 UNREADABLE_JOURNAL = "change-in-progress.unreadable.json"
+INTERRUPTED = "interrupted.json"  # the note a job's page shows about a change a crash cut short
 HISTORY_NAME = re.compile(r"\d{8}T\d{12}-[0-9a-f]{4}")
 # What a change of unknown extent is settled by: the requirements saved again, or a CV started over.
 RESTARTS = ("candidates", "decided", *(f"cv-draft-{language}" for language in LANGUAGES))
+
+
+# The temporary files write_atomically makes; startup deletes leftovers of this exact shape only.
+TEMPORARY = re.compile(r"\.workbench-.+\.[0-9a-f]{8}\.tmp")
 
 
 def _sync_folder(folder: Path) -> None:
@@ -50,10 +55,22 @@ def _sync_folder(folder: Path) -> None:
         os.close(descriptor)
 
 
+def _make_folder(folder: Path) -> None:
+    """Create a folder and its missing parents, each entry flushed into its parent: a new
+    folder's name lives in the folder above it."""
+    missing = []
+    while not folder.exists():
+        missing.append(folder)
+        folder = folder.parent
+    for new in reversed(missing):
+        new.mkdir()
+        _sync_folder(new.parent)
+
+
 def write_atomically(path: Path, data: bytes) -> None:
     """Write all of a file or none of it: a temporary file beside it, flushed to disk, then
     renamed over it. A crash leaves the old file or the new one, never part of one."""
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    temporary = path.with_name(f".workbench-{path.name}.{secrets.token_hex(4)}.tmp")
     try:
         with temporary.open("xb") as output:
             output.write(data)
@@ -67,14 +84,20 @@ def write_atomically(path: Path, data: bytes) -> None:
 
 
 def remove_leftovers(folder: Path) -> None:
-    """Delete the temporary files a crash left behind in a folder (write_atomically's)."""
+    """Delete the temporary files write_atomically left behind when the process died. Only
+    files of its exact name pattern are touched."""
     if folder.is_dir():
-        for stray in folder.glob(".*.tmp"):
-            stray.unlink()
+        for stray in folder.iterdir():
+            if TEMPORARY.fullmatch(stray.name) and stray.is_file() and not stray.is_symlink():
+                stray.unlink()
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _note_bytes(data: dict[str, Any]) -> bytes:
+    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
 class WorkspaceError(Exception):
@@ -140,7 +163,7 @@ class Workspace:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         job_id = f"{stamp}-{secrets.token_hex(3)}"
         with self.lock:
-            (self.root / job_id).mkdir(parents=True)
+            _make_folder(self.root / job_id)
             try:
                 self.write(job_id, "input", review_input)
             except Exception:
@@ -172,11 +195,12 @@ class Workspace:
 
     def _replace_step_locked(self, job_id: str, step: str, data: bytes) -> None:
         """Move the step and every step derived from it into history, then write the new file.
-        The journal names what moved: an error undoes the change at once, a crash at the next
-        start (recover)."""
+        The journal, flushed first, names what will move: an error undoes the change at once,
+        a crash at the next start (recover). The change is committed once its new file is in
+        place with everything it moved in history."""
         directory = self._job_dir(job_id)
         if (directory / JOURNAL).exists():
-            self._finish(directory)
+            self._finish(directory)  # a change a crash cut short, not recovered yet
         moving = [path for path in (self.path(job_id, later) for later in _later_steps(step)) if path.exists()]
         # Random too, so two changes never share a history folder even if the clock goes back.
         stamp = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{secrets.token_hex(2)}"
@@ -186,49 +210,80 @@ class Workspace:
         try:
             if moving:
                 history = directory / "history" / stamp
-                history.mkdir(parents=True)
+                _make_folder(history)
                 for path in moving:
                     path.rename(history / path.name)
-                _sync_folder(history)
+                _sync_folder(history)  # both sides of each move
+                _sync_folder(directory)
             write_atomically(self.path(job_id, step), data)
         except Exception:
-            self._finish(directory)
+            self._finish(directory, tell=False)  # the page shows the error itself
             raise
+        self._commit(directory, journal)
+
+    def _commit(self, directory: Path, journal: dict[str, Any]) -> None:
+        """The change stands. Redoing a cut-short step, or one it depends on, settles the note
+        about it (the page's own requirement checks do not); then the journal goes."""
+        step = journal["step"]
+        try:
+            cut_short = json.loads((directory / INTERRUPTED).read_text(encoding="utf-8")).get("step")
+        except (OSError, ValueError, AttributeError):
+            cut_short = None
+        if cut_short in _later_steps(step) or (cut_short == "unknown" and step in RESTARTS):
+            (directory / INTERRUPTED).unlink()
+            _sync_folder(directory)
         (directory / JOURNAL).unlink()
         _sync_folder(directory)
-        # Redoing the cut-short step, or one it depends on, settles the note about it; other work
-        # (the page checks requirements by itself) leaves it for the user to read.
-        interrupted = self.read_note(job_id, "interrupted")
-        cut_short = (interrupted or {}).get("step")
-        if interrupted and (cut_short in _later_steps(step) or (cut_short == "unknown" and step in RESTARTS)):
-            self._note_path(job_id, "interrupted").unlink()
 
-    def _finish(self, directory: Path) -> str | None:
-        """Close the change the journal describes. If its new file was written in full, it stands
-        (None). Otherwise what it moved goes back, only into places now empty, since the files
-        it moved are exactly the ones missing, and the step is returned. A journal this code did
-        not write is set aside with nothing moved ("unknown"). Nothing is written here but files
-        put back, so this can never approve a CV or confirm anything."""
+    def _set_aside(self, directory: Path, tell: bool) -> str:
+        """A journal that cannot be trusted, or a moved file found in neither place: nothing
+        more is moved, the journal is kept aside for a person to look at, the job is marked."""
+        if tell:
+            write_atomically(directory / INTERRUPTED, _note_bytes({"step": "unknown", "undone_at": _now()}))
+        (directory / JOURNAL).rename(directory / UNREADABLE_JOURNAL)
+        _sync_folder(directory)
+        return "unknown"
+
+    def _finish(self, directory: Path, tell: bool = True) -> str | None:
+        """Close the change the journal describes: commit it (None) if its new file is complete
+        and all it moved is in history; otherwise put every moved file back and return the step.
+        Rolling back never overwrites and can itself be cut short and resumed. With tell, the
+        job is marked interrupted before the journal goes, so a crash cannot lose the note.
+        Nothing is written here but files put back and the note, so this can never approve a CV
+        or confirm anything."""
         journal = _read_journal(directory)
-        if journal is None:
-            (directory / JOURNAL).rename(directory / UNREADABLE_JOURNAL)
-            remove_leftovers(directory)
-            _sync_folder(directory)
-            return "unknown"
+        if journal is None or (directory / "history").is_symlink():
+            return self._set_aside(directory, tell)
         target = directory / _file_name(journal["step"])
-        finished = target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == journal["sha256"]
-        if not finished and journal["history"]:
-            history = directory / "history" / journal["history"]
-            for name in journal["moved"]:
-                if (history / name).exists() and not (directory / name).exists():
-                    (history / name).rename(directory / name)
+        history = directory / "history" / journal["history"] if journal["history"] else None
+        if history is not None and history.is_symlink():
+            return self._set_aside(directory, tell)
+        moved = journal["moved"]
+        if (target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == journal["sha256"]
+                and all((history / name).exists() for name in moved)):
+            self._commit(directory, journal)
+            return None
+        for name in moved:
+            if (directory / name).exists():
+                continue  # never moved, or put back already
+            if history is None or not (history / name).exists():
+                return self._set_aside(directory, tell)
+            (history / name).rename(directory / name)
+        if history is not None:
+            if history.is_dir():  # a resumed rollback may have removed it already
+                _sync_folder(history)
             for folder in (history, history.parent):  # history/ too, if this change made it
                 if folder.is_dir() and not any(folder.iterdir()):
                     folder.rmdir()
+                    _sync_folder(folder.parent)
         remove_leftovers(directory)
+        _sync_folder(directory)
+        creation = journal["step"] == "input"  # the job itself was being made: there is no job to mark
+        if tell and not creation:
+            write_atomically(directory / INTERRUPTED, _note_bytes({"step": journal["step"], "undone_at": _now()}))
         (directory / JOURNAL).unlink()
         _sync_folder(directory)
-        return None if finished else journal["step"]
+        return journal["step"]
 
     def recover(self) -> list[dict[str, str]]:
         with self.lock:
@@ -236,7 +291,7 @@ class Workspace:
 
     def _recover_locked(self) -> list[dict[str, str]]:
         """At start, close every change a crash cut short, and say which were undone. A job so
-        marked tells the page (the interrupted note) until the next change to it."""
+        marked tells the page (the interrupted note) until the step is done again."""
         undone: list[dict[str, str]] = []
         if not self.root.is_dir():
             return undone
@@ -245,12 +300,12 @@ class Workspace:
                 continue
             if (directory / JOURNAL).exists():
                 step = self._finish(directory)
-                if step and any(directory.iterdir()):
-                    self.write_note(directory.name, "interrupted", {"step": step, "undone_at": _now()})
+                if step and step != "input":
                     undone.append({"job_id": directory.name, "step": step})
             remove_leftovers(directory)
             if not any(directory.iterdir()):
                 directory.rmdir()  # a job whose creation was cut short before it held anything
+                _sync_folder(directory.parent)
         return undone
 
     def write(self, job_id: str, step: str, data: dict[str, Any]) -> None:
@@ -267,8 +322,7 @@ class Workspace:
 
     def write_note(self, job_id: str, name: str, data: dict[str, Any]) -> None:
         with self.lock:
-            write_atomically(self._note_path(job_id, name),
-                             (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+            write_atomically(self._note_path(job_id, name), _note_bytes(data))
 
     def read_note(self, job_id: str, name: str) -> dict[str, Any] | None:
         with self.lock:

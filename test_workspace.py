@@ -1,19 +1,22 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import workspace as workspace_module
 from workspace import Workspace, WorkspaceError
 
 
 class Crash(BaseException):
-    """Stands in for the process dying: nothing after it runs, not even error handling."""
+    """Stands in for the process dying in the web tests; the tests here kill a real process."""
 
 
 def crash_when_writing(name, written=False):
-    """Kill the process as the file ``name`` is renamed into place: before the rename, or, with
+    """Raise Crash as the file ``name`` is renamed into place: before the rename, or, with
     ``written``, just after it."""
     real = os.replace
 
@@ -26,6 +29,78 @@ def crash_when_writing(name, written=False):
             real(source, destination)
 
     return patch("workspace.os.replace", replace)
+
+
+REPO = Path(__file__).resolve().parent
+PROCESS_DIES = 9
+
+
+def dies_before_renaming_into(name):
+    return f"""
+def replace(source, destination):
+    if Path(destination).name == {name!r}:
+        os._exit({PROCESS_DIES})
+    real_replace(source, destination)
+os.replace = replace
+"""
+
+
+def dies_after_renaming_into(name):
+    return f"""
+def replace(source, destination):
+    real_replace(source, destination)
+    if Path(destination).name == {name!r}:
+        os._exit({PROCESS_DIES})
+os.replace = replace
+"""
+
+
+def dies_moving(name, times=1):
+    """Dies as ``name`` is moved (its ``times``-th move from anywhere, counting all moves)."""
+    return f"""
+moves = []
+def rename(source, target):
+    moves.append(source.name)
+    if source.name == {name!r} and moves.count({name!r}) == {times}:
+        os._exit({PROCESS_DIES})
+    return real_rename(source, target)
+Path.rename = rename
+"""
+
+
+def dies_halfway_through_writing(prefix):
+    return f"""
+class Half:
+    def __init__(self, handle):
+        self.handle = handle
+    def __enter__(self):
+        return self
+    def __exit__(self, *exception):
+        self.handle.close()
+    def write(self, data):
+        self.handle.write(data[: len(data) // 2])
+        self.handle.flush()
+        os._exit({PROCESS_DIES})
+def opener(path, mode="r", *args, **kwargs):
+    handle = real_open(path, mode, *args, **kwargs)
+    return Half(handle) if path.name.startswith({prefix!r}) else handle
+Path.open = opener
+"""
+
+
+def die_while(root, action, crash_point):
+    """Run ``action`` against the workspace in a new process that dies at ``crash_point`` the way
+    a killed process does: no finally, no except, no temporary file removed."""
+    code = "\n".join([
+        "import os, sys", "from pathlib import Path", f"sys.path.insert(0, {str(REPO)!r})",
+        "import workspace as module", f"workspace = module.Workspace(Path({str(root)!r}))",
+        "real_replace, real_rename, real_open = os.replace, Path.rename, Path.open",
+        crash_point, action,
+    ])
+    result = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True,
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    if result.returncode != PROCESS_DIES:
+        raise AssertionError(f"the process did not die where planned ({result.returncode}): {result.stderr[-800:]}")
 
 
 INPUT = {
@@ -98,45 +173,213 @@ class WorkspaceTests(unittest.TestCase):
     def files(self):
         return sorted(str(path.relative_to(self.root / self.job)) for path in (self.root / self.job).rglob("*"))
 
+    def files(self):
+        return sorted(str(path.relative_to(self.root / self.job)) for path in (self.root / self.job).rglob("*"))
+
+    def write_chain(self, steps=("cv-draft-en", "cv-tailored-en", "cv-planned-en")):
+        for step in steps:
+            self.workspace.write(self.job, step, {"version": 1, "step": step})
+
+    def read_chain(self, workspace, steps=("cv-draft-en", "cv-tailored-en", "cv-planned-en")):
+        return [workspace.read(self.job, step) for step in steps]
+
     def test_a_step_cut_short_by_a_crash_is_undone_at_the_next_start(self):
-        for step in ("decided", "cv-draft-en", "cv-planned-en"):
-            self.workspace.write(self.job, step, {"version": 1})
+        self.write_chain(("decided", "cv-draft-en", "cv-tailored-en", "cv-planned-en"))
         before = self.files()
-        with crash_when_writing("cv-draft-en.json"), self.assertRaises(Crash):
-            self.workspace.write(self.job, "cv-draft-en", {"version": 2})
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {{'version': 2}})",
+                  dies_before_renaming_into("cv-draft-en.json"))
+        self.assertIn("change-in-progress.json", self.files())  # what a killed process leaves
         restarted = Workspace(self.root)  # the next start
         self.assertEqual(restarted.recover(), [{"job_id": self.job, "step": "cv-draft-en"}])
-        self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 1})
-        self.assertEqual(restarted.read(self.job, "cv-planned-en"), {"version": 1})
+        self.assertEqual(self.read_chain(restarted), [{"version": 1, "step": step}
+                                                      for step in ("cv-draft-en", "cv-tailored-en", "cv-planned-en")])
         self.assertEqual(restarted.read_note(self.job, "interrupted")["step"], "cv-draft-en")
-        self.assertEqual(self.files(), sorted(before + ["interrupted.json"]))  # nothing half-done is left
+        self.assertEqual(self.files(), sorted(before + ["interrupted.json"]))  # its temporary file is gone too
         restarted.write(self.job, "gaps", {"version": 1})  # other work keeps the note for the page
         self.assertEqual(restarted.read_note(self.job, "interrupted")["step"], "cv-draft-en")
         restarted.write(self.job, "decided", {"version": 2})  # redoing what it depends on clears it
         self.assertIsNone(restarted.read_note(self.job, "interrupted"))
 
     def test_a_crash_while_moving_the_old_steps_aside_is_undone(self):
-        for step in ("cv-draft-en", "cv-tailored-en", "cv-planned-en"):
-            self.workspace.write(self.job, step, {"version": 1})
+        self.write_chain()
         before = self.files()
-        real = Path.rename
-
-        def rename(source, target):
-            if source.name == "cv-planned-en.json":  # the draft and its rewording are already aside
-                raise Crash()
-            return real(source, target)
-
-        with patch.object(Path, "rename", rename), self.assertRaises(Crash):
-            self.workspace.write(self.job, "cv-draft-en", {"version": 2})
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {{'version': 2}})",
+                  dies_moving("cv-planned-en.json"))  # the draft and its rewording are aside already
         restarted = Workspace(self.root)
         self.assertEqual(restarted.recover(), [{"job_id": self.job, "step": "cv-draft-en"}])
-        self.assertEqual([restarted.read(self.job, step) for step in ("cv-draft-en", "cv-tailored-en", "cv-planned-en")],
-                         [{"version": 1}] * 3)
+        self.assertEqual(self.read_chain(restarted), [{"version": 1, "step": step}
+                                                      for step in ("cv-draft-en", "cv-tailored-en", "cv-planned-en")])
         self.assertEqual(self.files(), sorted(before + ["interrupted.json"]))
 
+    def test_a_crash_while_the_new_file_is_half_written_leaves_the_old_one(self):
+        self.write_chain(("cv-draft-en",))
+        before = self.files()
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {{'version': 2}})",
+                  dies_halfway_through_writing(".workbench-cv-draft-en.json."))
+        self.assertTrue(any(name.startswith(".workbench-cv-draft-en.json.") for name in self.files()))
+        restarted = Workspace(self.root)
+        restarted.recover()
+        self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 1, "step": "cv-draft-en"})
+        self.assertEqual(self.files(), sorted(before + ["interrupted.json"]))
+
+    def test_a_step_written_in_full_before_a_crash_stands(self):
+        self.write_chain(("cv-draft-en", "cv-planned-en"))
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {{'version': 2}})",
+                  dies_after_renaming_into("cv-draft-en.json"))
+        restarted = Workspace(self.root)
+        self.assertEqual(restarted.recover(), [])
+        self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 2})
+        self.assertIsNone(restarted.read(self.job, "cv-planned-en"))  # moved to history, as the change meant
+        self.assertIsNone(restarted.read_note(self.job, "interrupted"))
+        self.assertNotIn("change-in-progress.json", self.files())
+
+    def test_a_rollback_cut_short_is_finished_at_the_next_start(self):
+        # Rewriting a step with the very same bytes, cut short, then a crash while putting the old
+        # files back: the next start must finish putting them back, not take the change as done.
+        self.write_chain(("cv-draft-en", "cv-tailored-en", "cv-planned-en", "cv-approved-en"))
+        before = self.files()
+        same = {"version": 1, "step": "cv-draft-en"}
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {same!r})",
+                  dies_before_renaming_into("cv-draft-en.json"))
+        die_while(self.root, "workspace.recover()", dies_moving("cv-tailored-en.json"))  # draft back, rewording not
+        restarted = Workspace(self.root)
+        restarted.recover()
+        chain = ("cv-draft-en", "cv-tailored-en", "cv-planned-en", "cv-approved-en")
+        self.assertEqual(self.read_chain(restarted, chain), [{"version": 1, "step": step} for step in chain])
+        self.assertEqual(self.files(), sorted(before + ["interrupted.json"]))
+
+    def test_the_note_is_not_lost_to_a_crash_right_after_it_is_written(self):
+        self.write_chain()
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {{'version': 2}})",
+                  dies_before_renaming_into("cv-draft-en.json"))
+        die_while(self.root, "workspace.recover()", dies_after_renaming_into("interrupted.json"))
+        restarted = Workspace(self.root)
+        restarted.recover()
+        self.assertEqual(restarted.read_note(self.job, "interrupted")["step"], "cv-draft-en")
+        self.assertNotIn("change-in-progress.json", self.files())
+
+    def test_a_retry_that_lands_just_before_a_crash_settles_the_old_note(self):
+        self.write_chain()
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {{'version': 2}})",
+                  dies_before_renaming_into("cv-draft-en.json"))
+        Workspace(self.root).recover()  # marked interrupted
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {{'version': 3}})",
+                  dies_after_renaming_into("cv-draft-en.json"))  # the retry is in place, then the crash
+        restarted = Workspace(self.root)
+        self.assertEqual(restarted.recover(), [])
+        self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 3})
+        self.assertIsNone(restarted.read_note(self.job, "interrupted"))
+
+    def record_disk_operations(self):
+        """Patches that log each folder flush, move, placement, removal and new folder, by name."""
+        events = []
+        real_sync, real_rename, real_replace = workspace_module._sync_folder, Path.rename, os.replace
+        real_unlink, real_mkdir = Path.unlink, Path.mkdir
+
+        def sync(folder):
+            events.append(("flush", Path(folder).name))
+            real_sync(folder)
+
+        def rename(source, target):
+            events.append(("move", source.name))
+            return real_rename(source, target)
+
+        def replace(source, destination):
+            events.append(("place", Path(destination).name))
+            real_replace(source, destination)
+
+        def unlink(path, missing_ok=False):
+            events.append(("remove", path.name))
+            return real_unlink(path, missing_ok=missing_ok)
+
+        def mkdir(path, *args, **kwargs):
+            events.append(("make", path.name))
+            return real_mkdir(path, *args, **kwargs)
+
+        patches = [patch("workspace._sync_folder", sync), patch.object(Path, "rename", rename),
+                   patch("workspace.os.replace", replace), patch.object(Path, "unlink", unlink),
+                   patch.object(Path, "mkdir", mkdir)]
+        return events, patches
+
+    def assert_before(self, events, earlier, later):
+        """The first ``later`` event comes after an ``earlier`` one."""
+        self.assertIn(earlier, events)
+        self.assertIn(later, events)
+        self.assertLess(events.index(earlier), events.index(later), events)
+
+    def test_each_phase_of_a_change_is_on_disk_before_the_next_begins(self):
+        self.write_chain()
+        events, patches = self.record_disk_operations()
+        for active in patches:
+            active.start()
+        try:
+            self.workspace.write(self.job, "cv-draft-en", {"version": 2})
+        finally:
+            for active in patches:
+                active.stop()
+        (stamp,) = [folder.name for folder in (self.root / self.job / "history").iterdir()]
+        moves = [index for index, event in enumerate(events) if event[0] == "move"]
+        placed, removed = events.index(("place", "cv-draft-en.json")), events.index(("remove", "change-in-progress.json"))
+        flushes = lambda name: [index for index, event in enumerate(events) if event == ("flush", name)]
+        # The journal, and the new history folder's name in its parent, are on disk before anything moves.
+        self.assertTrue(any(events.index(("place", "change-in-progress.json")) < index < moves[0] for index in flushes(self.job)))
+        self.assertTrue(any(events.index(("make", stamp)) < index < moves[0] for index in flushes("history")))
+        # Both sides of the moves are on disk before the new file is placed.
+        self.assertTrue(any(moves[-1] < index < placed for index in flushes(stamp)))
+        self.assertTrue(any(moves[-1] < index < placed for index in flushes(self.job)))
+        # The new file is on disk before the journal goes, and the journal's removal is flushed too.
+        self.assertTrue(any(placed < index < removed for index in flushes(self.job)))
+        self.assertEqual(events[-1], ("flush", self.job))
+
+    def test_each_phase_of_undoing_a_change_is_on_disk_before_the_next_begins(self):
+        self.write_chain(("gaps",))
+        self.write_chain(("gaps",))  # an earlier change's history stays, so history/ itself is not removed
+        self.write_chain()
+        die_while(self.root, f"workspace.write({self.job!r}, 'cv-draft-en', {{'version': 2}})",
+                  dies_before_renaming_into("cv-draft-en.json"))
+        events, patches = self.record_disk_operations()
+        for active in patches:
+            active.start()
+        try:
+            Workspace(self.root).recover()
+        finally:
+            for active in patches:
+                active.stop()
+        moves = [index for index, event in enumerate(events) if event[0] == "move"]
+        noted, removed = events.index(("place", "interrupted.json")), events.index(("remove", "change-in-progress.json"))
+        flushes = [index for index, event in enumerate(events) if event == ("flush", self.job)]
+        self.assertEqual(len(moves), 3)
+        # Everything is back and on disk before the note, and the note is on disk before the journal goes.
+        self.assertTrue(any(moves[-1] < index < noted for index in flushes))
+        self.assertTrue(any(noted < index < removed for index in flushes))
+        self.assertEqual(events[-1], ("flush", self.job))
+
+    def test_a_step_that_cannot_be_written_leaves_the_job_as_it_was(self):
+        self.write_chain(("cv-draft-en", "cv-planned-en"))
+        before = self.files()
+        real = os.replace
+
+        def disk_full(source, destination):
+            if Path(destination).name == "cv-draft-en.json":
+                raise OSError(28, "No space left on device")
+            real(source, destination)
+
+        with patch("workspace.os.replace", disk_full), self.assertRaises(OSError):
+            self.workspace.write(self.job, "cv-draft-en", {"version": 2})
+        self.assertEqual(self.read_chain(self.workspace, ("cv-draft-en", "cv-planned-en")),
+                         [{"version": 1, "step": "cv-draft-en"}, {"version": 1, "step": "cv-planned-en"}])
+        self.assertEqual(self.files(), before)  # no note: the page already showed the error
+        self.assertEqual(Workspace(self.root).recover(), [])
+
+    def test_a_job_whose_creation_was_cut_short_disappears(self):
+        die_while(self.root, "workspace.create_job({'jd': {'text': 'x'}})", dies_before_renaming_into("input.json"))
+        restarted = Workspace(self.root)
+        restarted.recover()
+        self.assertEqual([job["job_id"] for job in restarted.jobs()], [self.job])
+
     def test_recovery_never_puts_a_file_back_over_one_that_is_there(self):
-        # Two changes stamped alike (a clock set back) share a history folder; undoing the one
-        # that moved nothing must not bring back the other one's old files.
+        # Two changes stamped alike share a history folder; undoing the one that moved nothing
+        # must not bring back the other one's old file.
         self.workspace.write(self.job, "cv-draft-en", {"version": 1})
         self.workspace.write(self.job, "cv-draft-en", {"version": 2})  # version 1 goes to history
         (stamp,) = [folder.name for folder in (self.root / self.job / "history").iterdir()]
@@ -146,9 +389,19 @@ class WorkspaceTests(unittest.TestCase):
         Workspace(self.root).recover()
         self.assertEqual(self.workspace.read(self.job, "cv-draft-en"), {"version": 2})
 
+    def test_a_moved_file_found_nowhere_stops_recovery_for_that_job(self):
+        self.write_chain(("cv-draft-en",))
+        journal = {"step": "cv-draft-en", "history": "20260929T000000000000-abcd", "moved": ["cv-planned-en.json"],
+                   "sha256": "0" * 64, "started_at": "2026-09-29T00:00:00+00:00"}
+        (self.root / self.job / "change-in-progress.json").write_text(json.dumps(journal), encoding="utf-8")
+        before = self.files()
+        restarted = Workspace(self.root)
+        self.assertEqual(restarted.recover(), [{"job_id": self.job, "step": "unknown"}])
+        self.assertEqual(self.files(), sorted([name for name in before if name != "change-in-progress.json"]
+                                              + ["change-in-progress.unreadable.json", "interrupted.json"]))
+
     def test_a_journal_that_cannot_be_read_neither_stops_the_start_nor_moves_anything(self):
-        for step in ("cv-draft-en", "cv-planned-en"):
-            self.workspace.write(self.job, step, {"version": 1})
+        self.write_chain(("cv-draft-en", "cv-planned-en"))
         before = self.files()
         (self.root / self.job / "change-in-progress.json").write_text('{"step": "../../x", "moved": ["../../y"]}')
         restarted = Workspace(self.root)
@@ -160,74 +413,14 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 2})
         self.assertIsNone(restarted.read_note(self.job, "interrupted"))
 
-    def test_a_crash_while_the_new_file_is_half_written_leaves_the_old_one(self):
-        self.workspace.write(self.job, "cv-draft-en", {"version": 1})
-        before = self.files()
-        real_open = Path.open
-
-        class HalfWriter:
-            def __init__(self, handle):
-                self.handle = handle
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exception):
-                self.handle.close()
-
-            def write(self, data):
-                self.handle.write(data[: len(data) // 2])
-                raise Crash()
-
-        def half_open(path, mode="r", *args, **kwargs):
-            handle = real_open(path, mode, *args, **kwargs)
-            return HalfWriter(handle) if path.name.startswith(".cv-draft-en.json.") else handle
-
-        with patch.object(Path, "open", half_open), self.assertRaises(Crash):
-            self.workspace.write(self.job, "cv-draft-en", {"version": 2})
-        # What a real crash would also leave: the half-written temporary file.
-        (self.root / self.job / ".cv-draft-en.json.0badc0de.tmp").write_text('{"vers')
-        restarted = Workspace(self.root)
-        restarted.recover()
-        self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 1})
-        self.assertEqual(self.files(), sorted(before + ["interrupted.json"]))
-
-    def test_a_step_written_in_full_before_a_crash_stands(self):
-        for step in ("cv-draft-en", "cv-planned-en"):
-            self.workspace.write(self.job, step, {"version": 1})
-        with crash_when_writing("cv-draft-en.json", written=True), self.assertRaises(Crash):
-            self.workspace.write(self.job, "cv-draft-en", {"version": 2})
-        restarted = Workspace(self.root)
-        self.assertEqual(restarted.recover(), [])
-        self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 2})
-        self.assertIsNone(restarted.read(self.job, "cv-planned-en"))  # moved to history, as the change meant
-        self.assertIsNone(restarted.read_note(self.job, "interrupted"))
-        self.assertNotIn("change-in-progress.json", self.files())
-
-    def test_a_step_that_cannot_be_written_leaves_the_job_as_it_was(self):
-        for step in ("cv-draft-en", "cv-planned-en"):
-            self.workspace.write(self.job, step, {"version": 1})
-        before = self.files()
-        real = os.replace
-
-        def disk_full(source, destination):
-            if Path(destination).name == "cv-draft-en.json":
-                raise OSError(28, "No space left on device")
-            real(source, destination)
-
-        with patch("workspace.os.replace", disk_full), self.assertRaises(OSError):
-            self.workspace.write(self.job, "cv-draft-en", {"version": 2})
-        self.assertEqual(self.workspace.read(self.job, "cv-draft-en"), {"version": 1})
-        self.assertEqual(self.workspace.read(self.job, "cv-planned-en"), {"version": 1})
-        self.assertEqual(self.files(), before)
-        self.assertEqual(Workspace(self.root).recover(), [])
-
-    def test_a_job_whose_creation_was_cut_short_disappears(self):
-        with crash_when_writing("input.json"), self.assertRaises(Crash):
-            self.workspace.create_job(INPUT)
-        restarted = Workspace(self.root)
-        restarted.recover()
-        self.assertEqual([job["job_id"] for job in restarted.jobs()], [self.job])
+    def test_cleaning_up_after_a_crash_touches_only_its_own_temporary_files(self):
+        folder = self.root / self.job
+        (folder / ".workbench-cv-draft-en.json.0badc0de.tmp").write_text("{")  # one of ours
+        (folder / ".editor.tmp").write_text("someone else's")
+        (folder / ".workbench-notes.json.0badc0de.tmp").mkdir()  # a folder, whatever its name
+        Workspace(self.root).recover()
+        self.assertEqual(sorted(path.name for path in folder.iterdir() if path.name.startswith(".")),
+                         [".editor.tmp", ".workbench-notes.json.0badc0de.tmp"])
 
     def test_job_ids_and_step_names_cannot_leave_the_workspace(self):
         for job_id, step in (("../outside", "input"), (self.job, "../input"), (self.job, "notes")):
