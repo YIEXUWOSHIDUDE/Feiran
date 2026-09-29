@@ -1,0 +1,25 @@
+# On the EC2 host, on top of compose.yaml (systemd runs this; see host/workbench.service):
+#
+#   docker compose -f compose.yaml -f deploy/aws/compose.aws.yaml up
+#
+# The image is the released one, by digest. Docker never restarts or starts the container by
+# itself: at boot it would do so before the data volume is mounted, so systemd starts it after
+# the mount and restarts it if it stops. The app refuses to start unless the data folder is the
+# prepared volume. Logs (one JSON object per line, never CV text, keys or tokens) go to
+# CloudWatch without ever holding the app up: if CloudWatch is slow, lines wait in a 4 MB buffer
+# and are dropped beyond it.
+services:
+  workbench:
+    image: ${WORKBENCH_IMAGE:?set WORKBENCH_IMAGE to the released image, by digest}
+    restart: "no"
+    environment:
+      WORKBENCH_REQUIRE_DATA: "1"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION:?set AWS_REGION}
+        awslogs-group: ${LOG_GROUP:?set LOG_GROUP}
+        awslogs-create-group: "false"
+        mode: non-blocking
+        max-buffer-size: 4m
+        tag: workbench

@@ -11,8 +11,9 @@ synthetic examples. Each PDF is checked for its text, its fonts and its page cou
 checks that what `create` left is all still there and still consistent.
 
 It only ever runs on a throwaway folder: `create` refuses a folder that already holds anything
-but the data-volume marker, and `verify` refuses one that `create` did not make, so real facts
-are never confirmed or replaced by a smoke run.
+but the data-volume marker and what the workbench leaves when it starts on no data (the list of
+companies to follow, an empty folder for notices), and `verify` refuses one that `create` did not
+make, so real facts are never confirmed or replaced by a smoke run.
 """
 
 import argparse
@@ -128,8 +129,17 @@ def check(condition: bool, what: str) -> None:
         raise SystemExit(1)
 
 
+def _left_by_an_empty_start(item: Path) -> bool:
+    """What the workbench makes when it starts on no data: the list of companies to follow (no
+    facts, CV or jobs) and an empty folder for notices."""
+    if item.name == "listings.db":
+        return item.is_file()
+    return item.name == "unfinished" and item.is_dir() and not any(item.iterdir())
+
+
 def create(data: Path, out: Path) -> None:
-    held = sorted(item.name for item in data.iterdir() if item.name != DATA_MARKER) if data.is_dir() else []
+    held = sorted(item.name for item in data.iterdir()
+                  if item.name != DATA_MARKER and not _left_by_an_empty_start(item)) if data.is_dir() else []
     if held:
         raise SystemExit(f"REFUSED: {data} already holds {', '.join(held)}. The smoke run uploads a CV and "
                          "confirms facts, so it runs only on an empty throwaway folder, never on real data.")

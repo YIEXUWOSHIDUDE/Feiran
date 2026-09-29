@@ -1,0 +1,25 @@
+[Unit]
+Description=Job Fit Workbench (container; reached only through a Session Manager port forward)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/workbench/env
+EnvironmentFile=/etc/workbench/release
+WorkingDirectory=/opt/workbench/current
+# At every start: the data volume itself is mounted (never formatted), or nothing starts.
+ExecStartPre=/opt/workbench/current/deploy/aws/host/mount-data.sh ${DATA_DEVICE} ${DATA_MOUNT}
+ExecStartPre=/opt/workbench/current/deploy/aws/host/fetch-secret.sh
+# In the foreground, so systemd sees the container stop and starts it again; Docker's own restart
+# policy would start it at boot before the data volume is mounted.
+ExecStart=/usr/bin/docker compose -f compose.yaml -f deploy/aws/compose.aws.yaml up --no-build --pull never --exit-code-from workbench
+ExecStop=/usr/bin/docker compose -f compose.yaml -f deploy/aws/compose.aws.yaml down
+Restart=on-failure
+RestartSec=10
+# The data volume can take up to two minutes to appear after boot.
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

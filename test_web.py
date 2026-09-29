@@ -1510,6 +1510,20 @@ class SmokeRunTests(unittest.TestCase):
             self.assertEqual([item.name for item in data.iterdir()], ["workbench.db"])
             self.assertEqual({fact["status"] for fact in list_facts(data / "workbench.db")}, {"pending"})
 
+    def test_it_runs_where_the_workbench_has_only_started_on_no_data(self):
+        # As on the EC2 host after the first install: the company list and an empty notices folder.
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            (data / self.smoke.DATA_MARKER).write_text("", encoding="utf-8")
+            create_app(facts_db=data / "workbench.db", jobs_root=data / "jobs", profile_path=data / "cv-profile.json")
+            self.assertEqual(sorted(item.name for item in data.iterdir()), [".workbench-data", "listings.db", "unfinished"])
+            with patch.object(self.smoke, "client_for", side_effect=RuntimeError("past the check")):
+                with self.assertRaisesRegex(RuntimeError, "past the check"):
+                    self.smoke.create(data, data / "smoke")
+                (data / "unfinished" / "0123456789abcdef.json").write_text("{}", encoding="utf-8")  # a notice: real use
+                with self.assertRaisesRegex(SystemExit, "REFUSED"):
+                    self.smoke.create(data, data / "smoke")
+
 
 if __name__ == "__main__":
     unittest.main()

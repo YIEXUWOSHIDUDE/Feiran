@@ -1,0 +1,8 @@
+[Unit]
+Description=Report the workbench's health and the age of its last backup to CloudWatch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/workbench/current/deploy/aws/host/report-health.sh

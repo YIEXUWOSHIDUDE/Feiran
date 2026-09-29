@@ -160,8 +160,9 @@ FIELD_NAMES = {"title": "name", "subtitle": "role or degree", "location": "locat
 # What each kind of failure means and what to do about it. The page never quotes DeepSeek's raw
 # error, so neither a key nor response text can reach it.
 REASONS = {
-    "missing_key": "No DeepSeek API key was found. Add it to the Keychain (service deepseek-api-key) "
-                   "or set DEEPSEEK_API_KEY, then try again.",
+    "missing_key": "No DeepSeek API key was found. Add it to the Keychain (service deepseek-api-key), "
+                   "set DEEPSEEK_API_KEY, or on a server put it in the file DEEPSEEK_API_KEY_FILE names "
+                   "(on AWS: the Secrets Manager secret the stack names), then try again.",
     "key_rejected": "DeepSeek refused the API key. Check or replace the key, then try again.",
     "rate_limited": "DeepSeek is busy right now. Try again in a minute.",
     "unreachable": "DeepSeek could not be reached. Check the internet connection, then try again.",

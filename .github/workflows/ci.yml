@@ -29,6 +29,18 @@ jobs:
           # Web and PDF tests skip themselves when a package is missing; here everything is installed.
           if grep -E "\.\.\. skipped" test-output.txt; then echo "::error::Tests were skipped (listed above)"; exit 1; fi
 
+  host:
+    name: EC2 host files
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: The shell scripts pass shellcheck
+        run: shellcheck deploy/aws/host/*.sh deploy/aws/*.sh
+      - name: The host scripts do what they say (aws, docker, systemctl and curl stubbed)
+        run: deploy/aws/test-host-scripts.sh
+      - name: The data volume is formatted only on purpose and mounted only when it holds the data (loop devices)
+        run: deploy/aws/test-mount-data.sh
+
   container:
     name: Container (linux/amd64)
     runs-on: ubuntu-24.04
@@ -46,8 +58,9 @@ jobs:
           sysctl user.max_user_namespaces kernel.apparmor_restrict_unprivileged_userns || true
       - name: Build the image for linux/amd64
         run: |
-          docker build --platform linux/amd64 -t "$WORKBENCH_IMAGE" .
+          docker build --platform linux/amd64 --build-arg REVISION="$GITHUB_SHA" -t "$WORKBENCH_IMAGE" .
           test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$WORKBENCH_IMAGE")" = linux/amd64
+          test "$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$WORKBENCH_IMAGE")" = "$GITHUB_SHA"
       - name: Nothing personal or local is in the image, and it runs as its own user
         run: |
           docker run --rm --entrypoint sh "$WORKBENCH_IMAGE" -c 'ls -A /app'
