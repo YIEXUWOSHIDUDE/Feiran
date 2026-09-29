@@ -593,9 +593,10 @@ function cvBlock(view, language, refresh) {
   const cv = view.cv[language];
   const title = CV_TITLES[language];
   // A failed retry still records why; refresh either way so the page shows it.
-  const post = (action) => async () => {
+  const post = (action, body) => async () => {
     try {
-      await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`, { method: "POST" });
+      await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`,
+        body ? { method: "POST", body: JSON.stringify(body) } : { method: "POST" });
     } finally {
       await refresh();
     }
@@ -646,7 +647,9 @@ function cvBlock(view, language, refresh) {
   }
   let approval = null;
   if (!approved) {
-    const approve = actionButton("Approve this CV", post("approve"));
+    // Only the CV shown below can be approved: if another tab changed it since, the server
+    // refuses and the page shows the current one to read again.
+    const approve = actionButton("Approve this CV", post("approve", { expected_content_sha256: cv.content_sha256 }));
     approve.disabled = true;
     const read = el("input", { type: "checkbox" });
     read.addEventListener("change", () => { approve.disabled = !read.checked; });
@@ -655,7 +658,7 @@ function cvBlock(view, language, refresh) {
   }
   const preview = el("iframe", {
     class: "preview", sandbox: "", title: `${title} preview`,
-    src: `/preview/${view.job_id}/${language}?token=${encodeURIComponent(TOKEN)}&v=${Date.now()}`,
+    src: `/preview/${view.job_id}/${language}?token=${encodeURIComponent(TOKEN)}&v=${encodeURIComponent(cv.content_sha256)}`,
   });
   return el("div", { class: "cv-block" }, el("h3", {}, title), el("div", { class: "toolbar" }, tools), notes, approval, preview);
 }

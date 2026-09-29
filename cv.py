@@ -575,7 +575,9 @@ def _count_pages(data: bytes) -> int | None:
     return count or None
 
 
-def _content_hash(draft: dict[str, Any]) -> str:
+def content_fingerprint(draft: dict[str, Any]) -> str:
+    """What a CV says, as one hash: the page shows it with the CV, and an approval is only for
+    the CV that still has it. The approval stamp itself is not part of it."""
     content = {key: value for key, value in draft.items() if key != "approval"}
     return _profile_hash(content)
 
@@ -589,7 +591,7 @@ def approve_draft(draft: Any, facts_db: Path) -> dict[str, Any]:
     approved["approval"] = {
         "approval_version": APPROVAL_VERSION,
         "approved_at": datetime.now(timezone.utc).isoformat(),
-        "content_sha256": _content_hash(draft),
+        "content_sha256": content_fingerprint(draft),
     }
     return approved
 
@@ -602,7 +604,7 @@ def is_final_approval(draft: dict[str, Any]) -> bool:
     if (not isinstance(approval, dict) or approval.get("approval_version") != APPROVAL_VERSION
             or not isinstance(approval.get("content_sha256"), str)):
         raise CVError("批准记录结构无效")
-    if approval["content_sha256"] != _content_hash(draft):
+    if approval["content_sha256"] != content_fingerprint(draft):
         raise CVError("批准后内容已改变；请重新生成草稿并重新批准")
     return True
 

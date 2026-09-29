@@ -6,6 +6,7 @@ so other websites open in the browser cannot read facts or trigger DeepSeek call
 """
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -13,7 +14,6 @@ import re
 import secrets
 import sys
 import tempfile
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +29,7 @@ from cv import (
     CVError,
     approve_draft,
     build_draft,
+    content_fingerprint,
     export_pdf,
     is_final_approval,
     print_with_chrome,
@@ -84,6 +85,11 @@ access_log = logging.getLogger("workbench.access")
 CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by", "extraction_method")
 CV_LANGUAGES = ("en", "zh")
 QUERY_TOKEN_PATHS = ("/preview/", "/download/")
+READ_ONLY_METHODS = ("GET", "HEAD", "OPTIONS")
+# How long a change waits for the one before it (DeepSeek can take a minute) before the page is
+# told to try again.
+CHANGE_WAIT_SECONDS = 90
+BUSY = "Another change is still being made (DeepSeek can take a minute). Try again in a moment."
 UPLOAD_KEEP_SECONDS = 24 * 3600
 
 
@@ -137,6 +143,9 @@ STAGES = ("draft", "rewording", "layout")
 STAGE_FAILED = {"draft": "Not prepared", "rewording": "Not reworded", "layout": "Not adjusted for this job"}
 STAGE_KEPT = {"rewording": "Your confirmed wording is used.", "layout": "Your usual layout is used."}
 STAGE_KEPT_EARLIER = {"rewording": "The earlier rewording below is kept.", "layout": "The earlier adjusted layout below is kept."}
+CV_CHANGED = "This CV changed after the page showed it (another tab or window changed it). Read it again below, then approve."
+PREVIEW_CHANGED = ("<!doctype html><meta charset=\"utf-8\"><p>This CV changed after the page showed it. "
+                   "Reload the page to read the current version.</p>")
 
 
 def _reason(exc: Exception) -> str:
@@ -221,6 +230,12 @@ class WriteLineRequest(BaseModel):
 class ChangeRequest(BaseModel):
     change_id: str
     undone: bool = True
+
+
+class ApproveRequest(BaseModel):
+    """The fingerprint of the CV the page showed; only that CV can be approved."""
+
+    expected_content_sha256: str
 
 
 class ContactLink(BaseModel):
@@ -331,8 +346,24 @@ def create_app(
     # Next to the fact store by default, so tests with a temporary fact store stay temporary too.
     listings_db = Path(listings_db or Path(facts_db).parent / "listings.db")
     initialize(listings_db, load_starter() if starter is None else starter)
-    start_lock = threading.Lock()
+    changes = asyncio.Lock()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    # Declared first, so it runs inside the host and token check below.
+    @app.middleware("http")
+    async def one_change_at_a_time(request: Request, call_next):
+        """Requests that change data run one at a time, so two tabs or a double click never
+        write one job's files at the same moment. Reading never waits."""
+        if request.method in READ_ONLY_METHODS:
+            return await call_next(request)
+        try:
+            await asyncio.wait_for(changes.acquire(), CHANGE_WAIT_SECONDS)
+        except TimeoutError:
+            return JSONResponse({"error": BUSY}, status_code=409)
+        try:
+            return await call_next(request)
+        finally:
+            changes.release()
 
     @app.middleware("http")
     async def local_only(request: Request, call_next):
@@ -450,6 +481,7 @@ def create_app(
         head_step, head = cv_head(job_id, language)
         view: dict = {
             "head": head_step,
+            "content_sha256": content_fingerprint(head) if head else None,
             "final_pdf": workspace.path(job_id, f"cv-final-{language}").exists(),
         }
         draft = workspace.read(job_id, f"cv-draft-{language}")
@@ -758,15 +790,15 @@ def create_app(
 
     @app.post("/api/listings/start")
     def start_listing(request: StartListingRequest) -> dict:
-        # One job per posting: a second click, even a concurrent one, opens the first job.
-        with start_lock:
-            listing = get_listing(listings_db, request.provider, request.board, request.job_id)
-            existing = started_jobs().get(listing["source"])
-            if existing:
-                return {"job_id": existing, "existing": True}
-            selected = selected_posting(request.board, request.job_id, request.provider)
-            selected["jd"]["company"] = selected["jd"].get("company") or listing["company"]
-            return {"job_id": create_prepared_job(prepare_review_input(selected)), "existing": False}
+        # One job per posting: a second click opens the first job. A concurrent one waits for the
+        # first to finish (changes run one at a time), then finds it.
+        listing = get_listing(listings_db, request.provider, request.board, request.job_id)
+        existing = started_jobs().get(listing["source"])
+        if existing:
+            return {"job_id": existing, "existing": True}
+        selected = selected_posting(request.board, request.job_id, request.provider)
+        selected["jd"]["company"] = selected["jd"].get("company") or listing["company"]
+        return {"job_id": create_prepared_job(prepare_review_input(selected)), "existing": False}
 
     @app.get("/api/jobs")
     def jobs() -> dict:
@@ -914,14 +946,17 @@ def create_app(
         workspace.write(job_id, f"cv-planned-{language}", set_change(planned, request.change_id, request.undone))
         return job_view(job_id)
 
-    @app.post("/api/jobs/{job_id}/cv/{language}/approve")
-    def cv_approve(job_id: str, language: str) -> dict:
+    @app.post("/api/jobs/{job_id}/cv/{language}/approve", response_model=None)
+    def cv_approve(job_id: str, language: str, request: ApproveRequest) -> dict | JSONResponse:
+        """Approve exactly the CV the page showed. If another tab changed it since, nothing is
+        approved; a second click on the same CV approves nothing new."""
         head_step, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先生成简历草稿")
-        if head_step == "approved":
-            raise CVError("这份简历已经批准；如需修改请重新生成草稿")
-        workspace.write(job_id, f"cv-approved-{language}", approve_draft(head, facts_db))
+        if content_fingerprint(head) != request.expected_content_sha256:
+            return JSONResponse({"error": CV_CHANGED}, status_code=409)
+        if head_step != "approved":
+            workspace.write(job_id, f"cv-approved-{language}", approve_draft(head, facts_db))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/cv/{language}/export")
@@ -934,11 +969,15 @@ def create_app(
         workspace.write_bytes(job_id, f"cv-final-{language}", data)
         return job_view(job_id)
 
-    @app.get("/preview/{job_id}/{language}", response_class=HTMLResponse)
-    def cv_preview(job_id: str, language: str) -> str:
+    @app.get("/preview/{job_id}/{language}", response_class=HTMLResponse, response_model=None)
+    def cv_preview(job_id: str, language: str, v: str = "") -> str | HTMLResponse:
+        """The CV as it will print. The page asks for the version it holds (v, its fingerprint),
+        so the frame never shows a newer CV than the changes and the Approve button beside it."""
         head_step, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先生成简历草稿")
+        if v and v != content_fingerprint(head):
+            return HTMLResponse(PREVIEW_CHANGED, status_code=409)
         try:
             final = head_step == "approved" and is_final_approval(head)
         except CVError:

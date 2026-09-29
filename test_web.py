@@ -3,7 +3,10 @@ import io
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -48,6 +51,7 @@ class FakeDeepSeek(FakeChat):
         self.evidence = None
         self.cv_structure = None
         self.tailor_error = None
+        self.while_planning = None  # runs while DeepSeek "adjusts" a CV, to hold a request open
         self.sent = []
         self.systems = []
 
@@ -75,6 +79,8 @@ class FakeDeepSeek(FakeChat):
         if messages[0]["content"] == MATCH_RULES or (messages[0]["content"] == PLAN_RULES and self.plan is None):
             raise DeepSeekError("测试中不联网", reason="unreachable")
         if messages[0]["content"] == PLAN_RULES:
+            if self.while_planning:
+                self.while_planning()
             return {"model": "deepseek-flash", "content": resume_ids(self.plan, json.loads(messages[-1]["content"])),
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
         if messages[0]["content"] != FIND_RULES:
@@ -108,6 +114,7 @@ class WebTests(unittest.TestCase):
             profile_path=profile, chat=self.chat, printer=FakePrinter(),
             starter=[], boards=self.boards, selected_posting=self.read_posting,
         )
+        self.app = app
         self.client = TestClient(app, base_url="http://127.0.0.1:8765")
         self.headers = {"X-Workbench-Token": TOKEN}
 
@@ -433,8 +440,8 @@ class WebTests(unittest.TestCase):
         # A Chinese posting gets its Chinese CV at once; the English one comes on request.
         self.assertEqual((view["language"], view["cv"]["zh"]["head"], view["cv"]["en"]["head"]), ("zh", "tailored", None))
         prepared = self.cv_step(job_id, "prepare")
-        preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}")
-        approved = self.cv_step(job_id, "approve")
+        preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}&v={prepared['content_sha256']}")
+        approved = self.approve(job_id, prepared["content_sha256"]).json()["cv"]["en"]
         final = self.cv_step(job_id, "export")
         download = self.client.get(f"/download/{job_id}/en.pdf?token={TOKEN}")
         self.assertEqual(prepared["head"], "tailored")  # planning is offline in these tests
@@ -550,6 +557,107 @@ class WebTests(unittest.TestCase):
         # Talking points are optional extra reading: making them leaves the CV alone.
         self.assertEqual(talking.status_code, 200, talking.text)
         self.assertIn("cv-planned-en", talking.json()["steps"])
+
+    def planned_job(self):
+        """A job whose English CV is adjusted for it, with one cut line that can be put back."""
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.chat.plan = {
+            "sections": ["education", "skills", "experience"],
+            "entries": [{"entry": "s1e0", "lines": ["fact-intern-tests"]}],
+            "reasons": [{"target": "fact-intern-api", "reason": "REST APIs are not asked for."}],
+        }
+        return self.client.post(
+            "/api/jobs", json={"title": "Test Engineer", "text": "Requirements:\n- Writing unit tests"}, headers=self.headers,
+        ).json()["job_id"]
+
+    def approve(self, job_id, fingerprint, language="en"):
+        return self.client.post(f"/api/jobs/{job_id}/cv/{language}/approve",
+                                json={"expected_content_sha256": fingerprint}, headers=self.headers)
+
+    def put_back_the_cut_line(self, job_id):
+        self.client.post(f"/api/jobs/{job_id}/cv/en/change",
+                         json={"change_id": "cut:fact-intern-api", "undone": True}, headers=self.headers)
+
+    def test_approving_approves_only_the_cv_the_page_showed(self):
+        job_id = self.planned_job()
+        shown = self.job(job_id)["cv"]["en"]["content_sha256"]  # tab A shows the CV
+        self.put_back_the_cut_line(job_id)  # meanwhile tab B changes it
+        stale = self.approve(job_id, shown)  # tab A approves what it showed
+        unnamed = self.client.post(f"/api/jobs/{job_id}/cv/en/approve", headers=self.headers)
+        now = self.job(job_id)["cv"]["en"]
+        self.assertEqual(stale.status_code, 409)
+        self.assertIn("changed", stale.json()["error"])
+        self.assertEqual(unnamed.status_code, 422)  # an approval must say which CV it is for
+        self.assertEqual(now["head"], "planned")
+        self.assertNotEqual(now["content_sha256"], shown)
+        approved = self.approve(job_id, now["content_sha256"])  # after reading it again
+        self.assertEqual(approved.json()["cv"]["en"]["head"], "approved")
+
+    def test_a_second_click_on_approve_changes_nothing(self):
+        job_id = self.planned_job()
+        shown = self.job(job_id)["cv"]["en"]["content_sha256"]
+        first, second = self.approve(job_id, shown), self.approve(job_id, shown)
+        self.assertEqual((first.status_code, second.status_code), (200, 200), second.text)
+        self.assertEqual(second.json()["cv"]["en"]["approved_at"], first.json()["cv"]["en"]["approved_at"])
+        self.assertEqual(second.json()["cv"]["en"]["content_sha256"], shown)
+
+    def test_the_preview_shows_only_the_cv_the_page_holds(self):
+        job_id = self.planned_job()
+        shown = self.job(job_id)["cv"]["en"]["content_sha256"]
+        current = self.client.get(f"/preview/{job_id}/en?token={TOKEN}&v={shown}")
+        self.put_back_the_cut_line(job_id)
+        stale = self.client.get(f"/preview/{job_id}/en?token={TOKEN}&v={shown}")
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(stale.status_code, 409)
+        self.assertIn("changed", stale.text)
+        self.assertNotIn("REST APIs", stale.text)  # the newer CV is not shown in its place
+
+    def test_changes_from_two_tabs_run_one_at_a_time(self):
+        # While DeepSeek adjusts the CV for one tab, a change from another waits for it to finish,
+        # so two requests never write one job's files at the same moment.
+        job_id = self.planned_job()
+        inside, most, entered, release = [0], [0], threading.Event(), threading.Event()
+
+        def adjusting():
+            inside[0] += 1
+            most[0] = max(most[0], inside[0])
+            entered.set()
+            release.wait(5)
+            inside[0] -= 1
+
+        self.chat.while_planning = adjusting
+        plan = f"/api/jobs/{job_id}/cv/en/plan"
+        with TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(2) as pool:
+            first = pool.submit(client.post, plan, headers=self.headers)
+            self.assertTrue(entered.wait(5))
+            second = pool.submit(client.post, plan, headers=self.headers)
+            time.sleep(0.3)  # time enough for the second to start adjusting too, if nothing held it back
+            release.set()
+            replies = [first.result(10), second.result(10)]
+        self.assertEqual([reply.status_code for reply in replies], [200, 200])
+        self.assertEqual(most[0], 1)
+
+    def test_a_change_that_waits_too_long_is_told_to_try_again(self):
+        job_id = self.planned_job()
+        entered, release = threading.Event(), threading.Event()
+        self.chat.while_planning = lambda: (entered.set(), release.wait(5))
+        with patch("web.CHANGE_WAIT_SECONDS", 0.05), \
+                TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(1) as pool:
+            slow = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+            self.assertTrue(entered.wait(5))
+            waited = client.post(f"/api/jobs/{job_id}/cv/en/change",
+                                 json={"change_id": "cut:fact-intern-api", "undone": True}, headers=self.headers)
+            page = client.get(f"/api/jobs/{job_id}", headers=self.headers)  # reading never waits
+            stranger = client.post(f"/api/jobs/{job_id}/cv/en/change", json={"change_id": "cut:fact-intern-api"})
+            release.set()
+            self.assertEqual(slow.result(10).status_code, 200)
+        self.assertEqual(waited.status_code, 409)
+        self.assertIn("Try again", waited.json()["error"])
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(stranger.status_code, 403)  # turned away before it could wait for, or hold up, a change
+        cut = next(item for item in self.job(job_id)["cv"]["en"]["changes"] if item["id"] == "cut:fact-intern-api")
+        self.assertFalse(cut["undone"])  # the refused change was not made
 
     def test_nothing_found_leaves_the_requirements_step_to_the_user_and_can_be_retried(self):
         import_facts(self.database, FACTS)
