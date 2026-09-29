@@ -34,7 +34,7 @@ from typing import Any
 
 from cv import CVError, is_final_approval, verify_draft
 from facts import FactStoreError, list_facts
-from workspace import JOB_ID, JOURNAL, STEP_FILES, TEMPORARY, write_atomically
+from workspace import DATA_FORMAT, JOB_ID, JOURNAL, STEP_FILES, TEMPORARY, write_atomically
 
 
 FORMAT = "workbench-backup-1"
@@ -101,7 +101,7 @@ def create_backup(data: Path, archive: Path, revision: str | None = None) -> dic
         checked = verify_data(staging)
         entries = [{"path": str(relative), "bytes": (staging / relative).stat().st_size,
                     "sha256": _sha256((staging / relative).read_bytes())} for relative in _kept(staging)]
-        manifest = {"format": FORMAT, "created_at": datetime.now(timezone.utc).isoformat(),
+        manifest = {"format": FORMAT, "data_format": DATA_FORMAT, "created_at": datetime.now(timezone.utc).isoformat(),
                     "revision": revision or "unknown", "counts": checked["counts"], "problems": checked["problems"],
                     "files": entries}
         packed = io.BytesIO()
@@ -123,6 +123,10 @@ def _read_manifest(tar: tarfile.TarFile) -> dict[str, dict[str, Any]]:
         raise BackupError("the archive has no readable manifest") from exc
     if not isinstance(manifest, dict) or manifest.get("format") != FORMAT or not isinstance(manifest.get("files"), list):
         raise BackupError("the archive is not a workbench backup this version can read")
+    made_by = manifest.get("data_format", 1)  # backups from before the number existed are format 1
+    if not isinstance(made_by, int) or made_by > DATA_FORMAT:
+        raise BackupError(f"the archive holds data in format {made_by}, which this release (format {DATA_FORMAT}) "
+                          "cannot read; restore it with the release that made it, or a later one")
     return {entry["path"]: entry for entry in manifest["files"]}
 
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import workspace as workspace_module
-from workspace import Workspace, WorkspaceError
+from workspace import DATA_FORMAT, DATA_FORMAT_FILE, DataFormatError, Workspace, WorkspaceError, claim_data_format
 
 
 REPO = Path(__file__).resolve().parent
@@ -466,6 +466,37 @@ class WorkspaceTests(unittest.TestCase):
             with self.subTest(job_id=job_id, step=step):
                 with self.assertRaises(WorkspaceError):
                     self.workspace.read(job_id, step)
+
+
+class DataFormatTests(unittest.TestCase):
+    """The data folder records the newest format a release has stored it in, so it travels with
+    the data (and its backups), and no older release opens it afterwards."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.folder = Path(self.directory.name)
+        self.record = self.folder / DATA_FORMAT_FILE
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_a_start_records_the_format_it_stores_data_in(self):
+        claim_data_format(self.folder)
+        self.assertEqual(self.record.read_text(encoding="utf-8"), f"{DATA_FORMAT}\n")
+        claim_data_format(self.folder)  # and again, changing nothing
+        self.assertEqual(self.record.read_text(encoding="utf-8"), f"{DATA_FORMAT}\n")
+
+    def test_data_in_a_newer_format_is_refused_and_left_as_it_is(self):
+        self.record.write_text(f"{DATA_FORMAT + 1}\n", encoding="utf-8")
+        with self.assertRaisesRegex(DataFormatError, f"format {DATA_FORMAT + 1}"):
+            claim_data_format(self.folder)
+        self.assertEqual(self.record.read_text(encoding="utf-8"), f"{DATA_FORMAT + 1}\n")
+
+    def test_a_record_that_cannot_be_read_is_refused(self):
+        self.record.write_text("two", encoding="utf-8")
+        with self.assertRaises(DataFormatError):
+            claim_data_format(self.folder)
+        self.assertEqual(self.record.read_text(encoding="utf-8"), "two")
 
 
 if __name__ == "__main__":

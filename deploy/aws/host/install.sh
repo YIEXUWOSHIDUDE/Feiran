@@ -1,13 +1,29 @@
 #!/bin/bash
 # Install a release of the workbench on the EC2 host: its image, by digest, and the host files
 # that came in it (compose files, seccomp profile, these scripts, the systemd units), so the host
-# always runs what was tested with that image. The data volume is never touched. A release's
-# files, once installed, are never changed: installing it again reuses them. Installs, backups
-# and restores run one at a time. The first install also makes the first backup, so the backup
-# alarm starts from a real one.
+# always runs what was tested with that image. A release's files, once installed, are never
+# changed: installing it again reuses them. Installs, backups and restores run one at a time.
+#
+# A release must be able to read the data: its data format (workspace.DATA_FORMAT) may not be
+# older than the one the data folder records (.workbench-format, which each start of the app
+# writes, so it goes with the data and its backups). A release that raises the format needs a
+# backup from the last hour, and is never undone automatically: once it has started, the data may
+# be in a format the release before cannot read.
+#
+# Before switching, with the workbench stopped so the data cannot change in between, the new
+# release's own read-only check of the data (backup.py verify) may find no problem that the last
+# good release's check does not; otherwise nothing is switched and the workbench starts again as
+# it was. After switching, the release must start and answer within two minutes; otherwise the
+# last good release (the last one that passed, never one an install was cut short on) is
+# installed again. The first install also makes the first backup, so the backup alarm starts from
+# a real one.
 #
 #   install.sh <registry/repository@sha256:...>     (workbench-release pulls the image first)
 set -euo pipefail
+set -a
+# shellcheck source=/dev/null
+. "${WORKBENCH_ENV:-/etc/workbench/env}"
+set +a
 
 image=${1:?usage: install.sh <image@sha256:...>}
 [[ "$image" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] \
@@ -16,10 +32,58 @@ home=${WORKBENCH_HOME:-/opt/workbench}
 release_env=${WORKBENCH_RELEASE_ENV:-/etc/workbench/release}
 units=${SYSTEMD_DIR:-/etc/systemd/system}
 state=${WORKBENCH_STATE:-/var/lib/workbench}
+rolling_back=${WORKBENCH_ROLLING_BACK:-0}
 digest=${image##*@sha256:}
 release=$home/releases/${digest:0:12}
-exec 9> "$state/data.lock"
+# Going back to the last good release runs inside the install that failed, which already holds
+# the lock through this same open file; any other install opens the file and waits for the lock.
+[ "$rolling_back" = 1 ] || exec 9> "$state/data.lock"
 flock -w "${LOCK_WAIT_SECONDS:-900}" 9 || { echo "refused: a backup, a restore or another install is still running" >&2; exit 1; }
+good=$(cat "$state/good-release" 2> /dev/null || true)
+previous=$good
+[ "$previous" != "$image" ] || previous=""  # the good release again: nothing to go back to
+
+format=$(docker run --rm --network none --entrypoint python "$image" -c 'import workspace; print(workspace.DATA_FORMAT)')
+recorded=$(cat "$WORKBENCH_DATA_DIR/.workbench-format" 2> /dev/null || echo 0)
+[[ "$format" =~ ^[0-9]+$ ]] || { echo "refused: $image does not say its data format" >&2; exit 1; }
+[[ "$recorded" =~ ^[0-9]+$ ]] || { echo "refused: the data's record of its format cannot be read" >&2; exit 1; }
+if [ "$format" -lt "$recorded" ]; then
+    echo "refused: $image stores data in format $format, but the data is in format $recorded;" \
+        "to go back before that change, restore a backup made before it" >&2
+    exit 1
+fi
+raises_format=0
+if [ "$format" -gt "$recorded" ] && [ "$recorded" -gt 0 ]; then
+    raises_format=1
+    if [ -z "$(find "$state/last-backup" -mmin -60 2> /dev/null)" ]; then
+        echo "refused: $image changes the data's format from $recorded to $format. Make a backup first" \
+            "(systemctl start workbench-backup) and install it within the hour; going back means restoring that backup" >&2
+        exit 1
+    fi
+fi
+
+problems_found_by() {  # what release $1 finds wrong with the data (read-only), one per line, sorted
+    local report
+    report=$(docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
+        -v "$WORKBENCH_DATA_DIR:/data:ro" "$1" python backup.py verify --data /data) || [ $? = 1 ]
+    printf '%s' "$report" | python3 -c 'import json, sys; print("\n".join(sorted(json.load(sys.stdin)["problems"])))'
+}
+refuse_and_go_back() {  # once switched: install the last good release again, when that is safe
+    echo "refused: $image $1" >&2
+    if [ "$rolling_back" = 0 ] && [ "$raises_format" = 1 ]; then
+        echo "not going back automatically: $image may already hold the data in format $format, which the" \
+            "release before cannot read. Stop the workbench (systemctl stop workbench), restore the backup made" \
+            "before this install (restore.sh backups/<its name>), then install ${previous:-the release before}." >&2
+    elif [ "$rolling_back" = 0 ] && [ -n "$previous" ]; then
+        echo "installing the last good release again: $previous" >&2
+        WORKBENCH_ROLLING_BACK=1 "$0" "$previous" >&2 || echo "the release before could not be installed either" >&2
+    fi
+    exit 1
+}
+remember() {  # write a file whole: a line naming a release
+    printf '%s\n' "$2" > "$1.new"
+    mv -f "$1.new" "$1"
+}
 
 revision=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")
 if [ ! -d "$release" ]; then
@@ -34,21 +98,47 @@ if [ ! -d "$release" ]; then
     mv -T "$release.new" "$release"
 fi
 
+if [ "$rolling_back" = 0 ]; then
+    case "$(systemctl is-active workbench.service || true)" in
+        active | activating | reloading) was_running=1 ;;
+        *) was_running=0 ;;
+    esac
+    start_as_it_was() { if [ "$was_running" = 1 ]; then systemctl start workbench.service || true; fi; }
+    systemctl stop workbench.service 2> /dev/null || true  # there is no unit yet before the first install
+    known=""
+    if [ -n "$previous" ]; then known=$(problems_found_by "$previous" 2> /dev/null || true); fi
+    if ! found=$(problems_found_by "$image"); then
+        start_as_it_was
+        echo "refused: $image could not check the data; nothing was changed" >&2
+        exit 1
+    fi
+    new=$(LC_ALL=C comm -13 <(printf '%s\n' "$known" | sed '/^$/d') <(printf '%s\n' "$found" | sed '/^$/d'))
+    if [ -n "$new" ]; then
+        start_as_it_was
+        echo "refused: $image finds problems in the data that the last good release does not: $new; nothing was changed" >&2
+        exit 1
+    fi
+fi
+
 install -m 0644 "$release"/deploy/aws/host/*.service "$release"/deploy/aws/host/*.timer "$units/"
 ln -sfn "$home/current/release.env" "$release_env.new"  # the running release's, whichever it is
 mv -T "$release_env.new" "$release_env"
 ln -sfn "$release" "$home/current.new"
 mv -T "$home/current.new" "$home/current"
 
-systemctl daemon-reload
-systemctl enable workbench.service workbench-backup.timer workbench-health.timer
-systemctl restart workbench.service
+{ systemctl daemon-reload && systemctl enable workbench.service workbench-backup.timer workbench-health.timer \
+    && systemctl restart workbench.service; } || refuse_and_go_back "could not be started; see: journalctl -u workbench"
 healthy=0
 for _ in $(seq "${HEALTH_WAIT_ATTEMPTS:-60}"); do
     if curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:8765/healthz; then healthy=1; break; fi
     sleep "${HEALTH_WAIT_SECONDS:-2}"
 done
-[ "$healthy" = 1 ] || { echo "refused: $image did not become healthy; see: journalctl -u workbench" >&2; exit 1; }
+[ "$healthy" = 1 ] || refuse_and_go_back "did not become healthy; see: journalctl -u workbench"
+
+if [ "$image" != "$good" ]; then  # it passed: now the last good release, and the one before it kept
+    if [ -n "$good" ]; then remember "$state/good-release-before" "$good"; fi
+    remember "$state/good-release" "$image"
+fi
 systemctl start workbench-health.timer workbench-backup.timer
 flock -u 9  # the first backup takes the lock itself
 [ -e "$state/last-backup" ] || systemctl start workbench-backup.service

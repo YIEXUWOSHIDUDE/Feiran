@@ -12,7 +12,7 @@ from cv import approve_draft, build_draft
 from facts import confirm_facts, list_facts, revise_fact
 from listings import initialize
 from test_cv import PROFILE, make_store
-from workspace import Workspace
+from workspace import DATA_FORMAT, Workspace
 
 
 INPUT = {"jd": {"text": "Requirements:\n- Python", "title": "Backend Intern", "company": "Example Co",
@@ -73,7 +73,7 @@ class BackupTests(unittest.TestCase):
         report = verify_data(restored)
         self.assertEqual(report["problems"], [])
         self.assertEqual(report["counts"], {"facts": 4, "confirmed": 4, "jobs": 1, "approved": 1, "final_pdfs": 1})
-        self.assertEqual((made["revision"], made["counts"]), ("abc123", report["counts"]))
+        self.assertEqual((made["revision"], made["counts"], made["data_format"]), ("abc123", report["counts"], DATA_FORMAT))
         self.assertEqual(list_facts(restored / "workbench.db"), list_facts(self.data / "workbench.db"))
         kept = [name for name in files(self.data) if not name.startswith(("cv-uploads", ".workbench-cv-profile"))]
         self.assertEqual(files(restored), kept)
@@ -106,6 +106,15 @@ class BackupTests(unittest.TestCase):
         with self.assertRaisesRegex(BackupError, "does not match"):
             restore_backup(self.archive, self.root / "restored")
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["backups", "data"])
+
+    def test_an_archive_in_a_newer_data_format_is_refused(self):
+        # Made by a release that stores data in a way this one cannot read.
+        create_backup(self.data, self.archive)
+        self.archive.write_bytes(repacked(self.archive, lambda name, data: json.dumps(
+            {**json.loads(data), "data_format": DATA_FORMAT + 1}).encode("utf-8") if name == "manifest.json" else data))
+        with self.assertRaisesRegex(BackupError, "cannot read"):
+            restore_backup(self.archive, self.root / "restored")
+        self.assertFalse((self.root / "restored").exists())
 
     def test_an_archive_missing_a_file_it_lists_is_refused(self):
         create_backup(self.data, self.archive)

@@ -20,6 +20,14 @@ from typing import Any
 
 
 DEFAULT_ROOT = Path(".local/jobs")
+# How the data folder stores things, as a whole: the facts database, the CV profile, the job
+# steps and their notes. A release that stores data so an earlier release could not read it any
+# more raises this number. Each start records it in the data folder (claim_data_format), so no
+# older release opens the data afterwards, wherever the data goes; the EC2 host refuses such a
+# release before installing it (deploy/aws/host/install.sh); a backup is restored only by a
+# release that can read it.
+DATA_FORMAT = 1
+DATA_FORMAT_FILE = ".workbench-format"
 JOB_STEPS = ("input", "candidates", "decided")
 # Optional extras derived from the requirements; the CV does not depend on them. Talking points
 # (matches, linked) and gaps can be redone without touching the CV.
@@ -108,6 +116,29 @@ def _note_bytes(data: dict[str, Any]) -> bytes:
 
 class WorkspaceError(Exception):
     """A job or step name is invalid, or the requested step cannot be stored."""
+
+
+class DataFormatError(WorkspaceError):
+    """The data folder is in a format this release may not read, or its record of it is unreadable."""
+
+
+def claim_data_format(folder: Path) -> None:
+    """Refuse data a newer release has stored in a format this one may not read; otherwise
+    record this release's format in the data folder before anything uses the data. A release that
+    changes how data is stored must raise DATA_FORMAT, and so be recorded before it changes anything."""
+    record = Path(folder) / DATA_FORMAT_FILE
+    try:
+        recorded = int(record.read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        recorded = 0
+    except (OSError, ValueError) as exc:
+        raise DataFormatError(f"{DATA_FORMAT_FILE} cannot be read, so the data's format is unknown") from exc
+    if recorded > DATA_FORMAT:
+        raise DataFormatError(f"the data is in format {recorded}, newer than this release's format {DATA_FORMAT}; "
+                              "install a release that can read it")
+    if recorded < DATA_FORMAT:
+        make_folder(Path(folder))
+        write_atomically(record, f"{DATA_FORMAT}\n".encode("utf-8"))
 
 
 def _file_name(step: str) -> str:
