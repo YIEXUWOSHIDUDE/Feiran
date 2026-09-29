@@ -80,6 +80,16 @@ jobs:
         run: docker compose run --rm --no-deps workbench python deploy/smoke.py create --data /data --out /data/smoke
       - name: A new container finds everything the last one left
         run: docker compose run --rm --no-deps workbench python deploy/smoke.py verify --data /data
+      - name: A backup restores into an empty folder that the workbench can use
+        run: |
+          mkdir -p backups restored
+          sudo chown 10001:10001 backups restored
+          docker compose run --rm --no-deps -v "$PWD/backups:/backups" workbench \
+            python backup.py create --data /data --out /backups/ci.tar.gz --revision "$GITHUB_SHA"
+          docker compose run --rm --no-deps -v "$PWD/backups:/backups" -v "$PWD/restored:/restored" workbench \
+            python backup.py restore --archive /backups/ci.tar.gz --into /restored/data
+          docker compose run --rm --no-deps -v "$PWD/restored:/restored" workbench python backup.py verify --data /restored/data
+          WORKBENCH_DATA_DIR="$PWD/restored/data" docker compose run --rm --no-deps workbench python deploy/smoke.py verify --data /data
       - name: Served on the loopback only, behind the host and token checks; recreated, the data stays
         run: |
           healthy() {

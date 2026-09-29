@@ -530,7 +530,7 @@ def _line_supported(line: dict[str, Any], fact: dict[str, Any], vocabulary: list
     return False
 
 
-def _verify_draft(draft: Any, facts_db: Path) -> dict[str, dict[str, Any]]:
+def verify_draft(draft: Any, facts_db: Path) -> dict[str, dict[str, Any]]:
     """Every line must still rest on the current confirmed version of its fact.
 
     Returns those current facts, keyed by ID, for callers that need their tags.
@@ -586,7 +586,7 @@ def approve_draft(draft: Any, facts_db: Path) -> dict[str, Any]:
     """Stamp a verified draft with the fingerprint of exactly what the user reviewed."""
     if isinstance(draft, dict) and "approval" in draft:
         raise CVError("这个文件已经批准过；如内容需要修改，请重新生成草稿再批准")
-    _verify_draft(draft, facts_db)
+    verify_draft(draft, facts_db)
     approved = copy.deepcopy(draft)
     approved["approval"] = {
         "approval_version": APPROVAL_VERSION,
@@ -620,7 +620,7 @@ def export_pdf(
 
     Only an approved draft whose content is unchanged prints without the watermark.
     """
-    _verify_draft(draft, facts_db)
+    verify_draft(draft, facts_db)
     final = is_final_approval(draft)
     output = Path(output)
     for path in (output, html_output):
@@ -706,7 +706,7 @@ def tailor_draft(
         raise CVError("已批准的文件不能再改写；请从 cv.py draft 生成的原始草稿开始")
     if isinstance(draft, dict) and "tailoring" in draft:
         raise CVError("草稿已经改写过；请从 cv.py draft 生成的原始草稿开始")
-    current = _verify_draft(draft, facts_db)
+    current = verify_draft(draft, facts_db)
     job_summary = _job_summary(job)
     private = sorted({*private_terms(draft), *(private or ())}, key=len, reverse=True)
     sendable = [
