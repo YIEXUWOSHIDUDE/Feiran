@@ -96,6 +96,10 @@ case "$1" in
                 mkdir -p "$into" && echo restored > "$into/facts" ;;
             *" backup.py verify "*) [ "${FAKE_VERIFY_FAILS:-0}" = 0 ] || exit 1 ;;
         esac ;;
+    image)
+        if [ "$2" = ls ] && [ -n "${FAKE_IMAGES:-}" ]; then
+            printf '%s\n' "$FAKE_IMAGES"
+        fi ;;
     create) echo container-1 ;;
     cp) cp -R "$REPO/${2#container-1:/app/}" "$3" ;;
     inspect) echo rev-abc123 ;;
@@ -287,7 +291,11 @@ FAKE_PROBLEMS_a='"jobs/x/gaps.json: not readable"' FAKE_PROBLEMS_b='"jobs/x/gaps
     "$host/install.sh" "$image_b" > /dev/null || fail "a problem both releases find blocked the release"
 [ "$(cat "$work/state/good-release")" = "$image_b" ] || fail "a release that passed is not the last good one"
 [ "$(cat "$work/state/good-release-before")" = "$image" ] || fail "the good release before it was not kept"
-echo "ok   install: checked against unchanging data before switching; the last good release put back when one does not start or answer"
+: > "$calls"
+FAKE_IMAGES="$image"$'\n'"$image_b"$'\n'"$image_c"$'\n''<none>@<none>' "$host/install.sh" "$image_b" > /dev/null
+removed=$(sed -n 's/^docker image rm //p' "$calls")
+[ "$removed" = "$image_c" ] || fail "installing the good release again kept or removed the wrong images: $removed"
+echo "ok   install: checked against unchanging data before switching; the last good release put back when one does not start or answer; its image kept"
 
 # install.sh and the data's format: recorded by the app in the data folder, so it goes with the
 # data; never goes back; a release that raises it needs a fresh backup and is never undone

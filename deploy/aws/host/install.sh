@@ -139,6 +139,13 @@ if [ "$image" != "$good" ]; then  # it passed: now the last good release, and th
     if [ -n "$good" ]; then remember "$state/good-release-before" "$good"; fi
     remember "$state/good-release" "$image"
 fi
+if [ "$rolling_back" = 0 ]; then
+    # This release's image and the good one before it stay (to go back to); older ones are in the registry.
+    kept_before=$(cat "$state/good-release-before" 2> /dev/null || true)
+    docker image ls --digests --format '{{.Repository}}@{{.Digest}}' | while read -r stored; do
+        case "$stored" in "" | "$image" | "$kept_before" | *"<none>"*) ;; *) docker image rm "$stored" > /dev/null || true ;; esac
+    done
+fi
 systemctl start workbench-health.timer workbench-backup.timer
 flock -u 9  # the first backup takes the lock itself
 [ -e "$state/last-backup" ] || systemctl start workbench-backup.service
