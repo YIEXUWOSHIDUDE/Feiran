@@ -960,6 +960,27 @@ def upload_and_save():
         texts = [fact["text"] for fact in list_facts(self.database)]
         self.assertEqual(sorted(texts), sorted(set(texts)))  # nothing added twice
 
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_a_refused_retry_keeps_the_notice_about_the_action_it_repeats(self):
+        self.die_in_app(self.UPLOAD + "upload_and_save()", dies_before_renaming_into("cv-profile.json"))
+        # The same PDF again, refused before anything is written (no name): the notice stays.
+        self.die_in_app(self.UPLOAD + "contact['name'] = ''\nassert upload_and_save().status_code == 400\nos._exit(9)", "")
+        stopped = self.restarted().get("/api/facts", headers=self.headers).json()
+        self.assertEqual([notice["kind"] for notice in stopped["interrupted"]], ["save_cv"])
+
+    def test_a_notice_that_finishes_while_the_page_reads_it_is_not_shown(self):
+        unfinished = self.profile_path.parent / "unfinished"
+        (unfinished / "0123456789abcdef.json").write_text('{"kind": "save_cv"}', encoding="utf-8")
+        real_read = Path.read_text
+
+        def finished(file, *args, **kwargs):
+            if file.parent == unfinished:
+                raise FileNotFoundError(file)  # removed after the folder was listed
+            return real_read(file, *args, **kwargs)
+
+        with patch.object(Path, "read_text", finished):
+            self.assertNotIn("interrupted", self.client.get("/api/facts", headers=self.headers).json())
+
     def test_an_error_partway_through_adding_a_line_leaves_a_notice(self):
         # A storage error after the fact went in: the page shows the error, and the notice
         # stays, since part of the change is done.
@@ -977,7 +998,8 @@ def upload_and_save():
             refused = client.post(f"/api/jobs/{job_id}/gaps/{requirement}/write", headers=self.headers, json=line)
         self.assertEqual(refused.status_code, 500)
         notices = self.job(job_id)["interrupted_operations"]
-        self.assertEqual([(notice["kind"], notice["key"]) for notice in notices], [("add_line", requirement)])
+        self.assertEqual([(notice["kind"], notice["requirement"], notice["line"], notice["language"]) for notice in notices],
+                         [("add_line", "Hands-on Docker and Kubernetes", line["text"], "en")])
 
     def test_adding_a_line_cut_short_after_it_was_recorded_can_be_finished_by_adding_it_again(self):
         job_id, gaps = self.line_job()
@@ -987,7 +1009,7 @@ def upload_and_save():
                         dies_after_renaming_into("gaps.json"))  # the fact, profile and gaps are all in
         client = self.restarted()
         view = client.get(f"/api/jobs/{job_id}", headers=self.headers).json()
-        self.assertEqual([notice["key"] for notice in view["interrupted_operations"]], [requirement])
+        self.assertEqual([notice["line"] for notice in view["interrupted_operations"]], [line["text"]])
         again = client.post(write, headers=self.headers, json=line)
         self.assertEqual(again.status_code, 200, again.text)
         self.assertNotIn("interrupted_operations", again.json())
@@ -1008,8 +1030,9 @@ def upload_and_save():
                 accept = f"/api/jobs/{job_id}/gaps/{requirement}/accept"
                 self.die_in_app(f"client.post({accept!r}, headers=headers)", crash_point)
                 client = self.restarted()
-                self.assertEqual([notice["key"] for notice in client.get(f"/api/jobs/{job_id}", headers=self.headers)
-                                  .json()["interrupted_operations"]], [requirement])
+                self.assertEqual([(notice["requirement"], notice["line"]) for notice in client.get(
+                    f"/api/jobs/{job_id}", headers=self.headers).json()["interrupted_operations"]],
+                                 [("Experience with Go", "Languages: Python, Java, Go")])
                 again = client.post(accept, headers=self.headers)
                 self.assertEqual(again.status_code, 200, again.text)
                 self.assertNotIn("interrupted_operations", again.json())
@@ -1018,14 +1041,16 @@ def upload_and_save():
                                  [("Languages: Python, Java, Go", "confirmed")])
 
     def test_an_action_that_finished_just_before_a_crash_leaves_no_notice(self):
+        # The line is in; the process dies preparing the CV again, which is not part of adding it.
         job_id, gaps = self.line_job()
         requirement, line = self.own_line(gaps)
         write = f"/api/jobs/{job_id}/gaps/{requirement}/write"
         self.die_in_app(f"client.post({write!r}, headers=headers, json={line!r})",
-                        dies_after_renaming_into("operation-in-progress.json", times=2))  # its "done" is on disk
+                        dies_before_renaming_into("cv-draft-en.json"))
         view = self.restarted().get(f"/api/jobs/{job_id}", headers=self.headers).json()
         self.assertNotIn("interrupted_operations", view)
-        self.assertFalse((self.profile_path.parent / "operation-in-progress.json").exists())
+        self.assertEqual(view["interrupted"]["step"], "cv-draft-en")  # the CV says it was cut short
+        self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line["text"]), 1)
 
     def test_finishing_another_line_leaves_the_notice_about_this_one(self):
         job_id, gaps = self.line_job(("Hands-on Docker and Kubernetes", "Experience with Go"))
@@ -1036,9 +1061,40 @@ def upload_and_save():
                         dies_before_renaming_into("gaps.json"))
         client = self.restarted()
         done = client.post(f"/api/jobs/{job_id}/gaps/{second}/write", headers=self.headers, json=second_line)
-        self.assertEqual([notice["key"] for notice in done.json()["interrupted_operations"]], [first])
-        client.post("/api/notices/dismiss", headers=self.headers, json={"kind": "add_line", "job_id": job_id, "key": first})
+        [notice] = done.json()["interrupted_operations"]
+        self.assertEqual(notice["line"], first_line["text"])
+        client.post("/api/notices/dismiss", headers=self.headers, json={"id": notice["id"]})
         self.assertNotIn("interrupted_operations", client.get(f"/api/jobs/{job_id}", headers=self.headers).json())
+
+    def test_another_line_for_the_same_requirement_leaves_the_notice_about_the_first(self):
+        job_id, gaps = self.line_job()
+        requirement, first = self.own_line(gaps)
+        _, second = self.own_line(gaps, text="Ran the internal tool in Docker containers.")
+        write = f"/api/jobs/{job_id}/gaps/{requirement}/write"
+        self.die_in_app(f"client.post({write!r}, headers=headers, json={first!r})", dies_before_renaming_into("gaps.json"))
+        done = self.restarted().post(write, headers=self.headers, json=second)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual([notice["line"] for notice in done.json()["interrupted_operations"]], [first["text"]])
+
+    def test_a_notice_that_cannot_be_read_is_shown_and_kept_until_dismissed(self):
+        unfinished = self.profile_path.parent / "unfinished"
+        unfinished.mkdir(exist_ok=True)
+        (unfinished / "0123456789abcdef.json").write_text("{ not json", encoding="utf-8")
+        (unfinished / "notes.json").write_text('{"kind": "save_cv"}', encoding="utf-8")  # not a notice's name
+        (unfinished / "fedcba9876543210.json").symlink_to(self.profile_path)  # nor is a link
+        client = self.restarted()
+        stopped = client.get("/api/facts", headers=self.headers).json()["interrupted"]
+        self.assertEqual([(notice["kind"], notice["id"]) for notice in stopped], [("unknown", "0123456789abcdef")])
+        job_id, gaps = self.line_job()  # other actions finish around it
+        requirement, line = self.own_line(gaps)
+        self.assertEqual(client.post(f"/api/jobs/{job_id}/gaps/{requirement}/write", headers=self.headers,
+                                     json=line).status_code, 200)
+        self.assertEqual((unfinished / "0123456789abcdef.json").read_text(encoding="utf-8"), "{ not json")
+        for strange in ("../cv-profile", "0123456789ABCDEF", ""):
+            self.assertEqual(client.post("/api/notices/dismiss", headers=self.headers, json={"id": strange}).status_code, 400)
+        self.assertTrue(self.profile_path.exists())
+        client.post("/api/notices/dismiss", headers=self.headers, json={"id": "0123456789abcdef"})
+        self.assertNotIn("interrupted", client.get("/api/facts", headers=self.headers).json())
 
     def test_an_approval_cut_short_by_a_crash_is_no_approval_after_the_restart(self):
         job_id = self.planned_job()

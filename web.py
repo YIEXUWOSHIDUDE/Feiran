@@ -76,7 +76,15 @@ from requirement_flow import (
     propose_requirements,
 )
 from review import build_report
-from workspace import DEFAULT_ROOT, Workspace, WorkspaceError, remove_durably, remove_leftovers, write_atomically
+from workspace import (
+    DEFAULT_ROOT,
+    Workspace,
+    WorkspaceError,
+    make_folder,
+    remove_durably,
+    remove_leftovers,
+    write_atomically,
+)
 
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -99,10 +107,11 @@ OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload")
 CHANGE_WAIT_SECONDS = 90
 BUSY = "Another change is still being made (DeepSeek can take a minute). Try again in a moment."
 # Changes that span the fact store, the CV profile and a job's files: saving an uploaded CV, and
-# adding a line the user confirmed. The marker is there while one runs; the notice after a stop.
+# adding a line the user confirmed. Each has a file in unfinished/ while it runs, which stays as
+# the notice if it does not finish.
 OPERATIONS = ("save_cv", "add_line")
-OPERATION_MARKER = "operation-in-progress.json"
-OPERATION_NOTICES = "interrupted-operations.json"
+UNFINISHED = "unfinished"
+NOTICE_ID = re.compile(r"[0-9a-f]{16}")
 UPLOAD_KEEP_SECONDS = 24 * 3600
 
 
@@ -246,11 +255,9 @@ class ChangeRequest(BaseModel):
 
 
 class DismissRequest(BaseModel):
-    """Which notice the user has read: the same fields the notice itself has."""
+    """The notice the user has read, by the id the page was given."""
 
-    kind: str
-    job_id: str | None = None
-    key: str | None = None
+    id: str
 
 
 class ApproveRequest(BaseModel):
@@ -369,77 +376,64 @@ def create_app(
         logging.getLogger("workbench").warning("undid a change cut short by a stop: job %s, step %s",
                                                change["job_id"], change["step"])
     uploads = Path(profile_path).parent / "cv-uploads"
-    for folder in (Path(profile_path).parent, Path(profile_path).parent / "profile-history", uploads):
+    unfinished = Path(profile_path).parent / UNFINISHED
+    make_folder(unfinished)
+    for folder in (Path(profile_path).parent, Path(profile_path).parent / "profile-history", uploads, unfinished):
         remove_leftovers(folder)
-    operation_marker = Path(profile_path).parent / OPERATION_MARKER
-    notices_file = Path(profile_path).parent / OPERATION_NOTICES
 
     def read_notices() -> list[dict]:
-        """Actions that did not finish, one record each: the kind, the job and which one (the
-        requirement, or the uploaded PDF's hash)."""
-        try:
-            notices = json.loads(notices_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        return [notice for notice in notices if isinstance(notice, dict)] if isinstance(notices, list) else []
-
-    def same_action(notice: dict, record: dict) -> bool:
-        return all(notice.get(field) == record.get(field) for field in ("kind", "job_id", "key"))
-
-    def keep_notice(record: dict) -> None:
-        others = [notice for notice in read_notices() if not same_action(notice, record)]
-        stopped = {**record, "stopped_at": datetime.now(timezone.utc).isoformat()}
-        write_atomically(notices_file, json.dumps([*others, stopped]).encode("utf-8"))
-
-    def settle_notices(record: dict) -> None:
-        notices = read_notices()
-        left = [notice for notice in notices if not same_action(notice, record)]
-        if len(left) != len(notices):
-            write_atomically(notices_file, json.dumps(left).encode("utf-8"))
-
-    if operation_marker.exists():
-        # The last run stopped inside a change spanning the facts, the profile and a job. If the
-        # change had finished, only its bookkeeping is left; otherwise the page says so. Nothing
-        # is replayed.
-        try:
-            marker = json.loads(operation_marker.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            marker = None
-        marker = marker if isinstance(marker, dict) else {}
-        record = {"kind": marker.get("kind") if marker.get("kind") in OPERATIONS else "unknown",
-                  "job_id": marker.get("job_id") if isinstance(marker.get("job_id"), str) else None,
-                  "key": marker.get("key") if isinstance(marker.get("key"), str) else None}
-        if marker.get("done") is True:
-            settle_notices(record)
-        else:
-            keep_notice(record)
-            logging.getLogger("workbench").warning("an operation did not finish before a stop: %s", record["kind"])
-        remove_durably(operation_marker)
+        """Actions that did not finish, oldest first, each with the id the page dismisses it by.
+        A record that cannot be read is shown as an unknown action and kept for a person to see."""
+        notices = []
+        for path in unfinished.glob("*.json"):
+            if not NOTICE_ID.fullmatch(path.stem) or path.is_symlink():
+                continue
+            try:
+                notice = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue  # it has just finished
+            except (OSError, ValueError):
+                notice = None
+            if not isinstance(notice, dict) or notice.get("kind") not in OPERATIONS:
+                notice = {"kind": "unknown"}
+            notices.append({**notice, "id": path.stem})
+        return sorted(notices, key=lambda notice: str(notice.get("started_at") or ""))
 
     @contextmanager
-    def operation(kind: str, job_id: str | None = None, key: str | None = None) -> Iterator[None]:
+    def operation(kind: str, job_id: str | None = None, key: str | None = None, **shown: str | None) -> Iterator[None]:
         """A change that spans the fact store, the CV profile and a job's files, which no single
-        journal covers. A marker names the action while it runs. When it is done, that is put on
-        disk first, then any notice about this very action is settled, then the marker goes, so
-        a stop at any point leaves either a notice or nothing to explain. A storage error can
-        leave part of the action done, so it leaves a notice too; a refusal comes before anything
-        is written and leaves none. Nothing is replayed: repeating the action is safe, since a
-        saved CV's lines are reused and a line is never added twice."""
-        record = {"kind": kind, "job_id": job_id, "key": key}
-        write_atomically(operation_marker, json.dumps(
-            {**record, "started_at": datetime.now(timezone.utc).isoformat()}).encode("utf-8"))
+        journal covers. It has its own file in unfinished/, named after exactly this action (its
+        kind, job and key: the uploaded PDF's hash, or the requirement and the line), written
+        before it starts and removed once it is done. If the workbench stops, or a store fails
+        partway, the file stays and is the notice the page shows, with what is ``shown`` in it.
+        So no other action, not even another line for the same requirement, settles or replaces
+        it; only the same action done again, or the user, does. A refusal comes before anything
+        is written and leaves things as they were. Nothing is replayed: repeating is safe, since
+        a saved CV's lines are reused and a line is never added twice."""
+        name = hashlib.sha256(json.dumps([kind, job_id, key]).encode("utf-8")).hexdigest()[:16]
+        path = unfinished / f"{name}.json"
+        earlier = path.exists()  # the same action stopped before: its notice stays until this one is done
+        if not earlier:
+            write_atomically(path, json.dumps({"kind": kind, "job_id": job_id, "key": key, **shown,
+                                               "started_at": datetime.now(timezone.utc).isoformat()},
+                                              ensure_ascii=False).encode("utf-8"))
         try:
             yield
         except (OSError, sqlite3.Error, FactStoreError):
-            keep_notice(record)
-            remove_durably(operation_marker)
-            raise
+            raise  # part of the action may be done: the file stays as the notice
         except Exception:
-            remove_durably(operation_marker)
+            if not earlier:
+                remove_durably(path)
             raise
-        write_atomically(operation_marker, json.dumps({**record, "done": True}).encode("utf-8"))
-        settle_notices(record)
-        remove_durably(operation_marker)
+        remove_durably(path)
+
+    def added_line(gaps: dict, requirement_id: str, what: object, line: str | None) -> dict:
+        """How a notice names a line being added: its requirement, the line, and in the key a
+        fingerprint of exactly what is added, so another line is another action."""
+        requirement = next((item for item in gaps["requirements"] if item["requirement_id"] == requirement_id), {})
+        digest = hashlib.sha256(json.dumps(what, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        return {"key": f"{requirement_id}:{digest[:12]}", "requirement": requirement.get("text"), "line": line,
+                "language": gaps.get("language")}
     # Next to the fact store by default, so tests with a temporary fact store stay temporary too.
     listings_db = Path(listings_db or Path(facts_db).parent / "listings.db")
     initialize(listings_db, load_starter() if starter is None else starter)
@@ -567,9 +561,9 @@ def create_app(
         interrupted = workspace.read_note(job_id, "interrupted")
         if interrupted:
             view["interrupted"] = interrupted
-        unfinished = [notice for notice in read_notices() if notice.get("job_id") == job_id]
-        if unfinished:
-            view["interrupted_operations"] = unfinished
+        stopped = [notice for notice in read_notices() if notice.get("job_id") == job_id]
+        if stopped:
+            view["interrupted_operations"] = stopped
         gaps = workspace.read(job_id, "gaps")
         if gaps:
             view["gaps"] = gaps_view(job_id, gaps)
@@ -881,7 +875,9 @@ def create_app(
     @app.post("/api/notices/dismiss")
     def dismiss_notice(request: DismissRequest) -> dict:
         """The user has read a notice about an action that did not finish."""
-        settle_notices(request.model_dump())
+        if not NOTICE_ID.fullmatch(request.id):
+            raise ValueError("没有这条提示")
+        remove_durably(unfinished / f"{request.id}.json")
         return {"dismissed": True}
 
     def started_jobs() -> dict[str, str]:
@@ -1030,7 +1026,10 @@ def create_app(
     def accept_suggestion(job_id: str, requirement_id: str) -> dict:
         """The user says the suggested line is true: it becomes a confirmed fact on the CV."""
         gaps = require(job_id, "gaps")
-        with operation("add_line", job_id, key=requirement_id):
+        suggestion = next((item["suggestion"] for item in gaps["requirements"]
+                           if item["requirement_id"] == requirement_id), None) or {}
+        line = suggestion.get("new_text") or suggestion.get("text")
+        with operation("add_line", job_id, **added_line(gaps, requirement_id, suggestion, line)):
             updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
             if profile is not None:
                 save_profile(profile)
@@ -1045,7 +1044,8 @@ def create_app(
         _, head = cv_head(job_id, gaps["language"])
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历")
-        with operation("add_line", job_id, key=requirement_id):
+        line = " ".join(request.text.split())
+        with operation("add_line", job_id, **added_line(gaps, requirement_id, {"place": request.place, "text": line}, line)):
             updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile())
             if profile is not None:
                 save_profile(profile)

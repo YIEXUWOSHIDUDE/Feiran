@@ -860,17 +860,23 @@ function unfinishedNote(notice, refresh) {
       + "your CV layout may still be the old one. Upload the same PDF again and save: lines already saved are reused, "
       + "never added twice."
     : notice.kind === "add_line"
-      ? "Adding a line you confirmed did not finish. If it is not on your CV below, add it again with the same words: "
-        + "it will not be added twice. If you rebuilt the CV instead, check that the line is there."
-      : "A change did not finish. Check your facts and your CV, and repeat what you were doing.";
-  const dismiss = actionButton("Dismiss", async () => {
-    await api("/api/notices/dismiss", {
-      method: "POST",
-      body: JSON.stringify({ kind: notice.kind, job_id: notice.job_id || null, key: notice.key || null }),
-    });
+      ? `Adding “${notice.line}” for “${notice.requirement}” did not finish. If that requirement below still offers `
+        + "to add it, add it again with the same words: it will not be added twice. If it says the line was added, "
+        + "prepare the CV again so the CV shows it."
+      : "A change did not finish, and its record could not be read. Check your facts and your CV, and repeat what "
+        + "you were doing.";
+  const tools = [];
+  if (notice.kind === "add_line" && notice.job_id && notice.language) {
+    tools.push(actionButton("Prepare the CV again", async () => {
+      await api(`/api/jobs/${notice.job_id}/cv/${notice.language}/prepare`, { method: "POST" });
+      await refresh();
+    }, true));
+  }
+  tools.push(actionButton("Dismiss", async () => {
+    await api("/api/notices/dismiss", { method: "POST", body: JSON.stringify({ id: notice.id }) });
     await refresh();
-  }, true);
-  return el("p", { class: "warning" }, text, " ", dismiss);
+  }, true));
+  return el("p", { class: "warning" }, text, " ", ...tools);
 }
 
 async function renderJob(jobId) {

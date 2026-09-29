@@ -55,7 +55,7 @@ def _sync_folder(folder: Path) -> None:
         os.close(descriptor)
 
 
-def _make_folder(folder: Path) -> None:
+def make_folder(folder: Path) -> None:
     """Create a folder and its missing parents, each entry flushed into its parent: a new
     folder's name lives in the folder above it."""
     missing = []
@@ -171,7 +171,7 @@ class Workspace:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         job_id = f"{stamp}-{secrets.token_hex(3)}"
         with self.lock:
-            _make_folder(self.root / job_id)
+            make_folder(self.root / job_id)
             try:
                 self.write(job_id, "input", review_input)
             except Exception:
@@ -218,7 +218,7 @@ class Workspace:
         try:
             if moving:
                 history = directory / "history" / stamp
-                _make_folder(history)
+                make_folder(history)
                 for path in moving:
                     path.rename(history / path.name)
                 _sync_folder(history)  # both sides of each move
