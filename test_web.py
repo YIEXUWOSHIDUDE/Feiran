@@ -2,11 +2,14 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+
+import anyio
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -93,6 +96,61 @@ class FakeDeepSeek(FakeChat):
                  if line["text"].lstrip("- ") in self.requirement_lines]
         return {"model": "deepseek-flash", "content": {"requirements": picks},
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+
+class Gate:
+    """Stands in for a slow DeepSeek call: records each request that reaches it and holds it
+    there until released, counting how many are inside at once."""
+
+    def __init__(self):
+        self.arrived = threading.Semaphore(0)
+        self.release = threading.Event()
+        self.guard = threading.Lock()
+        self.inside = self.most = self.count = 0
+
+    def __call__(self):
+        with self.guard:
+            self.inside += 1
+            self.count += 1
+            self.most = max(self.most, self.inside)
+        self.arrived.release()
+        self.release.wait(10)
+        with self.guard:
+            self.inside -= 1
+
+
+def wait_until(condition, seconds=5):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("waited in vain")
+        time.sleep(0.01)
+
+
+async def asgi_post(app, path, body_ends=True):
+    """Send one POST straight to the ASGI app, as the server would, from a client that stays;
+    with body_ends=False the client sends part of a body and then nothing more. Returns the
+    status code."""
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "scheme": "http",
+             "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+             "headers": [(b"host", b"127.0.0.1:8765"), (b"x-workbench-token", TOKEN.encode()),
+                         (b"content-type", b"application/pdf" if not body_ends else b"application/json")],
+             "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765)}
+    body_sent, status = False, []
+
+    async def receive():
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": b"%PDF-1.4" if not body_ends else b"", "more_body": not body_ends}
+        await anyio.sleep_forever()
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status.append(message["status"])
+
+    await app(scope, receive, send)
+    return status[0] if status else None
 
 
 @unittest.skipUnless(HAS_FASTAPI, "web tests need the packages in requirements.txt")
@@ -618,45 +676,171 @@ class WebTests(unittest.TestCase):
         # While DeepSeek adjusts the CV for one tab, a change from another waits for it to finish,
         # so two requests never write one job's files at the same moment.
         job_id = self.planned_job()
-        inside, most, entered, release = [0], [0], threading.Event(), threading.Event()
-
-        def adjusting():
-            inside[0] += 1
-            most[0] = max(most[0], inside[0])
-            entered.set()
-            release.wait(5)
-            inside[0] -= 1
-
-        self.chat.while_planning = adjusting
+        gate = self.chat.while_planning = Gate()
         plan = f"/api/jobs/{job_id}/cv/en/plan"
         with TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(2) as pool:
-            first = pool.submit(client.post, plan, headers=self.headers)
-            self.assertTrue(entered.wait(5))
-            second = pool.submit(client.post, plan, headers=self.headers)
-            time.sleep(0.3)  # time enough for the second to start adjusting too, if nothing held it back
-            release.set()
+            try:
+                first = pool.submit(client.post, plan, headers=self.headers)
+                self.assertTrue(gate.arrived.acquire(timeout=5))
+                second = pool.submit(client.post, plan, headers=self.headers)
+                wait_until(lambda: self.app.state.waiting_changes == 1)  # the second has reached the lock
+                self.assertFalse(gate.arrived.acquire(timeout=0.5))  # and does not get past it
+            finally:
+                gate.release.set()
             replies = [first.result(10), second.result(10)]
         self.assertEqual([reply.status_code for reply in replies], [200, 200])
-        self.assertEqual(most[0], 1)
+        self.assertEqual((gate.count, gate.most), (2, 1))
+
+    def test_a_change_whose_client_goes_away_keeps_others_out_until_it_has_finished(self):
+        # The handler keeps running in its thread after its request is cancelled (a closed tab,
+        # a stopping server); the next change must still wait for it.
+        job_id = self.planned_job()
+        gate = self.chat.while_planning = Gate()
+        plan = f"/api/jobs/{job_id}/cv/en/plan"
+
+        async def scenario():
+            async with anyio.create_task_group() as group:
+                first = anyio.CancelScope()
+
+                async def run_first():
+                    with first:
+                        await asgi_post(self.app, plan)
+
+                group.start_soon(run_first)
+                try:
+                    self.assertTrue(await anyio.to_thread.run_sync(gate.arrived.acquire, True, 5))
+                    first.cancel()
+                    group.start_soon(asgi_post, self.app, plan)
+                    while self.app.state.waiting_changes != 1 and gate.count < 2:
+                        await anyio.sleep(0.01)
+                    return await anyio.to_thread.run_sync(gate.arrived.acquire, True, 0.5)
+                finally:
+                    gate.release.set()
+
+        self.assertFalse(anyio.run(scenario))  # the second change never got in while the first ran
+        self.assertEqual((gate.count, gate.most), (2, 1))
+
+    def test_a_stalled_upload_holds_up_no_change(self):
+        # An upload only writes its own new file, so a client that stops sending in the middle of
+        # a PDF must not keep the user's changes waiting.
+        job_id = self.planned_job()
+
+        async def scenario():
+            async with anyio.create_task_group() as group:
+                group.start_soon(asgi_post, self.app, "/api/cv/upload", False)
+                await anyio.sleep(0.1)
+                with anyio.fail_after(3):
+                    status = await asgi_post(self.app, f"/api/jobs/{job_id}/cv/en/plan")
+                group.cancel_scope.cancel()
+                return status
+
+        self.assertEqual(anyio.run(scenario), 200)
+
+    def test_following_and_refreshing_companies_never_waits_for_a_cv_change(self):
+        # Job boards are refreshed four at a time when Find jobs opens; they live in their own
+        # store, so they need not wait while DeepSeek adjusts a CV.
+        job_id = self.planned_job()
+        gate = self.chat.while_planning = Gate()
+        with TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(3) as pool:
+            try:
+                slow = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+                self.assertTrue(gate.arrived.acquire(timeout=5))
+                follow = pool.submit(client.post, "/api/sources", json={"link": "https://boards.greenhouse.io/example"},
+                                     headers=self.headers).result(timeout=3)
+                refresh = pool.submit(client.post, "/api/sources/greenhouse/example/refresh",
+                                      headers=self.headers).result(timeout=3)
+            finally:
+                gate.release.set()
+            self.assertEqual(slow.result(10).status_code, 200)
+        self.assertEqual((follow.status_code, refresh.status_code), (200, 200), refresh.text)
+
+    def test_a_busy_database_is_reported_as_busy(self):
+        with patch("web.ranked_listings", side_effect=sqlite3.OperationalError("database is locked")):
+            response = self.client.get("/api/listings", headers=self.headers)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Try again", response.json()["error"])
+
+    def test_a_page_never_sees_a_step_half_moved_to_history(self):
+        # Start over moves the old draft, rewording and layout to history one file at a time; a page
+        # loaded at that moment waits the moment out instead of showing a chain with a hole in it.
+        job_id = self.planned_job()
+        paused, resume = threading.Event(), threading.Event()
+        real_rename = Path.rename
+
+        def slow_rename(source, target):
+            if source.name == "cv-tailored-en.json" and "history" in target.parts:
+                paused.set()
+                resume.wait(5)
+            return real_rename(source, target)
+
+        with patch.object(Path, "rename", slow_rename), \
+                TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(2) as pool:
+            try:
+                start_over = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+                self.assertTrue(paused.wait(5))
+                page = pool.submit(client.get, f"/api/jobs/{job_id}", headers=self.headers)
+                try:
+                    early = page.result(timeout=0.5)
+                except TimeoutError:
+                    early = None  # still waiting, as it should
+            finally:
+                resume.set()
+            view = (early or page.result(10)).json()
+            self.assertEqual(start_over.result(10).status_code, 200)
+        steps = set(view["steps"])
+        self.assertTrue("cv-draft-en" in steps or not steps & {"cv-tailored-en", "cv-planned-en"}, sorted(steps))
+
+    def test_no_step_moves_while_a_page_is_being_read(self):
+        # The page reads a job's steps one file at a time; Start over must not move them between
+        # two of those reads, or the page would mix the old chain with the new.
+        job_id = self.planned_job()
+        draft = Path(self.directory.name) / "jobs" / job_id / "cv-draft-en.json"
+        before = draft.read_bytes()
+        reading, resume = threading.Event(), threading.Event()
+        workspace = self.app.state.workspace
+        real_state = type(workspace).state
+
+        def slow_state(this, job):  # the page's first read pauses there
+            steps = real_state(this, job)
+            if not reading.is_set():
+                reading.set()
+                resume.wait(5)
+            return steps
+
+        with patch.object(type(workspace), "state", slow_state), \
+                TestClient(self.app, base_url="http://127.0.0.1:8765") as client, \
+                ThreadPoolExecutor(1) as reader, ThreadPoolExecutor(1) as writer:
+            try:
+                page = reader.submit(client.get, f"/api/jobs/{job_id}", headers=self.headers)
+                self.assertTrue(reading.wait(5))
+                start_over = writer.submit(client.post, f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+                time.sleep(0.5)  # time enough for Start over to replace the draft, if nothing held it back
+                self.assertEqual(draft.read_bytes(), before)
+            finally:
+                resume.set()
+            self.assertEqual((page.result(10).status_code, start_over.result(10).status_code), (200, 200))
 
     def test_a_change_that_waits_too_long_is_told_to_try_again(self):
         job_id = self.planned_job()
-        entered, release = threading.Event(), threading.Event()
-        self.chat.while_planning = lambda: (entered.set(), release.wait(5))
+        gate = self.chat.while_planning = Gate()
+        change = {"change_id": "cut:fact-intern-api", "undone": True}
         with patch("web.CHANGE_WAIT_SECONDS", 0.05), \
-                TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(1) as pool:
-            slow = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
-            self.assertTrue(entered.wait(5))
-            waited = client.post(f"/api/jobs/{job_id}/cv/en/change",
-                                 json={"change_id": "cut:fact-intern-api", "undone": True}, headers=self.headers)
-            page = client.get(f"/api/jobs/{job_id}", headers=self.headers)  # reading never waits
-            stranger = client.post(f"/api/jobs/{job_id}/cv/en/change", json={"change_id": "cut:fact-intern-api"})
-            release.set()
+                TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(3) as pool:
+            try:
+                slow = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+                self.assertTrue(gate.arrived.acquire(timeout=5))
+                waited = client.post(f"/api/jobs/{job_id}/cv/en/change", json=change, headers=self.headers)
+                # Both answer while the slow change is still held: reading and the token check never wait for it.
+                page = pool.submit(client.get, f"/api/jobs/{job_id}", headers=self.headers).result(timeout=2)
+                stranger = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/change", json=change).result(timeout=2)
+                self.assertEqual(gate.inside, 1)
+            finally:
+                gate.release.set()
             self.assertEqual(slow.result(10).status_code, 200)
         self.assertEqual(waited.status_code, 409)
         self.assertIn("Try again", waited.json()["error"])
         self.assertEqual(page.status_code, 200)
-        self.assertEqual(stranger.status_code, 403)  # turned away before it could wait for, or hold up, a change
+        self.assertEqual(stranger.status_code, 403)
         cut = next(item for item in self.job(job_id)["cv"]["en"]["changes"] if item["id"] == "cut:fact-intern-api")
         self.assertFalse(cut["undone"])  # the refused change was not made
 

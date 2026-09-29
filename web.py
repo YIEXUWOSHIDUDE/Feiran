@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import tempfile
 import time
@@ -19,9 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, NamedTuple
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -86,6 +88,10 @@ CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by",
 CV_LANGUAGES = ("en", "zh")
 QUERY_TOKEN_PATHS = ("/preview/", "/download/")
 READ_ONLY_METHODS = ("GET", "HEAD", "OPTIONS")
+# Changes to their own store only, so they neither wait for nor hold up the others: the followed
+# companies and their postings (a SQLite database of their own, with its own transactions) and a
+# new CV upload (its own new file; saving it, which changes facts and the profile, does wait).
+OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload")
 # How long a change waits for the one before it (DeepSeek can take a minute) before the page is
 # told to try again.
 CHANGE_WAIT_SECONDS = 90
@@ -355,20 +361,28 @@ def create_app(
     initialize(listings_db, load_starter() if starter is None else starter)
     changes = asyncio.Lock()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.waiting_changes = 0
 
     # Declared first, so it runs inside the host and token check below.
     @app.middleware("http")
     async def one_change_at_a_time(request: Request, call_next):
-        """Requests that change data run one at a time, so two tabs or a double click never
-        write one job's files at the same moment. Reading never waits."""
-        if request.method in READ_ONLY_METHODS:
+        """Requests that change the facts, the CV profile or a job's files run one at a time, so
+        two tabs or a double click never write the same files at the same moment. Reading never
+        waits here."""
+        if request.method in READ_ONLY_METHODS or OWN_STORE.fullmatch(request.url.path):
             return await call_next(request)
+        app.state.waiting_changes += 1  # how many changes wait here now (the event loop's thread only)
         try:
             await asyncio.wait_for(changes.acquire(), CHANGE_WAIT_SECONDS)
         except TimeoutError:
             return JSONResponse({"error": BUSY}, status_code=409)
+        finally:
+            app.state.waiting_changes -= 1
         try:
-            return await call_next(request)
+            # A cancelled request (a closed tab, a stopping server) does not stop its handler, which
+            # runs on in a thread; the shield keeps the lock held until the handler has finished.
+            with anyio.CancelScope(shield=True):
+                return await call_next(request)
         finally:
             changes.release()
 
@@ -422,6 +436,14 @@ def create_app(
     async def domain_error(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
+    @app.exception_handler(sqlite3.OperationalError)
+    async def database_busy(_request: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+        """SQLite waits up to 30 seconds for another writer; after that the page is told to retry.
+        Any other database error stays an error."""
+        if "locked" in str(exc) or "busy" in str(exc):
+            return JSONResponse({"error": BUSY}, status_code=409)
+        raise exc
+
     def require(job_id: str, step: str) -> dict:
         data = workspace.read(job_id, step)
         if data is None:
@@ -429,7 +451,12 @@ def create_app(
         return data
 
     def job_view(job_id: str) -> dict:
-        """What the page needs for one job: the JD and the current file of each step."""
+        """What the page needs for one job: the JD and the current file of each step, all read
+        while no step is being moved or replaced, so they agree with each other."""
+        with workspace.lock:
+            return job_view_locked(job_id)
+
+    def job_view_locked(job_id: str) -> dict:
         steps = workspace.state(job_id)
         jd = {key: value for key, value in require(job_id, "input")["jd"].items() if key != "raw_content"}
         view: dict = {
@@ -979,7 +1006,8 @@ def create_app(
     def cv_preview(job_id: str, language: str, v: str = "") -> str | HTMLResponse:
         """The CV as it will print. The page asks for the version it holds (v, its fingerprint),
         so the frame never shows a newer CV than the changes and the Approve button beside it."""
-        head_step, head = cv_head(job_id, language)
+        with workspace.lock:
+            head_step, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先生成简历草稿")
         if v and v != content_fingerprint(head):
@@ -991,11 +1019,13 @@ def create_app(
         return render_html(head, final=final)
 
     @app.get("/download/{job_id}/{language}.pdf")
-    def cv_download(job_id: str, language: str) -> FileResponse:
-        path = workspace.path(job_id, f"cv-final-{check_language(language)}")
-        if not path.exists():
+    def cv_download(job_id: str, language: str) -> Response:
+        # Read whole (a CV is small), so a new export moving this one to history cannot cut it off.
+        data = workspace.read_bytes(job_id, f"cv-final-{check_language(language)}")
+        if data is None:
             raise WorkspaceError("还没有已批准的最终 PDF")
-        return FileResponse(path, media_type="application/pdf", filename=f"CV-{language.upper()}.pdf")
+        return Response(data, media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="CV-{language.upper()}.pdf"'})
 
     app.state.workspace = workspace
     return app

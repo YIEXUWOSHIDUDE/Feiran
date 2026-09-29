@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -116,6 +117,9 @@ def _later_steps(step: str) -> list[str]:
 class Workspace:
     def __init__(self, root: Path = DEFAULT_ROOT) -> None:
         self.root = Path(root)
+        # Held while files move or are replaced (moments, never across a DeepSeek call), and by
+        # readers that need several files to agree, such as a job's page.
+        self.lock = threading.RLock()
 
     def _job_dir(self, job_id: Any) -> Path:
         if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):
@@ -135,24 +139,38 @@ class Workspace:
             raise WorkspaceError("新岗位必须包含 jd")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         job_id = f"{stamp}-{secrets.token_hex(3)}"
-        (self.root / job_id).mkdir(parents=True)
-        try:
-            self.write(job_id, "input", review_input)
-        except Exception:
-            (self.root / job_id).rmdir()  # empty again: the write undid itself
-            raise
+        with self.lock:
+            (self.root / job_id).mkdir(parents=True)
+            try:
+                self.write(job_id, "input", review_input)
+            except Exception:
+                (self.root / job_id).rmdir()  # empty again: the write undid itself
+                raise
         return job_id
 
     def read(self, job_id: str, step: str) -> dict[str, Any] | None:
-        path = self.path(job_id, step)
-        if not path.exists():
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        with self.lock:
+            try:
+                return json.loads(self.path(job_id, step).read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return None
 
     def state(self, job_id: str) -> list[str]:
-        return [step for step in STEPS if self.path(job_id, step).exists()]
+        with self.lock:
+            return [step for step in STEPS if self.path(job_id, step).exists()]
+
+    def read_bytes(self, job_id: str, step: str) -> bytes | None:
+        with self.lock:
+            try:
+                return self.path(job_id, step).read_bytes()
+            except FileNotFoundError:
+                return None
 
     def _replace_step(self, job_id: str, step: str, data: bytes) -> None:
+        with self.lock:
+            self._replace_step_locked(job_id, step, data)
+
+    def _replace_step_locked(self, job_id: str, step: str, data: bytes) -> None:
         """Move the step and every step derived from it into history, then write the new file.
         The journal names what moved: an error undoes the change at once, a crash at the next
         start (recover)."""
@@ -213,6 +231,10 @@ class Workspace:
         return None if finished else journal["step"]
 
     def recover(self) -> list[dict[str, str]]:
+        with self.lock:
+            return self._recover_locked()
+
+    def _recover_locked(self) -> list[dict[str, str]]:
         """At start, close every change a crash cut short, and say which were undone. A job so
         marked tells the page (the interrupted note) until the next change to it."""
         undone: list[dict[str, str]] = []
@@ -244,11 +266,16 @@ class Workspace:
         return self._job_dir(job_id) / f"{name}.json"
 
     def write_note(self, job_id: str, name: str, data: dict[str, Any]) -> None:
-        write_atomically(self._note_path(job_id, name), (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        with self.lock:
+            write_atomically(self._note_path(job_id, name),
+                             (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
     def read_note(self, job_id: str, name: str) -> dict[str, Any] | None:
-        path = self._note_path(job_id, name)
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        with self.lock:
+            try:
+                return json.loads(self._note_path(job_id, name).read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return None
 
     def write_bytes(self, job_id: str, step: str, data: bytes) -> None:
         if not step.startswith("cv-final-"):
@@ -258,6 +285,10 @@ class Workspace:
         self._replace_step(job_id, step, data)
 
     def jobs(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return self._jobs_locked()
+
+    def _jobs_locked(self) -> list[dict[str, Any]]:
         """Summaries of every job, newest first, read from each job's input step."""
         if not self.root.is_dir():
             return []
