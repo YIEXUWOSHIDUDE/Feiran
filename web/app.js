@@ -832,6 +832,20 @@ function gapsPanel(view, refresh) {
     el("div", { class: "toolbar" }, check));
 }
 
+// A change the server was making when it stopped is undone at the next start; say what it was.
+function interruptedNote(interrupted) {
+  if (!interrupted) return null;
+  const step = interrupted.step;
+  const what = step.startsWith("cv-approved-") ? "approving your CV"
+    : step.startsWith("cv-final-") ? "creating the final PDF"
+      : step.startsWith("cv-") ? "preparing your CV"
+        : step === "gaps" ? "checking what your CV shows for each requirement"
+          : step === "matches" || step === "linked" ? "finding talking points"
+            : "saving this job's requirements";
+  return el("p", { class: "warning" },
+    `The workbench stopped while ${what}, so that change was undone and nothing half-done was kept. Do it again if you still want it.`);
+}
+
 async function renderJob(jobId) {
   // Requirements are checked against the CV once it exists, after the page shows, so Start
   // stays quick; and again, at most once per refresh, whenever the facts or the CV's wording
@@ -846,6 +860,7 @@ async function renderJob(jobId) {
           [jd.company, jd.location].filter(Boolean).join(" · ") || "Company unknown", " · captured ", localDate(jd.captured_at)),
         jd.source ? el("p", {}, el("a", { href: jd.source, target: "_blank", rel: "noopener noreferrer" }, jd.source)) : el("p", { class: "muted" }, "Source: unknown"),
         el("details", {}, el("summary", {}, "Job description"), el("pre", { class: "jd" }, jd.text)),
+        interruptedNote(view.interrupted),
       ),
       requirementsPanel(view, refresh),
       cvPanel(view, refresh),

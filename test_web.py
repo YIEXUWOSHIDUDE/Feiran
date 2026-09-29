@@ -21,6 +21,7 @@ from requirement_flow import FIND_RULES
 from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
 from test_gaps import resume_ids, sent_lines
 from test_listings import FakeBoards, posting
+from test_workspace import Crash, crash_when_writing
 
 HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
 HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
@@ -658,6 +659,21 @@ class WebTests(unittest.TestCase):
         self.assertEqual(stranger.status_code, 403)  # turned away before it could wait for, or hold up, a change
         cut = next(item for item in self.job(job_id)["cv"]["en"]["changes"] if item["id"] == "cut:fact-intern-api")
         self.assertFalse(cut["undone"])  # the refused change was not made
+
+    def test_an_approval_cut_short_by_a_crash_is_no_approval_after_the_restart(self):
+        job_id = self.planned_job()
+        shown = self.job(job_id)["cv"]["en"]["content_sha256"]
+        with crash_when_writing("cv-approved-en.json"), self.assertRaises(BaseException) as died:
+            self.approve(job_id, shown)
+        self.assertIsNotNone(died.exception)
+        restarted = create_app(
+            facts_db=self.database, jobs_root=Path(self.directory.name) / "jobs", token=TOKEN,
+            profile_path=self.profile_path, chat=self.chat, printer=FakePrinter(), starter=[],
+        )  # the next start
+        view = TestClient(restarted, base_url="http://127.0.0.1:8765").get(f"/api/jobs/{job_id}", headers=self.headers).json()
+        self.assertEqual(view["cv"]["en"]["head"], "planned")  # recovery never approves
+        self.assertEqual(view["cv"]["en"]["content_sha256"], shown)
+        self.assertEqual(view["interrupted"]["step"], "cv-approved-en")
 
     def test_nothing_found_leaves_the_requirements_step_to_the_user_and_can_be_retried(self):
         import_facts(self.database, FACTS)

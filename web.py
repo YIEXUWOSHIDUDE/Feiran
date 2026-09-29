@@ -72,7 +72,7 @@ from requirement_flow import (
     propose_requirements,
 )
 from review import build_report
-from workspace import DEFAULT_ROOT, Workspace, WorkspaceError
+from workspace import DEFAULT_ROOT, Workspace, WorkspaceError, remove_leftovers, write_atomically
 
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -343,6 +343,13 @@ def create_app(
 ) -> FastAPI:
     token = token or secrets.token_urlsafe(32)
     workspace = Workspace(jobs_root)
+    # A change the last run was making when it stopped is finished or undone before anything is served.
+    for change in workspace.recover():
+        logging.getLogger("workbench").warning("undid a change cut short by a stop: job %s, step %s",
+                                               change["job_id"], change["step"])
+    uploads = Path(profile_path).parent / "cv-uploads"
+    for folder in (Path(profile_path).parent, Path(profile_path).parent / "profile-history", uploads):
+        remove_leftovers(folder)
     # Next to the fact store by default, so tests with a temporary fact store stay temporary too.
     listings_db = Path(listings_db or Path(facts_db).parent / "listings.db")
     initialize(listings_db, load_starter() if starter is None else starter)
@@ -446,6 +453,9 @@ def create_app(
         if linked:
             view["report"] = build_report(linked)
         view["cv"] = {language: cv_view(job_id, language) for language in CV_LANGUAGES}
+        interrupted = workspace.read_note(job_id, "interrupted")
+        if interrupted:
+            view["interrupted"] = interrupted
         gaps = workspace.read(job_id, "gaps")
         if gaps:
             view["gaps"] = gaps_view(job_id, gaps)
@@ -523,12 +533,9 @@ def create_app(
             except ValueError:
                 readable = False
             # A broken file is kept for the user to look at, but never read as a backup.
-            with (history / f"cv-profile-{stamp}.{'json' if readable else 'broken'}").open("xb") as backup:
-                backup.write(raw)
+            write_atomically(history / f"cv-profile-{stamp}.{'json' if readable else 'broken'}", raw)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(path)
+        write_atomically(path, (json.dumps(profile, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
     # The page exists to help the user present their best CV for each job, not to grade them.
     # Everything up to the CV review happens by itself: the requirements DeepSeek (or the
@@ -697,7 +704,6 @@ def create_app(
 
     # An uploaded CV is read here; DeepSeek only sees its lines without the name and contact
     # details. What it proposes waits in cv-uploads/ until the user checks the details and saves.
-    uploads = Path(profile_path).parent / "cv-uploads"
 
     def upload_path(upload_id: str) -> Path:
         if not re.fullmatch(r"[0-9a-f]{16}", upload_id):
@@ -713,7 +719,7 @@ def create_app(
         for forgotten in uploads.glob("*.json"):
             if time.time() - forgotten.stat().st_mtime > UPLOAD_KEEP_SECONDS:
                 forgotten.unlink(missing_ok=True)
-        (uploads / f"{upload_id}.json").write_text(json.dumps(proposal, ensure_ascii=False), encoding="utf-8")
+        write_atomically(uploads / f"{upload_id}.json", json.dumps(proposal, ensure_ascii=False).encode("utf-8"))
         known = {fact["text"] for fact in list_facts(facts_db)} if Path(facts_db).exists() else set()
         for section in proposal["sections"]:
             for entry in section["entries"]:
