@@ -16,10 +16,18 @@ import secrets
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 DEFAULT_ROOT = Path(".local/jobs")
+# How the data folder stores things, as a whole: the facts database, the CV profile, the job
+# steps and their notes. A release that stores data so an earlier release could not read it any
+# more raises this number. Each start records it in the data folder (claim_data_format), so no
+# older release opens the data afterwards, wherever the data goes; the EC2 host refuses such a
+# release before installing it (deploy/aws/host/install.sh); a backup is restored only by a
+# release that can read it.
+DATA_FORMAT = 1
+DATA_FORMAT_FILE = ".workbench-format"
 JOB_STEPS = ("input", "candidates", "decided")
 # Optional extras derived from the requirements; the CV does not depend on them. Talking points
 # (matches, linked) and gaps can be redone without touching the CV.
@@ -108,6 +116,36 @@ def _note_bytes(data: dict[str, Any]) -> bytes:
 
 class WorkspaceError(Exception):
     """A job or step name is invalid, or the requested step cannot be stored."""
+
+
+class DataFormatError(WorkspaceError):
+    """The data folder is in a format this release may not read, or its record of it is unreadable."""
+
+
+def recorded_data_format(folder: Path) -> int:
+    """The format ``folder``'s record names; 0 when there is none."""
+    try:
+        return int((Path(folder) / DATA_FORMAT_FILE).read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError) as exc:
+        raise DataFormatError(f"{DATA_FORMAT_FILE} cannot be read, so the data's format is unknown") from exc
+
+
+def claim_data_format(folder: Path, also: Iterable[Path] = ()) -> None:
+    """Refuse data a newer release has stored in a format this one may not read, in the data
+    folder or any other folder the data is in (``also``: the older per-file options can put the
+    facts or the jobs elsewhere); otherwise record this release's format in the data folder,
+    before anything uses the data. A release that changes how data is stored must raise
+    DATA_FORMAT, and so be recorded before it changes anything."""
+    for place in dict.fromkeys([Path(folder), *map(Path, also)]):
+        recorded = recorded_data_format(place)
+        if recorded > DATA_FORMAT:
+            raise DataFormatError(f"the data is in format {recorded}, newer than this release's format {DATA_FORMAT}; "
+                                  "install a release that can read it")
+    if recorded_data_format(folder) < DATA_FORMAT:
+        make_folder(Path(folder))
+        write_atomically(Path(folder) / DATA_FORMAT_FILE, f"{DATA_FORMAT}\n".encode("utf-8"))
 
 
 def _file_name(step: str) -> str:

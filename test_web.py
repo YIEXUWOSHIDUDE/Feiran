@@ -1489,6 +1489,30 @@ class ServerSettingsTests(unittest.TestCase):
         self.assertEqual((line["event"], line["error"]), ("failed_to_start", "RuntimeError"))
         self.assertNotIn("Alex", json.dumps(line))
 
+    def test_data_a_newer_release_has_used_is_refused_wherever_the_options_put_it(self):
+        from workspace import DATA_FORMAT, DATA_FORMAT_FILE
+        with tempfile.TemporaryDirectory() as newer, tempfile.TemporaryDirectory() as other, \
+                patch.object(web_module.Workspace, "recover") as recover:
+            (Path(newer) / DATA_FORMAT_FILE).write_text(f"{DATA_FORMAT + 1}\n", encoding="utf-8")
+            for facts_db, jobs in ((Path(newer) / "workbench.db", Path(other) / "jobs"),
+                                   (Path(other) / "workbench.db", Path(newer) / "jobs")):
+                with self.assertRaisesRegex(Exception, f"format {DATA_FORMAT + 1}"):
+                    create_app(facts_db=facts_db, jobs_root=jobs, profile_path=Path(other) / "cv-profile.json")
+            recover.assert_not_called()  # no change a crash cut short was touched
+            self.assertEqual(sorted(path.name for path in Path(other).iterdir()), [])  # nothing written either
+
+    def test_data_a_newer_release_has_used_is_never_opened(self):
+        from workspace import DATA_FORMAT, DATA_FORMAT_FILE
+        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("web.run_log.configure"), \
+                self.assertLogs("workbench", level="ERROR") as logs:
+            (Path(directory) / DATA_FORMAT_FILE).write_text(f"{DATA_FORMAT + 1}\n", encoding="utf-8")
+            self.assertEqual(main(["--data", directory, "--json-logs"]), 2)
+            self.assertFalse((Path(directory) / "workbench.db").exists())  # nothing was opened or made
+        run.assert_not_called()
+        [line] = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
+        self.assertEqual(line["event"], "refused_to_start")
+        self.assertIn(f"format {DATA_FORMAT + 1}", line["reason"])
+
 
 @unittest.skipUnless(HAS_FASTAPI and HAS_PYPDF, "the smoke run needs the packages in requirements.txt")
 class SmokeRunTests(unittest.TestCase):
@@ -1516,7 +1540,8 @@ class SmokeRunTests(unittest.TestCase):
             data = Path(directory)
             (data / self.smoke.DATA_MARKER).write_text("", encoding="utf-8")
             create_app(facts_db=data / "workbench.db", jobs_root=data / "jobs", profile_path=data / "cv-profile.json")
-            self.assertEqual(sorted(item.name for item in data.iterdir()), [".workbench-data", "listings.db", "unfinished"])
+            self.assertEqual(sorted(item.name for item in data.iterdir()),
+                             [".workbench-data", ".workbench-format", "listings.db", "unfinished"])
             with patch.object(self.smoke, "client_for", side_effect=RuntimeError("past the check")):
                 with self.assertRaisesRegex(RuntimeError, "past the check"):
                     self.smoke.create(data, data / "smoke")

@@ -92,8 +92,10 @@ import run_log
 from workspace import (
     DEFAULT_ROOT,
     JOB_ID,
+    DataFormatError,
     Workspace,
     WorkspaceError,
+    claim_data_format,
     make_folder,
     remove_durably,
     remove_leftovers,
@@ -391,6 +393,8 @@ def create_app(
     selected_posting: Callable[..., dict] = fetch_selected,
 ) -> FastAPI:
     token = token or secrets.token_urlsafe(32)
+    # Before anything reads or changes the data, wherever the options put it.
+    claim_data_format(Path(profile_path).parent, also=(Path(facts_db).parent, Path(jobs_root).parent))
     workspace = Workspace(jobs_root)
     # A change the last run was making when it stopped is finished or undone before anything is served.
     for change in workspace.recover():
@@ -1230,6 +1234,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"打开 http://127.0.0.1:{settings.port}/ （只在本机可用；按 Ctrl+C 停止）")
     try:
         app = create_app(settings.facts_db, settings.jobs, profile_path=settings.profile)
+    except DataFormatError as exc:  # its words are the app's own: format numbers, never data
+        if settings.json_logs:
+            run_log.event(log, "refused_to_start", level=logging.ERROR, reason=str(exc))
+        else:
+            print(f"不启动：{exc}", file=sys.stderr)
+        return 2
     except Exception:
         if not settings.json_logs:
             raise  # on a terminal, the whole traceback

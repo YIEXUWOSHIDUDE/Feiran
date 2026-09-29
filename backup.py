@@ -34,7 +34,7 @@ from typing import Any
 
 from cv import CVError, is_final_approval, verify_draft
 from facts import FactStoreError, list_facts
-from workspace import JOB_ID, JOURNAL, STEP_FILES, TEMPORARY, write_atomically
+from workspace import DATA_FORMAT, DATA_FORMAT_FILE, JOB_ID, JOURNAL, STEP_FILES, TEMPORARY, write_atomically
 
 
 FORMAT = "workbench-backup-1"
@@ -101,7 +101,7 @@ def create_backup(data: Path, archive: Path, revision: str | None = None) -> dic
         checked = verify_data(staging)
         entries = [{"path": str(relative), "bytes": (staging / relative).stat().st_size,
                     "sha256": _sha256((staging / relative).read_bytes())} for relative in _kept(staging)]
-        manifest = {"format": FORMAT, "created_at": datetime.now(timezone.utc).isoformat(),
+        manifest = {"format": FORMAT, "data_format": DATA_FORMAT, "created_at": datetime.now(timezone.utc).isoformat(),
                     "revision": revision or "unknown", "counts": checked["counts"], "problems": checked["problems"],
                     "files": entries}
         packed = io.BytesIO()
@@ -116,19 +116,25 @@ def create_backup(data: Path, archive: Path, revision: str | None = None) -> dic
     return {key: value for key, value in manifest.items() if key != "files"}
 
 
-def _read_manifest(tar: tarfile.TarFile) -> dict[str, dict[str, Any]]:
+def _read_manifest(tar: tarfile.TarFile) -> tuple[dict[str, dict[str, Any]], int]:
+    """The files the manifest lists, by path, and the data format the backup holds."""
     try:
         manifest = json.loads(tar.extractfile("manifest.json").read())
     except (KeyError, AttributeError, ValueError) as exc:
         raise BackupError("the archive has no readable manifest") from exc
     if not isinstance(manifest, dict) or manifest.get("format") != FORMAT or not isinstance(manifest.get("files"), list):
         raise BackupError("the archive is not a workbench backup this version can read")
-    return {entry["path"]: entry for entry in manifest["files"]}
+    made_by = manifest.get("data_format", 1)  # backups from before the number existed are format 1
+    if not isinstance(made_by, int) or made_by > DATA_FORMAT:
+        raise BackupError(f"the archive holds data in format {made_by}, which this release (format {DATA_FORMAT}) "
+                          "cannot read; restore it with the release that made it, or a later one")
+    return {entry["path"]: entry for entry in manifest["files"]}, made_by
 
 
 def restore_backup(archive: Path, into: Path) -> dict[str, Any]:
     """Unpack a backup into ``into``, which must be missing or empty. Nothing appears there
-    unless every file matches the manifest."""
+    unless every file matches the manifest. A backup made before the app recorded its data
+    format gets the record the manifest names, so the restored data never looks new."""
     archive, into = Path(archive), Path(into)
     if into.exists() and (not into.is_dir() or any(into.iterdir())):
         raise BackupError(f"{into} is not empty; a backup is restored only into an empty folder")
@@ -136,7 +142,7 @@ def restore_backup(archive: Path, into: Path) -> dict[str, Any]:
     staging = into.parent / f".workbench-restoring-{into.name}-{secrets.token_hex(4)}"
     try:
         with tarfile.open(archive, "r:gz") as tar:
-            expected = _read_manifest(tar)
+            expected, made_by = _read_manifest(tar)
             seen = set()
             for member in tar.getmembers():
                 if member.name == "manifest.json":
@@ -155,6 +161,9 @@ def restore_backup(archive: Path, into: Path) -> dict[str, Any]:
                 seen.add(str(relative))
             if seen != set(expected):
                 raise BackupError("files the manifest lists are missing from the archive")
+        if DATA_FORMAT_FILE not in seen:
+            staging.mkdir(exist_ok=True)
+            (staging / DATA_FORMAT_FILE).write_text(f"{made_by}\n", encoding="utf-8")
         if into.exists():
             into.rmdir()
         staging.rename(into)
