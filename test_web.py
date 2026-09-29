@@ -675,6 +675,20 @@ class WebTests(unittest.TestCase):
         self.assertEqual(view["cv"]["en"]["content_sha256"], shown)
         self.assertEqual(view["interrupted"]["step"], "cv-approved-en")
 
+    def test_a_restart_during_generation_shows_only_what_was_finished(self):
+        job_id = self.planned_job()
+        self.chat.tailor_error = Crash()  # the process dies while DeepSeek rewords the new draft
+        with self.assertRaises(BaseException):
+            self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)  # Start over
+        restarted = create_app(
+            facts_db=self.database, jobs_root=Path(self.directory.name) / "jobs", token=TOKEN,
+            profile_path=self.profile_path, chat=self.chat, printer=FakePrinter(), starter=[],
+        )
+        view = TestClient(restarted, base_url="http://127.0.0.1:8765").get(f"/api/jobs/{job_id}", headers=self.headers).json()
+        self.assertEqual(view["cv"]["en"]["head"], "draft")  # the finished draft stays; nothing after it exists
+        self.assertNotIn("stages", view["cv"]["en"])  # no stage is reported as done for this draft
+        self.assertNotIn("interrupted", view)  # no file was cut short, so nothing needed undoing
+
     def test_nothing_found_leaves_the_requirements_step_to_the_user_and_can_be_retried(self):
         import_facts(self.database, FACTS)
         confirm_facts(self.database, [("fact-web-python", 1)])

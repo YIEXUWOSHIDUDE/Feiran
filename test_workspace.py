@@ -160,6 +160,38 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 2})
         self.assertIsNone(restarted.read_note(self.job, "interrupted"))
 
+    def test_a_crash_while_the_new_file_is_half_written_leaves_the_old_one(self):
+        self.workspace.write(self.job, "cv-draft-en", {"version": 1})
+        before = self.files()
+        real_open = Path.open
+
+        class HalfWriter:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exception):
+                self.handle.close()
+
+            def write(self, data):
+                self.handle.write(data[: len(data) // 2])
+                raise Crash()
+
+        def half_open(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            return HalfWriter(handle) if path.name.startswith(".cv-draft-en.json.") else handle
+
+        with patch.object(Path, "open", half_open), self.assertRaises(Crash):
+            self.workspace.write(self.job, "cv-draft-en", {"version": 2})
+        # What a real crash would also leave: the half-written temporary file.
+        (self.root / self.job / ".cv-draft-en.json.0badc0de.tmp").write_text('{"vers')
+        restarted = Workspace(self.root)
+        restarted.recover()
+        self.assertEqual(restarted.read(self.job, "cv-draft-en"), {"version": 1})
+        self.assertEqual(self.files(), sorted(before + ["interrupted.json"]))
+
     def test_a_step_written_in_full_before_a_crash_stands(self):
         for step in ("cv-draft-en", "cv-planned-en"):
             self.workspace.write(self.job, step, {"version": 1})
