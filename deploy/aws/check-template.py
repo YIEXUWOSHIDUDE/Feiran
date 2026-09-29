@@ -36,6 +36,14 @@ SAMPLE = {
 }
 
 
+# All the release role may do: push to this registry, send the release command, read its result.
+RELEASE_ACTIONS = {
+    "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload",
+    "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchGetImage",
+    "ecr:DescribeImages", "ssm:SendCommand", "ssm:GetCommandInvocation",
+}
+
+
 def problems(template: dict) -> list[str]:
     found = []
     resources = template["Resources"]
@@ -83,7 +91,50 @@ def problems(template: dict) -> list[str]:
     values = resources["Host"]["Properties"]["UserData"]["Fn::Base64"]["Fn::Sub"][1]
     check(values.get("VolumeNew") == {"Fn::If": ["CreateDataVolume", "1", "0"]},
           "the host may format a data volume the stack did not make (one given as DataVolumeId holds data)")
+
+    # Releases: only this repository's jobs in one GitHub environment, and only the release command.
+    trust = resources["ReleaseRole"]["Properties"]["AssumeRolePolicyDocument"]["Statement"]
+    conditions = [statement.get("Condition", {}) for statement in trust]
+    check(all(set(condition) == {"StringEquals"} for condition in conditions), "the release role's trust matches loosely")
+    subjects = [condition["StringEquals"].get("token.actions.githubusercontent.com:sub") for condition in conditions]
+    check(all(isinstance(subject, dict) and "Fn::Sub" in subject and "*" not in subject["Fn::Sub"]
+              and subject["Fn::Sub"] == "repo:${GitHubRepository}:environment:${GitHubEnvironment}" for subject in subjects),
+          f"the release role trusts more than one repository's environment: {subjects}")
+    check(all(condition["StringEquals"].get("token.actions.githubusercontent.com:aud") == "sts.amazonaws.com"
+              for condition in conditions), "the release role does not check the token's audience")
+    document = resources["ReleaseDocument"]["Properties"]["Content"]
+    commands = [command for step in document["mainSteps"] for command in step["inputs"]["runCommand"]]
+    check(commands == ["/usr/local/sbin/workbench-release {{ Image }}"], f"the release document runs more: {commands}")
+    pattern = release_pattern(document["parameters"]["Image"]["allowedPattern"],
+                              "123456789012.dkr.ecr.us-east-1.amazonaws.com/job-fit-repository-abc")
+    good = "123456789012.dkr.ecr.us-east-1.amazonaws.com/job-fit-repository-abc@sha256:" + "a" * 64
+    check(bool(re.fullmatch(pattern, good)), f"the release document refuses a real release: {pattern}")
+    for bad in (good + "; reboot", good.replace(".dkr", ";dkr"), good.replace("@sha256:", ":latest@sha256:"),
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com/other@sha256:" + "a" * 64, good[:-1] + " "):
+        check(not re.fullmatch(pattern, bad), f"the release document accepts {bad!r}")
+    budget = resources["MonthlyBudget"]["Properties"]
+    check(len(budget.get("NotificationsWithSubscribers", [])) >= 1, "the budget notifies no one")
+    release_actions = {action for policy in resources["ReleaseRole"]["Properties"]["Policies"]
+                       for statement in policy["PolicyDocument"]["Statement"]
+                       for action in ([statement["Action"]] if isinstance(statement["Action"], str) else statement["Action"])}
+    check(release_actions == RELEASE_ACTIONS, f"the release role may do more or less than release: {sorted(release_actions ^ RELEASE_ACTIONS)}")
+    check(resources["GitHubOidcProvider"].get("DeletionPolicy") == "Retain",
+          "the GitHub OIDC provider, which other workflows may use, would be deleted with the stack")
     return found
+
+
+def release_pattern(value: object, repository: str) -> str:
+    """The release document's allowedPattern for a sample repository URI (Fn::Join of Fn::Split)."""
+    if isinstance(value, str):
+        return value
+    if "Fn::Join" in value:
+        separator, parts = value["Fn::Join"]
+        items = parts if isinstance(parts, list) else release_pattern(parts, repository)  # a list from Fn::Split
+        return separator.join(release_pattern(item, repository) for item in items)
+    if "Fn::Split" in value:
+        separator, _source = value["Fn::Split"]
+        return repository.split(separator)
+    raise ValueError(f"unexpected {value}")
 
 
 def user_data(template: dict) -> str:

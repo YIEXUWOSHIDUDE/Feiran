@@ -100,6 +100,10 @@ case "$1" in
                 mkdir -p "$into" && echo restored > "$into/facts" ;;
             *" backup.py verify "*) [ "${FAKE_VERIFY_FAILS:-0}" = 0 ] || exit 1 ;;
         esac ;;
+    image)
+        if [ "$2" = ls ] && [ -n "${FAKE_IMAGES:-}" ]; then
+            printf '%s\n' "$FAKE_IMAGES"
+        fi ;;
     create) echo container-1 ;;
     cp) cp -R "$REPO/${2#container-1:/app/}" "$3" ;;
     inspect) echo rev-abc123 ;;
@@ -291,9 +295,13 @@ FAKE_PROBLEMS_a='"jobs/x/gaps.json: not readable"' FAKE_PROBLEMS_b='"jobs/x/gaps
     "$host/install.sh" "$image_b" > /dev/null || fail "a problem both releases find blocked the release"
 [ "$(sed -n 1p "$work/state/good-releases")" = "$image_b" ] || fail "a release that passed is not the last good one"
 [ "$(sed -n 2p "$work/state/good-releases")" = "$image" ] || fail "the good release before it was not kept"
-FAKE_PROBLEMS_b='"jobs/x/gaps.json: not readable"' "$host/install.sh" "$image_b" > /dev/null \
+: > "$calls"
+FAKE_PROBLEMS_b='"jobs/x/gaps.json: not readable"' FAKE_IMAGES="$image"$'\n'"$image_b"$'\n'"$image_c"$'\n''<none>@<none>' \
+    "$host/install.sh" "$image_b" > /dev/null \
     || fail "installing the good release again tripped over a problem it had already passed with"
-echo "ok   install: checked against unchanging data before switching; the last good release put back when one does not start or answer"
+removed=$(sed -n 's/^docker image rm //p' "$calls")
+[ "$removed" = "$image_c" ] || fail "installing the good release again kept or removed the wrong images: $removed"
+echo "ok   install: checked against unchanging data before switching; the last good release put back when one does not start or answer; its image kept"
 
 # install.sh never looks at data that is not on the mounted volume, never checks data that could
 # change, and leaves the workbench as it was when it stops before switching

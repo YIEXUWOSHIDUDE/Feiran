@@ -1,0 +1,96 @@
+# Build, test and push a release, then install it on the EC2 host. Only by hand ("Run workflow"),
+# never on a merge: the host holds real data. The job runs in the GitHub environment "aws": its
+# protection rules decide who may release and from which branch, and AWS trusts only this
+# repository's jobs in that environment (the stack's ReleaseRole). The environment's variables
+# come from the stack's outputs; none of them is secret. See docs/aws-deployment.md.
+name: Release to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      install:
+        description: >-
+          Install it on the host. Turn off only for the very first release, which is pushed so the
+          new data volume can be formatted with it before anything is installed.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write  # the OIDC token the release role trusts
+
+concurrency:
+  group: release-aws
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, test, push and install
+    runs-on: ubuntu-24.04
+    environment: aws
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      RELEASE_ROLE: ${{ vars.AWS_RELEASE_ROLE_ARN }}
+      REPOSITORY: ${{ vars.AWS_REPOSITORY_URI }}
+      HOST: ${{ vars.AWS_HOST_ID }}
+      DOCUMENT: ${{ vars.AWS_RELEASE_DOCUMENT }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Sign in to AWS as the release role, with this job's OIDC token
+        run: |
+          token=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | python3 -c 'import json, sys; print(json.load(sys.stdin)["value"])')
+          echo "::add-mask::$token"
+          # What the token says, so the role's trust can be checked against it; never the token itself.
+          python3 - "$token" <<'EOF'
+          import base64, json, sys
+          part = sys.argv[1].split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+          print(json.dumps({key: claims.get(key) for key in ("sub", "aud", "repository", "environment", "ref")}, indent=1))
+          EOF
+          credentials=$(aws sts assume-role-with-web-identity --role-arn "$RELEASE_ROLE" \
+            --role-session-name "release-$GITHUB_RUN_ID" --web-identity-token "$token" --query Credentials --output json)
+          for pair in AWS_ACCESS_KEY_ID:AccessKeyId AWS_SECRET_ACCESS_KEY:SecretAccessKey AWS_SESSION_TOKEN:SessionToken; do
+            value=$(printf '%s' "$credentials" | python3 -c "import json, sys; print(json.load(sys.stdin)['${pair#*:}'])")
+            echo "::add-mask::$value"
+            echo "${pair%%:*}=$value" >> "$GITHUB_ENV"
+          done
+      - name: Build the image for linux/amd64, labelled and tagged with the commit
+        run: docker build --platform linux/amd64 --build-arg REVISION="$GITHUB_SHA" -t "$REPOSITORY:$GITHUB_SHA" .
+      - name: The tests pass inside the image
+        run: docker run --rm "$REPOSITORY:$GITHUB_SHA" python -m unittest discover -p "test_*.py"
+      - name: Push it (a tag is never replaced) and read its digest
+        id: push
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REPOSITORY%%/*}"
+          pushed() {
+            aws ecr describe-images --repository-name "${REPOSITORY#*/}" --image-ids imageTag="$GITHUB_SHA" \
+              --query 'imageDetails[0].imageDigest' --output text 2> /dev/null
+          }
+          pushed > /dev/null || docker push "$REPOSITORY:$GITHUB_SHA"
+          echo "image=$REPOSITORY@$(pushed)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release"
+            echo "- commit: \`$GITHUB_SHA\`"
+            echo "- image: \`$REPOSITORY@$(pushed)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Install it on the host (checked against the data; the release before comes back if it fails)
+        if: inputs.install
+        env:
+          IMAGE: ${{ steps.push.outputs.image }}
+        run: |
+          id=$(aws ssm send-command --instance-ids "$HOST" --document-name "$DOCUMENT" \
+            --parameters "Image=$IMAGE" --query Command.CommandId --output text)
+          status=Pending
+          for _ in $(seq 180); do  # up to 30 minutes: pulling the image, the health check and the data check
+            if ! status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$HOST" \
+                --query Status --output text 2>&1); then
+              # Right after sending, the command may not be found yet; any other error ends the wait.
+              case "$status" in *InvocationDoesNotExist*) status=Pending ;; *) echo "$status (command $id)"; exit 1 ;; esac
+            fi
+            case "$status" in Pending|InProgress|Delayed|Cancelling) sleep 10 ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation --command-id "$id" --instance-id "$HOST" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text
+          echo "- result on the host: $status" >> "$GITHUB_STEP_SUMMARY"
+          test "$status" = Success
