@@ -347,7 +347,7 @@ Jev 在这里是**语义判断器**，不是业务决策者。代码继续控制
 
 目标：在不改变现有工作方式的前提下，在一台 AWS 主机上为单个用户运行现有应用：一个容器、一个进程，SQLite 和岗位文件夹放在一个数据卷上，只能通过 SSM 端口转发访问。不重写、不迁移数据库、不引入新的 agent 架构。
 
-镜像（`Dockerfile`）：基于 `python:3.14-slim-trixie`，面向 linux/amd64，包含 Debian 的 Chromium、Liberation 字体（字宽与 Arial 相同，因此英文简历的排版与 Mac 上一致）、Noto Sans CJK 和 tini（回收 Chromium 的子进程），以 uid 10001 运行。`.dockerignore` 是白名单：只有代码、`web/`、合成示例、`deploy/smoke.py`、`starter_boards.json` 和 `requirements.txt` 会被放入；`.local/`、密钥和本地笔记从不放入。
+镜像（`Dockerfile`）：基于 `python:3.14-slim-trixie`，面向 linux/amd64（compose 和 CI 都固定这个平台，Apple Silicon 的 Mac 上靠模拟运行），包含 Debian 的 Chromium、Liberation 字体（字宽与 Arial 相同，因此英文简历的排版与 Mac 上一致）、Noto Sans CJK 和 tini（回收 Chromium 的子进程），以 uid 10001 运行。`.dockerignore` 是白名单：只有代码、`web/`、合成示例、`deploy/smoke.py`、`starter_boards.json` 和 `requirements.txt` 会被放入；`.local/`、密钥和本地笔记从不放入。
 
 数据：一个目录（`--data` 或 `WORKBENCH_DATA`，默认 `.local`）存放 `workbench.db`、`listings.db`、`cv-profile.json` 和 `jobs/`；在容器中，它是挂载到 `/data` 的数据卷。准备好的数据卷中有一个空的 `.workbench-data` 文件。使用 `--require-data`（`WORKBENCH_REQUIRE_DATA=1`）时，如果该目录缺失、缺少该文件或不可写，应用会拒绝启动（退出码 2，原因输出到 stderr），因此即使挂载缺失，也不会启动一个空工作台并在其中写入新数据。
 
@@ -355,11 +355,11 @@ Jev 在这里是**语义判断器**，不是业务决策者。代码继续控制
 
 DeepSeek 密钥：依次从 `DEEPSEEK_API_KEY`、由 `DEEPSEEK_API_KEY_FILE` 指定的文件（compose 把宿主机上的文件作为 secret 挂载到 `/run/secrets/deepseek_api_key`；文件缺失或为空是错误，绝不回退）以及 macOS 上的 Keychain 读取。密钥从不出现在镜像或 compose 的环境变量中。
 
-Chromium 的沙箱：Docker 默认 seccomp 配置阻止了 Chromium 沙箱所依赖的用户命名空间，而 Chromium 在没有沙箱时会拒绝启动（“No usable sandbox!”）。`deploy/seccomp-chromium.json` 是 Docker 29.8.1 的默认配置加上一条允许 `clone` 和 `unshare` 的规则。在自身的用户命名空间之外，容器永远没有 CAP_SYS_ADMIN，因此它仍然无法创建任何其他命名空间；`setns` 和 `mount` 仍被阻止。已拒绝：`--no-sandbox`（那样渲染器里的漏洞一旦被利用，就能以应用的权限访问全部数据）、`--cap-add SYS_ADMIN` 或特权容器（远超所需），以及 Chromium 的 SUID 沙箱辅助程序（它需要 setuid root，而 `no-new-privileges` 会阻止这点）。有一项测试确保 Chrome 命令行上没有任何沙箱标志。在 CI 中（Docker 28.0.4，Ubuntu 24.04，`kernel.apparmor_restrict_unprivileged_userns = 1`），无需改动宿主机即可工作，因为这项限制不作用于受 Docker AppArmor 配置约束的容器进程。
+Chromium 的沙箱：Docker 默认 seccomp 配置阻止了 Chromium 沙箱所依赖的用户命名空间，而 Chromium 在没有沙箱时会拒绝启动（“No usable sandbox!”）。`deploy/seccomp-chromium.json` 是 Docker 29.8.1 的默认配置加上两条规则：`clone` 和 `unshare` 只能创建用户、PID 和网络命名空间，这正是 Chromium 沙箱用到的三种；挂载、IPC、UTS、cgroup 和时间命名空间仍被拒绝，`setns` 和 `mount` 也仍被阻止。创建 PID 或网络命名空间需要对其所属的用户命名空间拥有 CAP_SYS_ADMIN，而容器在自己新建的用户命名空间之外没有这项能力，所以这两种只能在新的用户命名空间里创建。（第一版曾放开全部命名空间种类，Codex 审查指出后收窄。）已拒绝：`--no-sandbox`（那样渲染器里的漏洞一旦被利用，就能以应用的权限访问全部数据）、`--cap-add SYS_ADMIN` 或特权容器（远超所需），以及 Chromium 的 SUID 沙箱辅助程序（它需要 setuid root，而 `no-new-privileges` 会阻止这点）。有一项测试确保 Chrome 命令行上没有任何沙箱标志。在 CI 中（Docker 28.0.4，Ubuntu 24.04，`kernel.apparmor_restrict_unprivileged_userns = 1`），无需改动宿主机即可工作，因为这项限制不作用于受 Docker AppArmor 配置约束的容器进程。
 
 其他容器设置（`compose.yaml`）：只读根文件系统、tmpfs `/tmp`、为 Chromium 提供 256 MB 的 `/dev/shm`、`no-new-privileges`、`restart: unless-stopped`，以及镜像的健康检查。
 
-验证：CI（`.github/workflows/ci.yml`，GitHub Actions，Ubuntu 24.04）在 Linux 上运行所有测试，如果有任何测试被跳过则失败。然后构建镜像；检查其中没有个人或本地内容，并且它以 uid 10001 运行；在镜像内运行测试；检查它在没有标记的目录上拒绝启动；运行 `deploy/smoke.py`（使用合成数据和脚本化的 DeepSeek 替身走完整个工作流，用容器中的 Chromium 打印真实的英文和中文 PDF，并检查其文本、字体和页数）；然后用 compose 启动服务，检查健康检查、Host 与令牌检查、只有回环地址在监听、令牌从不进入日志，以及重新创建的容器仍能找到事实、简历 profile、岗位和批准记录。CI 中从不调用 DeepSeek。容器中打印的中文 PDF 与 Mac 上的进行了目视比较：换行和布局相同。英文简历只嵌入 Liberation Sans；中文简历嵌入 Noto Sans CJK 和 Liberation Sans（Chrome 像 Mac 上的 PingFang 一样，将 Noto Sans CJK 作为 Type3 字体嵌入）。
+验证：CI（`.github/workflows/ci.yml`，GitHub Actions，Ubuntu 24.04）在 Linux 上运行所有测试，如果有任何测试被跳过则失败。然后构建 linux/amd64 镜像并确认其平台；检查其中没有个人或本地内容，并且它以 uid 10001 运行；确认容器能创建 Chromium 用的用户、PID 和网络命名空间，而挂载、IPC、UTS、cgroup 和时间命名空间都被拒绝；在镜像内运行测试；检查它在没有标记的目录上拒绝启动；运行 `deploy/smoke.py`（使用合成数据和脚本化的 DeepSeek 替身走完整个工作流，用容器中的 Chromium 打印真实的英文和中文 PDF，并检查其文本、字体和页数）；然后用 compose 启动服务，检查健康检查、Host 与令牌检查、Docker 实际发布的端口只有 127.0.0.1:8765（并用 `ss` 确认只有回环地址在监听）、令牌从不进入日志，以及重新创建的容器仍能找到事实、简历 profile、岗位和批准记录。CI 中从不调用 DeepSeek。`deploy/smoke.py` 会上传简历并确认事实，所以 `create` 拒绝任何已有数据的目录（只允许数据卷标记文件），`verify` 拒绝不是 `create` 建立的目录，冒烟测试不会确认或替换真实数据。容器中打印的中文 PDF 与 Mac 上的进行了目视比较：换行和布局相同。英文简历只嵌入 Liberation Sans；中文简历嵌入 Noto Sans CJK 和 Liberation Sans（Chrome 像 Mac 上的 PingFang 一样，将 Noto Sans CJK 作为 Type3 字体嵌入）。
 
 尚未验证：EC2 主机本身（Amazon Linux 2023、其内核的用户命名空间设置和其 Docker 版本）以及 arm64 镜像。
 

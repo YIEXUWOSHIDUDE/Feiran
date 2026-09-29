@@ -9,6 +9,10 @@ create a job (its CV is drafted, reworded and adjusted by itself), check what th
 each requirement, approve that exact CV and export it. It also prints a Chinese CV from the
 synthetic examples. Each PDF is checked for its text, its fonts and its page count. `verify`
 checks that what `create` left is all still there and still consistent.
+
+It only ever runs on a throwaway folder: `create` refuses a folder that already holds anything
+but the data-volume marker, and `verify` refuses one that `create` did not make, so real facts
+are never confirmed or replaced by a smoke run.
 """
 
 import argparse
@@ -52,6 +56,9 @@ STRUCTURE = {"sections": [
 ]}
 CONTACT = {"name": "Alex Example", "location": "Los Angeles, CA", "phone": "000-000-0000",
            "email": "alex@example.com", "links": [{"label": "github.com/alex-example", "url": "github.com/alex-example"}]}
+SMOKE_FACTS = {"Built REST APIs for an internal tool.", "Languages: Python, Java"}
+DATA_MARKER = ".workbench-data"
+RUN_RECORD = "smoke-run.json"  # left by create; verify runs only where it is
 
 
 class ScriptedDeepSeek:
@@ -122,6 +129,10 @@ def check(condition: bool, what: str) -> None:
 
 
 def create(data: Path, out: Path) -> None:
+    held = sorted(item.name for item in data.iterdir() if item.name != DATA_MARKER) if data.is_dir() else []
+    if held:
+        raise SystemExit(f"REFUSED: {data} already holds {', '.join(held)}. The smoke run uploads a CV and "
+                         "confirms facts, so it runs only on an empty throwaway folder, never on real data.")
     out.mkdir(parents=True, exist_ok=True)
     client = client_for(data)
     check(client.get("/healthz").json() == {"status": "ok"}, "health endpoint answers ok")
@@ -129,7 +140,9 @@ def create(data: Path, out: Path) -> None:
                             headers={**HEADERS, "Content-Type": "application/pdf"}), "upload the CV")
     ok(client.post(f"/api/cv/uploads/{upload['upload_id']}/save", json=CONTACT, headers=HEADERS), "save the CV")
     facts = ok(client.get("/api/facts", headers=HEADERS), "list facts")["facts"]
-    ok(client.post("/api/facts/confirm", json={"refs": [f"{fact['id']}@{fact['version']}" for fact in facts]},
+    check({fact["text"] for fact in facts} == SMOKE_FACTS, "the CV's two lines became facts, and nothing else is there")
+    ok(client.post("/api/facts/confirm", json={"refs": [f"{fact['id']}@{fact['version']}" for fact in facts
+                                                        if fact["text"] in SMOKE_FACTS]},
                    headers=HEADERS), "confirm the facts")
     job = ok(client.post("/api/jobs", json={"title": "Backend Intern", "company": "Example Co", "text": JD},
                          headers=HEADERS), "create a job")["job_id"]
@@ -176,9 +189,12 @@ def create(data: Path, out: Path) -> None:
               f"Chinese CV uses Noto Sans CJK and Liberation Sans only: {zh['fonts']}")
     (out / "summary.json").write_text(json.dumps({"job": job, "statuses": statuses, "english": {**en, "text": None},
                                                   "chinese": {**zh, "text": None}}, ensure_ascii=False, indent=1))
+    (data / RUN_RECORD).write_text(json.dumps({"job": job}) + "\n", encoding="utf-8")
 
 
 def verify(data: Path) -> None:
+    if not (data / RUN_RECORD).is_file():
+        raise SystemExit(f"REFUSED: {data} was not made by `smoke.py create`, so there is nothing of the smoke run's to check.")
     client = client_for(data)
     facts = ok(client.get("/api/facts", headers=HEADERS), "list facts")["facts"]
     check(len(facts) == 2 and all(fact["status"] == "confirmed" for fact in facts), "both facts still confirmed")

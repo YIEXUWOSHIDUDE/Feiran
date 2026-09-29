@@ -245,7 +245,7 @@ Notes:
 
 ## Run in a container
 
-The same web page runs in a Linux container (linux/amd64, the way it will run on the AWS host). Data never goes into the image; it stays in a folder on the host, mounted at `/data`:
+The same web page runs in a Linux container (linux/amd64, the way it will run on the AWS host; an Apple Silicon Mac emulates it, which is slower). Data never goes into the image; it stays in a folder on the host, mounted at `/data`:
 
 ```sh
 mkdir -p ~/workbench-data && touch ~/workbench-data/.workbench-data
@@ -258,9 +258,9 @@ Open http://127.0.0.1:8765/; `docker compose down` stops it. The folder keeps th
 - The container runs as uid 10001, which must be able to write the folder (on Linux: `sudo chown -R 10001:10001 <folder>`).
 - With `WORKBENCH_REQUIRE_DATA=1` the app refuses to start when the folder has no `.workbench-data` file, so a missing volume never starts an empty workbench.
 - The DeepSeek key comes from a file on the host: `DEEPSEEK_KEY_FILE=<file>`. Compose mounts it as a secret; the key is never in the image or an environment variable. Without it, the DeepSeek steps fail with a clear message.
-- Chromium prints the CV with Liberation Sans (Arial's widths) and Noto Sans CJK, and keeps its sandbox: compose runs the container with `deploy/seccomp-chromium.json`, Docker's default seccomp profile plus the user namespaces the sandbox needs.
+- Chromium prints the CV with Liberation Sans (Arial's widths) and Noto Sans CJK, and keeps its sandbox: compose runs the container with `deploy/seccomp-chromium.json`, Docker's default seccomp profile plus the user, PID and network namespaces the sandbox makes, and no other kind.
 - `GET /healthz` answers `{"status": "ok"}` without the token. The access log records the method, path, status and time only, never a query string (preview and download links carry the token).
-- `python deploy/smoke.py create --data /data --out /data/smoke` runs the whole workflow once with synthetic data, a scripted stand-in for DeepSeek and real PDFs. CI runs it in the container on every pull request.
+- `deploy/smoke.py` runs the whole workflow once with synthetic data, a scripted stand-in for DeepSeek and real PDFs; CI runs it in the container on every pull request. It uploads a CV and confirms facts, so it refuses any folder that already holds data: give it an empty throwaway folder, never your real one.
 
 ## Data and limits
 

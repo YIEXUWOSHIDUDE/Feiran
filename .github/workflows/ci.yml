@@ -44,8 +44,10 @@ jobs:
           docker version --format 'Docker {{.Server.Version}}'
           docker compose version
           sysctl user.max_user_namespaces kernel.apparmor_restrict_unprivileged_userns || true
-      - name: Build the image
-        run: docker build -t "$WORKBENCH_IMAGE" .
+      - name: Build the image for linux/amd64
+        run: |
+          docker build --platform linux/amd64 -t "$WORKBENCH_IMAGE" .
+          test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$WORKBENCH_IMAGE")" = linux/amd64
       - name: Nothing personal or local is in the image, and it runs as its own user
         run: |
           docker run --rm --entrypoint sh "$WORKBENCH_IMAGE" -c 'ls -A /app'
@@ -59,6 +61,14 @@ jobs:
           mkdir -p ci-data empty
           touch ci-data/.workbench-data
           sudo chown -R 10001:10001 ci-data empty
+      - name: The container may make the namespaces Chromium's sandbox uses, and no others
+        run: |
+          in_container() { docker compose run --rm --no-deps --entrypoint unshare workbench "$@"; }
+          in_container --user --pid --net --fork true
+          for other in --mount --ipc --uts --cgroup --time; do
+            if in_container --user "$other" true 2> refused.txt; then echo "::error::unshare --user $other was allowed"; exit 1; fi
+            grep -q "Operation not permitted" refused.txt || { cat refused.txt; exit 1; }
+          done
       - name: Refuse to start on a folder that is not the data volume
         run: |
           set +e
@@ -89,6 +99,10 @@ jobs:
           test -n "$token"
           curl -fsS -H "X-Workbench-Token: $token" http://127.0.0.1:8765/api/jobs | grep -q job_id
           curl -s -o /dev/null "http://127.0.0.1:8765/preview/none/en?token=$token"
+          # Docker's own record of what it published; NAT-only publishing would not show in ss.
+          ports=$(docker inspect -f '{{json .NetworkSettings.Ports}}' "$(docker compose ps -q workbench)")
+          echo "published: $ports"
+          echo "$ports" | jq -e 'keys == ["8765/tcp"] and (.["8765/tcp"] | length > 0 and all(.HostIp == "127.0.0.1"))'
           ss -ltnH 'sport = :8765' | tee listening.txt
           if grep -v '127.0.0.1:8765' listening.txt; then echo "::error::listening beyond the loopback"; exit 1; fi
           docker compose logs > compose.log

@@ -12,6 +12,7 @@ services:
   workbench:
     build: .
     image: ${WORKBENCH_IMAGE:-job-fit-workbench:local}
+    platform: linux/amd64  # what CI tests and the host runs; an Apple Silicon Mac emulates it
     ports:
       - "127.0.0.1:8765:8765"  # the host's loopback only, never every interface
     volumes:
@@ -29,8 +30,9 @@ services:
     security_opt:
       - no-new-privileges:true
       # Docker's default seccomp profile blocks the user namespaces Chromium's sandbox is built
-      # on, and Chromium refuses to print without its sandbox. This is Docker's default plus that
-      # one rule (the last in the file). The sandbox stays on; nothing runs with --no-sandbox.
+      # on, and Chromium refuses to print without its sandbox. This is Docker's default plus two
+      # rules (the last in the file) that allow only the user, PID and network namespaces the
+      # sandbox makes. The sandbox stays on; nothing runs with --no-sandbox.
       - seccomp=./deploy/seccomp-chromium.json
     restart: unless-stopped
 

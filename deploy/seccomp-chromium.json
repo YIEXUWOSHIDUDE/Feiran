@@ -873,11 +873,37 @@
 		},
 		{
 			"names": [
-				"clone",
+				"clone"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
+					"value": 235012096,
+					"op": "SCMP_CMP_MASKED_EQ"
+				}
+			],
+			"comment": "Added to Docker 29.8.1's default profile: Chromium's sandbox creates user, PID and network namespaces (clone and unshare), and nothing else. Mount, IPC, UTS and cgroup namespaces stay refused. clone cannot make a time namespace.",
+			"excludes": {
+				"arches": [
+					"s390",
+					"s390x"
+				]
+			}
+		},
+		{
+			"names": [
 				"unshare"
 			],
 			"action": "SCMP_ACT_ALLOW",
-			"comment": "Added to Docker 29.8.1's default profile, the only change: Chromium's sandbox puts itself in a user namespace, then gives each page its own PID and network namespace. Outside its own user namespace the container never has CAP_SYS_ADMIN, so it still cannot create any other namespace. setns and mount stay blocked."
+			"args": [
+				{
+					"index": 0,
+					"value": 235012224,
+					"op": "SCMP_CMP_MASKED_EQ"
+				}
+			],
+			"comment": "Added to Docker 29.8.1's default profile: Chromium's sandbox creates user, PID and network namespaces (clone and unshare), and nothing else. Mount, IPC, UTS, cgroup and time namespaces stay refused."
 		}
 	]
 }

@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deepseek_client import DeepSeekError
-from facts import confirm_facts, import_facts, revise_fact
+from facts import confirm_facts, import_facts, list_facts, revise_fact
 from cv_import import STRUCTURE_RULES
 from cv_plan import PLAN_RULES
 from gaps import EVIDENCE_RULES, SUGGEST_RULES
@@ -772,6 +772,27 @@ class ServerSettingsTests(unittest.TestCase):
             (Path(directory) / DATA_MARKER).write_text("", encoding="utf-8")
             self.assertEqual(main(["--data", directory, "--require-data", "--host", "0.0.0.0"]), 0)
         self.assertEqual((run.call_args.kwargs["host"], run.call_args.kwargs["access_log"]), ("0.0.0.0", False))
+
+
+@unittest.skipUnless(HAS_FASTAPI and HAS_PYPDF, "the smoke run needs the packages in requirements.txt")
+class SmokeRunTests(unittest.TestCase):
+    """deploy/smoke.py uploads a CV and confirms facts, so it must never run on real data."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("smoke", Path(__file__).parent / "deploy" / "smoke.py")
+        self.smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.smoke)
+
+    def test_it_refuses_a_folder_that_already_holds_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            import_facts(data / "workbench.db", FACTS)  # someone's facts, not confirmed yet
+            with self.assertRaisesRegex(SystemExit, "REFUSED"):
+                self.smoke.create(data, data / "smoke")
+            with self.assertRaisesRegex(SystemExit, "REFUSED"):
+                self.smoke.verify(data)
+            self.assertEqual([item.name for item in data.iterdir()], ["workbench.db"])
+            self.assertEqual({fact["status"] for fact in list_facts(data / "workbench.db")}, {"pending"})
 
 
 if __name__ == "__main__":

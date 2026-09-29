@@ -245,7 +245,7 @@ python3 -m venv .venv
 
 ## 在容器中运行
 
-同一个网页也能在 Linux 容器中运行（linux/amd64，即将来在 AWS 主机上的运行方式）。数据绝不会进入镜像，而是保存在宿主机上的一个目录中，挂载到 `/data`：
+同一个网页也能在 Linux 容器中运行（linux/amd64，即将来在 AWS 主机上的运行方式；Apple Silicon 的 Mac 上靠模拟运行，会慢一些）。数据绝不会进入镜像，而是保存在宿主机上的一个目录中，挂载到 `/data`：
 
 ```sh
 mkdir -p ~/workbench-data && touch ~/workbench-data/.workbench-data
@@ -258,9 +258,9 @@ WORKBENCH_DATA_DIR=~/workbench-data docker compose up -d --build
 - 容器以 uid 10001 运行，该用户必须能写入该目录（在 Linux 上：`sudo chown -R 10001:10001 <folder>`）。
 - 设置 `WORKBENCH_REQUIRE_DATA=1` 时，如果目录中没有 `.workbench-data` 文件，应用会拒绝启动，因此缺失数据卷时绝不会启动一个空工作台。
 - DeepSeek 密钥来自宿主机上的文件：`DEEPSEEK_KEY_FILE=<file>`。Compose 将其挂载为 secret；密钥绝不会出现在镜像或环境变量中。没有它时，DeepSeek 相关步骤会失败并给出明确提示。
-- Chromium 用 Liberation Sans（字宽与 Arial 相同）和 Noto Sans CJK 打印简历，并保留沙箱：compose 使用 `deploy/seccomp-chromium.json` 运行容器，即 Docker 默认的 seccomp 配置加上沙箱所需的用户命名空间。
+- Chromium 用 Liberation Sans（字宽与 Arial 相同）和 Noto Sans CJK 打印简历，并保留沙箱：compose 使用 `deploy/seccomp-chromium.json` 运行容器，即 Docker 默认的 seccomp 配置，再允许沙箱创建的用户、PID 和网络命名空间，其他种类一律不允许。
 - `GET /healthz` 无需令牌即可返回 `{"status": "ok"}`。访问日志只记录请求方法、路径、状态码和耗时，绝不记录查询字符串（预览和下载链接携带令牌）。
-- `python deploy/smoke.py create --data /data --out /data/smoke` 使用合成数据、脚本化的 DeepSeek 替身和真实 PDF 将整个工作流运行一次。CI 在每个 pull request 中都会在容器里运行它。
+- `deploy/smoke.py` 使用合成数据、脚本化的 DeepSeek 替身和真实 PDF 将整个工作流运行一次；CI 在每个 pull request 中都会在容器里运行它。它会上传简历并确认事实，所以拒绝任何已有数据的目录：只能给它一个空的临时目录，绝不能用你的真实数据目录。
 
 ## 数据与限制
 
