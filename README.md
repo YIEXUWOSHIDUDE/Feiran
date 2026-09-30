@@ -20,7 +20,7 @@ An AI-powered workspace that helps you turn real experience into clearer, job-sp
 
 ## Availability
 
-Feiran is being prepared as a browser-based cloud workspace. **It is not live yet:** there is no public demo, hosted URL or open registration. The prepared deployment offers a public HTTPS address with a single owner login, no open registration, and private persistent data. See [AWS public deployment](docs/aws-public.md); deployment and cloud acceptance checks are still pending.
+A single-owner Feiran workspace is now deployed on AWS with a public HTTPS address and private login. **There is no public demo or open registration.** The owner can open the workspace in a browser; local operation remains optional. Login protection, synthetic English/Chinese PDF export, persistence across test containers, and backup restoration have been verified on AWS. Real AI generation still needs the cloud DeepSeek secret. See [AWS public deployment](docs/aws-public.md) and the [acceptance record](docs/aws-acceptance.md) for the tested scope and remaining checks.
 
 ## Using Feiran
 

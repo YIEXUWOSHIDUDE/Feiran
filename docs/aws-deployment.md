@@ -221,6 +221,17 @@ run_on_host "set -o pipefail; docker pull $RELEASE && \
   docker run --rm --entrypoint cat $RELEASE /app/deploy/aws/host/format-data.sh | bash -s $VOLUME"
 ```
 
+If a newly created volume fails the zero check, **do not infer that it is safe to erase**.
+AWS documents that unwritten EBS blocks may read as zeros or cryptographically pseudorandom data
+([data protection](https://docs.aws.amazon.com/ebs/latest/userguide/data-protection.html)).
+The formatter intentionally fails closed in either case. Confirm the exact volume ID, its new
+creation and lack of a source snapshot, its device identity, and that it is unmounted and has no
+filesystem signature. With all writers stopped, create and retain a safety snapshot. Wait for it
+to complete, then inspect `ListSnapshotBlocks`: there must be zero blocks **and no NextToken**;
+an empty page with a continuation token is not proof of emptiness. Only a verified new,
+logically empty volume may be zero-initialized and passed to the unchanged formatter again.
+Never apply this recovery to a reused volume or one whose provenance is uncertain.
+
 Then install the release. `workbench-release` pulls the image, takes `install.sh` from that same
 image, and runs it. The host's compose files, seccomp profile, scripts and systemd units come from
 the image, so the host runs the files that were tested with it. The first install also makes the
