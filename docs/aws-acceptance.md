@@ -7,7 +7,7 @@ record every run on AWS.
 
 **Status: owner workspace deployed; initial checks passed, full matrix incomplete.** On
 2026-09-30 UTC, release `613f902` was installed behind CloudFront HTTPS with owner authentication.
-Real DeepSeek calls await the cloud secret. Host reboot and recovery passed; interruption
+The owner supplied the cloud secret; one bounded live DeepSeek connectivity call passed. Host reboot and recovery passed; interruption
 and rollback drills below are not claimed as completed. Earlier CI used GitHub's Ubuntu runners, Docker and real
 Chromium, with AWS and systemd stubbed for host-script tests. Each result is one of:
 
@@ -240,3 +240,12 @@ Host reboot completed at 2026-09-30 09:04:23 UTC. After boot, the data device wa
 `/srv/workbench`, the production service was active, and the isolated synthetic facts, profile,
 job, approval and PDF still passed `deploy/smoke.py verify`. Local and public health returned
 200, and unauthenticated private content still returned 401.
+
+DeepSeek connection was completed on 2026-09-30 UTC through the base stack's existing secret
+parameter and the host environment. The first test invocation used the wrong Compose project
+name for the symlinked release and made no model request; selecting the sole running workbench
+container corrected the test harness. From that production container, `chat_json` returned the
+expected synthetic JSON using `deepseek-flash`: 1 request, 52 input tokens, 5 output tokens,
+with a 128-output-token cap and HTTP retries disabled. No personal input or secret value was
+printed. The owner gate remained 401 without login and public HTTPS health returned 200.
+This confirms live connectivity, not a full real-model resume quality evaluation.
