@@ -120,7 +120,8 @@ sets the budget.
 Releases come from the **Release to AWS** workflow (`.github/workflows/release.yml`), run by hand;
 a merge never releases. It runs in the GitHub environment `aws` and signs in to AWS with the job's
 OIDC token, so no AWS key is stored anywhere. Create the environment and give it the stack's
-outputs as variables (none of them is secret):
+outputs as environment secrets, except for the region. The identifiers are not credentials, but
+keeping them as secrets prevents this public repository's logs from publishing them:
 
 ```sh
 REPO=YIEXUWOSHIDUDE/job-fit-materials-workbench
@@ -130,20 +131,21 @@ output() {
 }
 gh api -X PUT "repos/$REPO/environments/aws" > /dev/null
 gh variable set AWS_REGION --repo "$REPO" --env aws --body "$AWS_REGION"
-gh variable set AWS_RELEASE_ROLE_ARN --repo "$REPO" --env aws --body "$(output ReleaseRoleArn)"
-gh variable set AWS_REPOSITORY_URI --repo "$REPO" --env aws --body "$(output RepositoryUri)"
-gh variable set AWS_HOST_ID --repo "$REPO" --env aws --body "$(output HostId)"
-gh variable set AWS_RELEASE_DOCUMENT --repo "$REPO" --env aws --body "$(output ReleaseDocumentName)"
+gh secret set AWS_RELEASE_ROLE_ARN --repo "$REPO" --env aws --body "$(output ReleaseRoleArn)"
+gh secret set AWS_REPOSITORY_URI --repo "$REPO" --env aws --body "$(output RepositoryUri)"
+gh secret set AWS_HOST_ID --repo "$REPO" --env aws --body "$(output HostId)"
+gh secret set AWS_RELEASE_DOCUMENT --repo "$REPO" --env aws --body "$(output ReleaseDocumentName)"
 ```
 
 Then, on GitHub, under Settings → Environments → `aws`: add yourself as a **required reviewer**, and
 under deployment branches allow **`main` only**. Every release then waits for your approval, and a
 job from another branch cannot take on the release role.
 
-The repository is public, so the release runs' logs are public too. They show the AWS account ID
-(it is part of the registry's address), the host's ID and what the install printed: the release,
-its revision, and the names of any files the data check flags. They never show data, keys or
-tokens; the workflow masks the credentials it gets.
+The repository is public, so release logs are public too. Environment secrets mask the full
+resource identifiers; the workflow also masks the account ID and registry hostname before any
+AWS call or build. The summary shows only the commit, image digest and result. Detailed host
+output stays in AWS Systems Manager: open the printed command ID there to diagnose a failure,
+because that output may include private file names. Do not copy it into a public issue or log.
 
 ## 4. Push the first release, format the data volume, install
 
