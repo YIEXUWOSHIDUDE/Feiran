@@ -205,13 +205,14 @@ def verify_data(data: Path) -> dict[str, Any]:
             counts["confirmed"] = sum(fact["status"] == "confirmed" for fact in facts)
         except (FactStoreError, sqlite3.DatabaseError):
             problems.append("workbench.db: the facts cannot be read")
-    profile = data / "cv-profile.json"
-    if profile.exists():
-        try:
-            if not isinstance(json.loads(profile.read_text(encoding="utf-8")), dict):
-                problems.append("cv-profile.json: not a CV profile")
-        except (OSError, ValueError):
-            problems.append("cv-profile.json: not readable")
+    for name in ("cv-profile.json", "cv-profile.en.json", "cv-profile.zh.json"):
+        profile = data / name
+        if profile.exists():
+            try:
+                if not isinstance(json.loads(profile.read_text(encoding="utf-8")), dict):
+                    problems.append(f"{name}: not a CV profile")
+            except (OSError, ValueError):
+                problems.append(f"{name}: not readable")
     jobs = data / "jobs"
     for job in sorted(jobs.iterdir()) if jobs.is_dir() else []:
         if not job.is_dir() or not JOB_ID.fullmatch(job.name):

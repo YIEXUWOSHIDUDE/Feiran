@@ -1,3 +1,5 @@
+> For a public HTTPS address with one owner login, also follow [the public entry-point guide](aws-public.md). The base stack below remains private until that separate entry point is enabled.
+
 # Running the workbench on AWS
 
 A private, single-user beta: the same app, on one EC2 host, reached only through a Session Manager

@@ -14,15 +14,18 @@ services:
     image: ${WORKBENCH_IMAGE:-job-fit-workbench:local}
     platform: linux/amd64  # what CI tests and the host runs; an Apple Silicon Mac emulates it
     ports:
-      - "127.0.0.1:8765:8765"  # the host's loopback only, never every interface
+      - "${WORKBENCH_BIND_ADDRESS:-127.0.0.1}:8765:8765"  # the host's loopback only, never every interface
     volumes:
       - ${WORKBENCH_DATA_DIR:?set WORKBENCH_DATA_DIR to the data folder}:/data
     environment:
       WORKBENCH_REQUIRE_DATA: ${WORKBENCH_REQUIRE_DATA:-0}
       DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      WORKBENCH_PUBLIC_HOST: ${WORKBENCH_PUBLIC_HOST:-}
+      WORKBENCH_LOGIN_FILE: /run/secrets/owner_login
       HOME: /tmp
     secrets:
       - deepseek_api_key
+      - owner_login
     read_only: true
     tmpfs:
       - /tmp
@@ -37,5 +40,7 @@ services:
     restart: unless-stopped
 
 secrets:
+  owner_login:
+    file: ${WORKBENCH_LOGIN_FILE:-/dev/null}
   deepseek_api_key:
     file: ${DEEPSEEK_KEY_FILE:-/dev/null}

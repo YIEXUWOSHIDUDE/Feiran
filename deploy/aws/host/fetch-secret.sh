@@ -29,3 +29,26 @@ chmod 0400 "$temporary"
 mv -f "$temporary" "$target"
 trap - EXIT
 echo "$done_message"
+
+# In public mode a missing or unreadable login secret stops startup (never opens the app).
+if [ -n "${WORKBENCH_PUBLIC_HOST:-}" ]; then
+    target=${WORKBENCH_LOGIN_FILE:?WORKBENCH_LOGIN_FILE is not set}
+    temporary=$(mktemp "$(dirname "$target")/.login.XXXXXX")
+    trap 'rm -f "$temporary"' EXIT
+    aws secretsmanager get-secret-value --region "$AWS_REGION" \
+        --secret-id "${WORKBENCH_LOGIN_SECRET_ARN:?WORKBENCH_LOGIN_SECRET_ARN is not set}" \
+        --query SecretString --output text > "$temporary"
+    python3 - "$temporary" <<'PYLOGIN'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1]))
+    assert value["username"] == "feiran" and isinstance(value["password"], str) and len(value["password"]) >= 32
+except Exception:
+    sys.exit("refused: invalid owner login secret")
+PYLOGIN
+    chown "$owner" "$temporary"
+    chmod 0400 "$temporary"
+    mv -f "$temporary" "$target"
+    trap - EXIT
+    echo "the owner login is in place for the container"
+fi

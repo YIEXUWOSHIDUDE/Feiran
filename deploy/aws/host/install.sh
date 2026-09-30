@@ -62,6 +62,12 @@ good=$(sed -n 1p "$state/good-releases" 2> /dev/null || true)
 previous=$good
 [ "$previous" != "$image" ] || previous=""  # the good release again: nothing to go back to
 
+# Public mode may never silently roll back to an image without the owner login gate.
+if [ -n "${WORKBENCH_PUBLIC_HOST:-}" ]; then
+    docker run --rm --network none --entrypoint python "$image" -c 'from public_access import OwnerAccess' \
+        || { echo "refused: this release has no owner login support" >&2; exit 1; }
+fi
+
 revision=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")
 if [ ! -d "$release" ]; then
     container=$(docker create "$image")

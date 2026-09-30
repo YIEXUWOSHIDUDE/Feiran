@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Feiran HTTPS entry point with a private CloudFront VPC origin and one owner login. No public registration.
+Parameters:
+  HostId:
+    Type: AWS::EC2::Instance::Id
+  HostPrivateDns:
+    Type: String
+  HostSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  HostRoleName:
+    Type: String
+  CloudFrontPrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[a-f0-9]+$'
+Resources:
+  OwnerLogin:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Feiran single owner login; retrieve in Secrets Manager, never in release logs.
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"feiran"}'
+        GenerateStringKey: password
+        PasswordLength: 40
+        ExcludePunctuation: true
+        IncludeSpace: false
+  ReadOwnerLogin:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: feiran-owner-login
+      Roles: [!Ref HostRoleName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref OwnerLogin
+  CloudFrontIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: CloudFront origin-facing network only; the app also requires the owner login.
+      GroupId: !Ref HostSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 8765
+      ToPort: 8765
+      SourcePrefixListId: !Ref CloudFrontPrefixListId
+  PrivateOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    DependsOn: CloudFrontIngress
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub ${AWS::StackName}-origin
+        Arn: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${HostId}
+        HTTPPort: 8765
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+        OriginSSLProtocols: [TLSv1.2]
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Feiran private single-owner workspace
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: workbench
+            DomainName: !Ref HostPrivateDns
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt PrivateOrigin.Id
+              OriginReadTimeout: 120
+        DefaultCacheBehavior:
+          TargetOriginId: workbench
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          # Managed CachingDisabled and AllViewerExceptHostHeader: Authorization, cookies,
+          # CSRF headers and query strings reach the app; the origin gets its private DNS Host.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 500
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 502
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 503
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 504
+            ErrorCachingMinTTL: 0
+Outputs:
+  PublicUrl:
+    Value: !Sub https://${Distribution.DomainName}/
+  LoginSecretArn:
+    Value: !Ref OwnerLogin
+  OriginHost:
+    Value: !Ref HostPrivateDns

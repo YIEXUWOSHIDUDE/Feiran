@@ -399,6 +399,7 @@ def revise_fact(
     text: str | None = None,
     fact_type: str | None = None,
     tags: Iterable[str] | None = None,
+    expected_version: int | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Create a pending version, carrying forward fields not changed by the caller."""
     fact_id = _fact_id(fact_id)
@@ -411,6 +412,10 @@ def revise_fact(
     try:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
+            if expected_version is not None:
+                current = connection.execute("SELECT current_version AS version FROM facts WHERE fact_id = ?", (fact_id,)).fetchone()
+                if current is None or current["version"] != expected_version:
+                    raise FactStoreError("这条事实已被修改，请刷新后再编辑")
             return _revise_in_transaction(connection, fact_id, next_text, next_type, next_tags)
     except sqlite3.Error as exc:
         raise FactStoreError("无法创建事实新版本") from exc

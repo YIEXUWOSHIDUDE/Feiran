@@ -280,6 +280,29 @@ def _matched_count(tags: list[str]) -> int:
     return len({tag.casefold() for tag in tags})
 
 
+def location_regions(location: str | None) -> set[str]:
+    """Classify only explicit place names, never the JD language or company nationality.
+
+    This deliberately finite vocabulary leaves unrecognized places unknown. A posting naming
+    multiple regions can appear in both filters; Remote alone proves no country eligibility.
+    """
+    value = (location or "").casefold()
+    mainland_city = re.search(
+        r"\b(beijing|shanghai|shenzhen|guangzhou|hangzhou|suzhou|chengdu|wuhan|nanjing|"
+        r"tianjin|xian|xi'an|chongqing|hefei|wuxi|xiamen|dongguan|zhuhai|changsha|ningbo)\b|"
+        r"北京|上海|深圳|广州|杭州|苏州|成都|武汉|南京|天津|西安|重庆|合肥|无锡|厦门|东莞|珠海|长沙|宁波", value)
+    other_china = re.search(r"\b(hong kong|hongkong|macau|macao|taiwan|taipei)\b|香港|澳门|澳門|台湾|臺灣|台北|臺北", value)
+    mainland = mainland_city or (re.search(r"\b(china|prc)\b|中国|中國", value) and not other_china)
+    other = other_china or re.search(
+        r"\b(usa|united states|u\.s\.|united kingdom|uk|canada|germany|france|india|singapore|"
+        r"japan|australia|netherlands|ireland|sweden|switzerland|brazil|mexico|spain|poland|"
+        r"new york|san francisco|palo alto|mountain view|los angeles|seattle|boston|austin|"
+        r"london|berlin|paris|tokyo|toronto|vancouver|sydney|bengaluru|bangalore|dublin)\b|"
+        r"美国|英国|加拿大|德国|法国|印度|新加坡|日本|澳大利亚", value)
+    result = ({"cn"} if mainland else set()) | ({"other"} if other else set())
+    return result or {"unknown"}
+
+
 def ranked_listings(
     path: Path,
     facts_db: Path,
@@ -288,6 +311,7 @@ def ranked_listings(
     limit: int = PAGE_SIZE,
     offset: int = 0,
     hide_senior: bool = False,
+    region: str = "all",
 ) -> dict[str, Any]:
     """Open postings, most confirmed skills mentioned first; a count of words, not a fit score.
 
@@ -296,6 +320,8 @@ def ranked_listings(
     """
     if isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE or offset < 0:
         raise ListingsError(f"每页岗位数必须在 1 到 {MAX_PAGE_SIZE} 之间")
+    if region not in {"all", "cn", "other", "unknown"}:
+        raise ListingsError("地区筛选无效")
     terms = load_search_terms(facts_db) if Path(facts_db).exists() else []
     tags = list(dict.fromkeys(item["term"] for item in terms))
     # Matching thousands of postings takes seconds, so matches are saved per posting and
@@ -320,7 +346,7 @@ def ranked_listings(
                 )
             rows = connection.execute(
                 """SELECT l.provider, l.board, l.job_id, l.title, l.location, l.source, l.posted_at,
-                          l.text_hash, l.matched_tags, s.company
+                          l.text_hash, l.matched_tags, l.last_seen_at, s.company
                    FROM listings AS l JOIN sources AS s USING (provider, board)
                    ORDER BY l.provider, l.board, l.job_id"""
             ).fetchall()
@@ -329,6 +355,8 @@ def ranked_listings(
     title_key, location_key = title.strip().casefold(), location.strip().casefold()
     groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for row in rows:
+        if region != "all" and region not in location_regions(row["location"]):
+            continue
         if title_key not in row["title"].casefold() or (hide_senior and is_senior_title(row["title"])):
             continue
         if location_key and row["location"] and location_key not in row["location"].casefold():
@@ -344,7 +372,7 @@ def ranked_listings(
                 "postings": [],
             }
         groups[role]["postings"].append({
-            field: row[field] for field in ("job_id", "location", "source", "posted_at")
+            field: row[field] for field in ("job_id", "location", "source", "posted_at", "last_seen_at")
         })
     ranked = list(groups.values())
     for group in ranked:

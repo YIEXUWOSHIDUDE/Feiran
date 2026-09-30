@@ -32,6 +32,8 @@ from pydantic import BaseModel
 
 from cv import (
     CVError,
+    _profile_hash,
+    verify_draft,
     approve_draft,
     build_draft,
     content_fingerprint,
@@ -47,7 +49,7 @@ from cv import (
 from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, structure_cv
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError, chat_json
-from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs
+from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs, revise_fact
 from gaps import (
     GAPS_VERSION,
     accept_gap,
@@ -65,9 +67,11 @@ from job_search import (
     fetch_board,
     fetch_selected,
     parse_board_link,
+    parse_posting_link,
     prepare_pasted_jd,
     prepare_review_input,
 )
+from job_url import fetch_job_url, normalize_url
 from listings import (
     ListingsError,
     add_source,
@@ -81,6 +85,7 @@ from listings import (
 )
 from matching import MatchingError, apply_match_decisions, first_candidates, propose_matches
 from privacy import private_terms
+from public_access import OwnerAccess
 from requirement_flow import (
     RequirementError,
     add_manual_requirements,
@@ -144,6 +149,10 @@ class NewJobRequest(BaseModel):
     company: str | None = None
     url: str | None = None
     location: str | None = None
+
+
+class JobURLRequest(BaseModel):
+    url: str
 
 
 class AddRequirementRequest(BaseModel):
@@ -291,6 +300,16 @@ class ContactLink(BaseModel):
     url: str
 
 
+class CVLanguageRequest(BaseModel):
+    language: str
+
+
+class EditFactRequest(BaseModel):
+    expected_version: int
+    text: str
+    tags: list[str]
+
+
 class SaveCVRequest(BaseModel):
     """The name and contact details as the user checked them; they never came from DeepSeek."""
 
@@ -391,7 +410,10 @@ def create_app(
     starter: Iterable[dict[str, str]] | None = None,
     boards: Callable[..., list[dict]] = fetch_board,
     selected_posting: Callable[..., dict] = fetch_selected,
+    url_posting: Callable[[str], dict] = fetch_job_url,
 ) -> FastAPI:
+    owner_access = OwnerAccess.from_environment()
+    allowed_hosts = ALLOWED_HOSTS | ({owner_access.host} if owner_access else set())
     token = token or secrets.token_urlsafe(32)
     # Before anything reads or changes the data, wherever the options put it.
     claim_data_format(Path(profile_path).parent, also=(Path(facts_db).parent, Path(jobs_root).parent))
@@ -498,8 +520,12 @@ def create_app(
     @app.middleware("http")
     async def local_only(request: Request, call_next):
         host = (request.headers.get("host") or "").rsplit(":", 1)[0]
-        if host not in ALLOWED_HOSTS:
+        if host not in allowed_hosts:
             return JSONResponse({"error": "只接受本机访问"}, status_code=403)
+        if owner_access:
+            refused = owner_access.refusal(request)
+            if refused is not None:
+                return refused
         path = request.url.path
         # Frames and download links cannot send headers, so those read-only paths
         # carry the same per-start token in the query string instead.
@@ -515,6 +541,7 @@ def create_app(
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
         return response
 
     def route_of(request: Request) -> dict[str, str]:
@@ -606,7 +633,7 @@ def create_app(
         jd = {key: value for key, value in require(job_id, "input")["jd"].items() if key != "raw_content"}
         view: dict = {
             "job_id": job_id, "steps": steps, "jd": jd,
-            "language": job_cv_language(jd["text"]), "cv_languages": cv_languages(),
+            "language": job_cv_language(jd["text"], job_id), "cv_languages": cv_languages(),
         }
         decided = workspace.read(job_id, "decided")
         requirements = decided or workspace.read(job_id, "candidates")
@@ -633,7 +660,7 @@ def create_app(
             view["interrupted_operations"] = stopped
         gaps = workspace.read(job_id, "gaps")
         if gaps:
-            view["gaps"] = gaps_view(job_id, gaps)
+            view["gaps"] = gaps_view(job_id, gaps) if gaps.get("language") == view["language"] else {"outdated": True}
         return view
 
     def gaps_view(job_id: str, gaps: dict) -> dict:
@@ -664,10 +691,17 @@ def create_app(
 
     def cv_view(job_id: str, language: str) -> dict:
         head_step, head = cv_head(job_id, language)
+        stale = False
+        if head:
+            try:
+                require_current_cv(head, language)
+            except (CVError, FactStoreError):
+                stale = True
         view: dict = {
             "head": head_step,
             "content_sha256": content_fingerprint(head) if head else None,
-            "final_pdf": workspace.path(job_id, f"cv-final-{language}").exists(),
+            "final_pdf": not stale and workspace.path(job_id, f"cv-final-{language}").exists(),
+            "stale": stale,
         }
         draft = workspace.read(job_id, f"cv-draft-{language}")
         if draft:
@@ -687,17 +721,36 @@ def create_app(
             view["approved_at"] = head["approval"]["approved_at"]
         return view
 
-    def load_profile() -> dict:
-        if not Path(profile_path).exists():
-            raise CVError(f"缺少简历 profile：{profile_path}", reason="no_profile")
-        try:
-            return json.loads(Path(profile_path).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise CVError(f"无法读取简历 profile：{profile_path}", reason="profile_unreadable") from exc
+    def profile_file(language: str | None = None, *, writing: bool = False) -> Path:
+        base = Path(profile_path)
+        if language is None:
+            return base
+        check_language(language)
+        separate = base.with_name(f"{base.stem}.{language}{base.suffix}")
+        if separate.exists():
+            return separate
+        if base.exists():
+            try:
+                available = profile_languages(json.loads(base.read_text(encoding="utf-8")))
+            except (OSError, ValueError) as exc:
+                raise CVError("无法读取简历资料", reason="profile_unreadable") from exc
+            if language in available and (not writing or available == [language]):
+                return base
+            return separate
+        return base if writing else separate
 
-    def save_profile(profile: dict) -> None:
-        """Replace the profile, keeping the previous one in profile-history/ first."""
-        path = Path(profile_path)
+    def load_profile(language: str | None = None) -> dict:
+        path = profile_file(language)
+        if not path.exists():
+            raise CVError("请先上传这个语言的简历", reason="no_profile")
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CVError("无法读取简历资料", reason="profile_unreadable") from exc
+
+    def save_profile(profile: dict, language: str | None = None, *, replace_language: bool = False) -> None:
+        """Replace only this language, keeping the previous contents in profile-history."""
+        path = profile_file(language, writing=replace_language)
         if path.exists():
             history = path.parent / "profile-history"
             history.mkdir(parents=True, exist_ok=True)
@@ -707,10 +760,20 @@ def create_app(
                 readable = isinstance(json.loads(raw.decode("utf-8")), dict)
             except ValueError:
                 readable = False
-            # A broken file is kept for the user to look at, but never read as a backup.
-            write_atomically(history / f"cv-profile-{stamp}.{'json' if readable else 'broken'}", raw)
+            write_atomically(history / f"{path.stem}-{stamp}.{'json' if readable else 'broken'}", raw)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_atomically(path, (json.dumps(profile, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+    def profile_is_current(head: dict, language: str) -> bool:
+        try:
+            return head.get("profile_sha256") == _profile_hash(load_profile(language))
+        except CVError:
+            return False
+
+    def require_current_cv(head: dict, language: str) -> None:
+        if not profile_is_current(head, language):
+            raise CVError("简历资料已更新，请重新准备并审核这份简历")
+        verify_draft(head, facts_db)
 
     # The page exists to help the user present their best CV for each job, not to grade them.
     # Everything up to the CV review happens by itself: the requirements DeepSeek (or the
@@ -722,7 +785,8 @@ def create_app(
         name a past employer."""
         path = Path(profile_path)
         terms: set[str] = set()
-        for source in [path, *sorted((path.parent / "profile-history").glob("*.json"))]:
+        for source in [path, *(path.with_name(f"{path.stem}.{lang}{path.suffix}") for lang in CV_LANGUAGES),
+                       *sorted((path.parent / "profile-history").glob("*.json"))]:
             if not source.exists():
                 continue
             try:
@@ -772,7 +836,7 @@ def create_app(
         try:
             if not Path(facts_db).exists():
                 raise CVError("还没有事实库", reason="no_facts")
-            head = build_draft(load_profile(), facts_db, check_language(language), job=job)
+            head = build_draft(load_profile(check_language(language)), facts_db, language, job=job)
         except (CVError, FactStoreError) as exc:
             # An earlier CV, if any, stays as it was; the page says it is not up to date.
             earlier = workspace.read(job_id, f"cv-draft-{language}") is not None
@@ -814,23 +878,27 @@ def create_app(
             pass
 
     def cv_languages() -> list[str]:
-        """Languages the user's resume is written in; only those get CVs."""
-        try:
-            return profile_languages(load_profile())
-        except (CVError, OSError, ValueError):
-            return ["en"]
+        available = []
+        for language in CV_LANGUAGES:
+            try:
+                load_profile(language)
+                available.append(language)
+            except CVError as exc:
+                if exc.reason != "no_profile":
+                    raise
+        return available
 
-    def job_cv_language(jd_text: str) -> str:
-        """The posting's language when the resume has it, otherwise the resume's own language."""
+    def job_cv_language(jd_text: str, job_id: str | None = None) -> str:
         available = cv_languages()
-        wanted = _job_language(jd_text)
-        return wanted if wanted in available else available[0]
+        chosen = workspace.read_note(job_id, "cv-language") if job_id else None
+        wanted = chosen.get("language") if chosen else _job_language(jd_text)
+        return wanted if wanted in available else (available or ["en"])[0]
 
     def prepare_cv_quietly(job_id: str) -> None:
         """The CV for this posting in a language the resume is written in. Without a profile
         or confirmed facts yet, the CV panel's Prepare button shows what is missing."""
         try:
-            prepare_cv(job_id, job_cv_language(require(job_id, "input")["jd"]["text"]))
+            prepare_cv(job_id, job_cv_language(require(job_id, "input")["jd"]["text"], job_id))
         except (CVError, FactStoreError, OSError, ValueError):
             pass
 
@@ -884,6 +952,16 @@ def create_app(
             return {"facts": [], **stopped}
         return {"facts": list_facts(facts_db), **stopped}
 
+    @app.get("/api/cv/languages")
+    def available_cv_languages() -> dict:
+        return {"languages": cv_languages()}
+
+    @app.post("/api/facts/{fact_id}/edit")
+    def edit_fact(fact_id: str, request: EditFactRequest) -> dict:
+        updated, changed = revise_fact(facts_db, fact_id, text=request.text, tags=request.tags,
+                                       expected_version=request.expected_version)
+        return {"fact": updated, "changed": changed}
+
     @app.post("/api/facts/confirm")
     def confirm(request: ConfirmRequest) -> dict:
         confirmed = confirm_facts(facts_db, parse_fact_refs(request.refs))
@@ -897,9 +975,11 @@ def create_app(
             raise CVImportError("找不到这次上传；请重新上传 PDF")
         return uploads / f"{upload_id}.json"
 
-    def propose_cv(data: bytes) -> dict:
+    def propose_cv(data: bytes, language: str | None = None) -> dict:
         pdf = read_pdf(data)
         proposal = structure_cv(pdf["lines"], chat, links=pdf["links"])
+        if language is not None:
+            proposal["language"] = check_language(language)
         proposal["source_sha256"] = hashlib.sha256(data).hexdigest()  # names this PDF if saving is cut short
         upload_id = secrets.token_hex(8)
         uploads.mkdir(parents=True, exist_ok=True)
@@ -920,13 +1000,15 @@ def create_app(
         return {"upload_id": upload_id, "has_profile": Path(profile_path).exists(), **proposal}
 
     @app.post("/api/cv/upload")
-    async def upload_cv(request: Request) -> dict:
+    async def upload_cv(request: Request, language: str | None = None) -> dict:
+        if language is not None:
+            check_language(language)
         data = bytearray()
         async for chunk in request.stream():
             data += chunk
             if len(data) > MAX_PDF_BYTES:
                 raise CVImportError(f"PDF 不能超过 {MAX_PDF_BYTES // 1_000_000} MB")
-        return await run_in_threadpool(propose_cv, bytes(data))
+        return await run_in_threadpool(propose_cv, bytes(data), language)
 
     @app.post("/api/cv/uploads/{upload_id}/save")
     def save_uploaded_cv(upload_id: str, request: SaveCVRequest) -> dict:
@@ -940,7 +1022,11 @@ def create_app(
             profile, items, reused = build_profile(proposal, request.model_dump(), facts_db)
             if items:
                 import_facts(facts_db, items)
-            save_profile(profile)
+            language = proposal.get("language")
+            if language:
+                # The user chooses the document language; names are not language detectors.
+                profile["name"] = {language: profile["name"]}
+            save_profile(profile, language, replace_language=True)
             path.unlink(missing_ok=True)
         return {"imported": len(items), "reused": reused}
 
@@ -986,9 +1072,9 @@ def create_app(
 
     @app.get("/api/listings")
     def listings(
-        title: str = "", location: str = "", limit: int = 50, offset: int = 0, hide_senior: bool = False
+        title: str = "", location: str = "", limit: int = 50, offset: int = 0, hide_senior: bool = False, region: str = "all"
     ) -> dict:
-        ranked = ranked_listings(listings_db, facts_db, title, location, limit, offset, hide_senior)
+        ranked = ranked_listings(listings_db, facts_db, title, location, limit, offset, hide_senior, region)
         started = started_jobs()
         for group in ranked["listings"]:
             group["started_job"] = next(
@@ -1016,6 +1102,33 @@ def create_app(
     def new_job(request: NewJobRequest) -> dict:
         selected = prepare_pasted_jd(request.text, request.title, request.company, request.url, request.location)
         return {"job_id": create_prepared_job(prepare_review_input(selected))}
+
+    @app.post("/api/jobs/from-url")
+    def new_job_from_url(request: JobURLRequest) -> dict:
+        url = normalize_url(request.url)
+        try:
+            identity = parse_posting_link(url)
+        except SearchError:
+            identity = None
+        # Identity ignores tracking queries, host aliases and application-page suffixes.
+        # Mutating requests already share the app's storage lock.
+        for summary in workspace.jobs():
+            jd = (workspace.read(summary["job_id"], "input") or {}).get("jd", {})
+            if ((identity and (jd.get("provider"), jd.get("board"), jd.get("job_id")) == identity) or
+                    url in (jd.get("requested_url"), jd.get("source"))):
+                return {"job_id": summary["job_id"], "existing": True}
+        if identity:
+            provider, board, posting_id = identity
+            selected = selected_posting(board, posting_id, provider)
+        else:
+            selected = url_posting(url)
+        if not selected["jd"].get("text", "").strip():
+            raise SearchError("岗位接口未返回 JD 正文，请使用手动粘贴。")
+        existing = started_jobs().get(selected["jd"].get("source"))
+        if existing:
+            return {"job_id": existing, "existing": True}
+        selected["jd"]["requested_url"] = url
+        return {"job_id": create_prepared_job(prepare_review_input(selected)), "existing": False}
 
     @app.get("/api/jobs/{job_id}")
     def job(job_id: str) -> dict:
@@ -1065,10 +1178,19 @@ def create_app(
         workspace.write(job_id, "linked", linked)
         return job_view(job_id)
 
+    @app.post("/api/jobs/{job_id}/language")
+    def choose_cv_language(job_id: str, request: CVLanguageRequest) -> dict:
+        language = check_language(request.language)
+        if language not in cv_languages():
+            raise CVError("请先上传这个语言的简历", reason="no_profile")
+        require(job_id, "input")
+        workspace.write_note(job_id, "cv-language", {"language": language})
+        return job_view(job_id)
+
     @app.post("/api/jobs/{job_id}/cv/{language}/draft")
     def cv_draft(job_id: str, language: str) -> dict:
         draft = build_draft(
-            load_profile(), facts_db, check_language(language), job=workspace.read(job_id, "decided")
+            load_profile(check_language(language)), facts_db, language, job=workspace.read(job_id, "decided")
         )
         workspace.write(job_id, f"cv-draft-{language}", draft)
         return job_view(job_id)
@@ -1092,7 +1214,7 @@ def create_app(
     def check_gaps(job_id: str) -> dict:
         """What the CV, as it is now, has behind each requirement, with suggestions for what
         nothing shows. A suggestion declined before stays declined."""
-        language = job_cv_language(require(job_id, "input")["jd"]["text"])
+        language = job_cv_language(require(job_id, "input")["jd"]["text"], job_id)
         _, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历，再检查缺口")
@@ -1106,9 +1228,9 @@ def create_app(
         gaps = require(job_id, "gaps")
         adds = suggested_addition(gaps, requirement_id)
         with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
-            updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
+            updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile(gaps["language"]))
             if profile is not None:
-                save_profile(profile)
+                save_profile(profile, gaps["language"])
             workspace.write(job_id, "gaps", updated)
             prepare_again(job_id, gaps["language"])  # the notice stays until the CV has been prepared again
         return job_view(job_id)
@@ -1122,9 +1244,9 @@ def create_app(
             raise WorkspaceError("请先准备这个岗位的简历")
         adds = addition(line_to_write(gaps, requirement_id, request.place, request.text, head))  # refused before any write
         with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
-            updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile())
+            updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile(gaps["language"]))
             if profile is not None:
-                save_profile(profile)
+                save_profile(profile, gaps["language"])
             workspace.write(job_id, "gaps", updated)
             prepare_again(job_id, gaps["language"])  # the notice stays until the CV has been prepared again
         return job_view(job_id)
@@ -1167,6 +1289,7 @@ def create_app(
         head_step, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先生成简历草稿")
+        require_current_cv(head, language)
         if content_fingerprint(head) != request.expected_content_sha256:
             return JSONResponse({"error": CV_CHANGED}, status_code=409)
         if head_step != "approved":
@@ -1176,6 +1299,7 @@ def create_app(
     @app.post("/api/jobs/{job_id}/cv/{language}/export")
     def cv_export(job_id: str, language: str) -> dict:
         approved = require(job_id, f"cv-approved-{check_language(language)}")
+        require_current_cv(approved, language)
         with tempfile.TemporaryDirectory(prefix="cv-web-") as directory:
             output = Path(directory) / "cv.pdf"
             export_pdf(approved, facts_db, output, printer=printer)
@@ -1194,13 +1318,16 @@ def create_app(
         if v and v != content_fingerprint(head):
             return HTMLResponse(PREVIEW_CHANGED, status_code=409)
         try:
+            require_current_cv(head, language)
             final = head_step == "approved" and is_final_approval(head)
-        except CVError:
+        except (CVError, FactStoreError):
             final = False
         return render_html(head, final=final)
 
     @app.get("/download/{job_id}/{language}.pdf")
     def cv_download(job_id: str, language: str) -> Response:
+        approved = require(job_id, f"cv-approved-{check_language(language)}")
+        require_current_cv(approved, language)
         # Read whole (a CV is small), so a new export moving this one to history cannot cut it off.
         data = workspace.read_bytes(job_id, f"cv-final-{check_language(language)}")
         if data is None:

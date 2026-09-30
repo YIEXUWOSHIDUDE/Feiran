@@ -16,6 +16,7 @@ from job_search import (
     main,
     normalize_board,
     parse_board_link,
+    parse_posting_link,
     plain_text,
     prepare_review_input,
     rank_jobs,
@@ -409,6 +410,35 @@ class JobSearchTests(unittest.TestCase):
         for link in ("https://stripe.com/jobs", "https://jobs.lever.co/", "https://jobs.ashbyhq.com/a%2F..%2Fb"):
             with self.subTest(link=link), self.assertRaisesRegex(SearchError, "boards.greenhouse.io"):
                 parse_board_link(link)
+
+    def test_posting_links_extract_only_validated_identifiers(self):
+        links = {
+            "https://boards.greenhouse.io/example/jobs/123?gh_src=tracking#app": ("greenhouse", "example", "123"),
+            "https://job-boards.greenhouse.io/example/jobs/123/": ("greenhouse", "example", "123"),
+            "https://boards.greenhouse.io/embed/job_app?for=example&token=123": ("greenhouse", "example", "123"),
+            "jobs.lever.co/example/abc-123/apply": ("lever", "example", "abc-123"),
+            "https://jobs.lever.co/example/abc-123": ("lever", "example", "abc-123"),
+            "https://jobs.ashbyhq.com/example/abc-123/application?utm_source=test": ("ashby", "example", "abc-123"),
+            "https://jobs.ashbyhq.com/example/abc-123": ("ashby", "example", "abc-123"),
+        }
+        for link, identity in links.items():
+            with self.subTest(link=link):
+                self.assertEqual(parse_posting_link(link), identity)
+
+    def test_posting_links_reject_unknown_hosts_homepages_and_unsafe_paths(self):
+        for link in (
+            "", "https://example.com/jobs/1", "http://127.0.0.1/jobs/1",
+            "https://jobs.lever.co.evil.example/company/id", "https://jobs.lever.co@evil.example/company/id",
+            "https://user@jobs.lever.co/company/id", "https://jobs.lever.co:8080/company/id",
+            "https://jobs.lever.co:bad/company/id", "https://[broken/company/id",
+            "file://jobs.lever.co/company/id", "https://jobs.lever.co/company",
+            "https://jobs.ashbyhq.com/company/id/unknown", "https://jobs.lever.co/a%2Fb/id",
+            "https://boards.greenhouse.io/example/jobs/abc", "https://jobs.lever.co/example/..",
+            "https://jobs.lever.co/exam\nple/id",
+            "https://boards.greenhouse.io/embed/job_app?for=a&for=b&token=123",
+        ):
+            with self.subTest(link=link), self.assertRaises(SearchError):
+                parse_posting_link(link)
 
 
 if __name__ == "__main__":
