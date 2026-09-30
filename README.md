@@ -20,18 +20,22 @@ An AI-powered workspace that helps you turn real experience into clearer, job-sp
 
 ## Availability
 
-Feiran is being prepared as a browser-based cloud workspace. **It is not live yet:** there is no public demo, hosted URL or open registration. The prepared deployment is a private, single-user beta and still needs deployment and cloud acceptance checks.
+Feiran is being prepared as a browser-based cloud workspace. **It is not live yet:** there is no public demo, hosted URL or open registration. The prepared deployment offers a public HTTPS address with a single owner login, no open registration, and private persistent data. See [AWS public deployment](docs/aws-public.md); deployment and cloud acceptance checks are still pending.
 
 ## Using Feiran
 
 Once you have access to a running workspace:
 
-1. **Bring your experience.** Upload your CV as a PDF, check the extracted information, and confirm the experience statements you want Feiran to use.
-2. **Choose a job.** Browse jobs from companies you follow or paste a job description. Feiran supports public Greenhouse, Lever and Ashby boards; pasted descriptions can come from other sources.
+1. **Bring your experience.** Choose Chinese or English when uploading a PDF; both CVs are kept separately. Check and confirm the extracted facts. Editing a fact saves a new version that needs confirmation.
+2. **Choose a job.** In My jobs → New job, enter any public posting URL and choose Read and generate. Greenhouse, Lever, Ashby and Tencent links use their public APIs; other sites are read as webpages, preferring structured JobPosting data. Feiran reads the title and description, then prepares a CV draft for review. Check the extracted text for completeness. Login, CAPTCHA, JavaScript-only pages and incomplete responses may require manual pasting. Repeating a saved URL opens the existing job. You can also browse followed companies.
 3. **Review your tailored CV.** Check the job requirements, proposed wording and layout changes. See which requirements your CV supports, which evidence was left out, and where information is missing. Add suggested experience only when it is true for you.
 4. **Approve and export.** Read the CV and every change, approve that version, and download the final PDF. Changed content needs a new review.
 
 Switch between **English** and **简体中文** at the top of the page. The interface remembers your choice; changing the interface language does not translate your job descriptions, experience statements or CV. CV languages depend on the information in your profile.
+
+Choose an uploaded Chinese or English CV for each job. Uploading again replaces only that language and keeps the previous profile in history. After related facts or profile content change, the old draft remains viewable but must be regenerated and reviewed before final export. PDFs need extractable text; scanned documents are not supported.
+
+All regions share one listings database; Mainland China, other regions and unknown-location filters use explicit workplace locations. You can also add Tencent's public board at `https://careers.tencent.com/zh-cn/search.html`. Its list contains responsibility summaries; full requirements are fetched on selection. BOSS, ByteDance and Alibaba automatic refresh adapters are not yet included; paste their full descriptions instead. Cached postings reflect the time they were fetched; check the official page before applying.
 
 ## Your information and your decisions
 

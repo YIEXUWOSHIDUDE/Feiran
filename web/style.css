@@ -469,3 +469,9 @@ input[type="file"]::file-selector-button { padding: 8px 12px; margin-right: 12px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+.toolbar .region-select { width: auto; flex: 0 1 150px; }
+
+.fact-edit-text { min-height: 110px; }
+.fact-editor { margin-top: 10px; }
+.cv-panel > .field { max-width: 320px; }

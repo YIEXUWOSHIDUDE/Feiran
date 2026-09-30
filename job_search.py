@@ -1,4 +1,4 @@
-"""Read public Greenhouse, Lever or Ashby job boards, re-fetch a selected posting, or accept a pasted JD."""
+"""Read public company job boards, re-fetch a selected posting, or accept a pasted JD."""
 
 import argparse
 import json
@@ -20,7 +20,10 @@ from facts import FactStoreError, load_confirmed_fact_texts, load_search_terms, 
 API_ROOT = "https://boards-api.greenhouse.io/v1/boards"
 LEVER_ROOT = "https://api.lever.co/v0/postings"
 ASHBY_ROOT = "https://api.ashbyhq.com/posting-api/job-board"
-PROVIDERS = ("greenhouse", "lever", "ashby")
+PROVIDERS = ("greenhouse", "lever", "ashby", "tencent")
+TENCENT_ROOT = "https://careers.tencent.com/tencentcareer/api/post"
+TENCENT_PAGE_SIZE = 100
+TENCENT_MAX_PAGES = 100
 BOARD_URLS = {
     "greenhouse": API_ROOT + "/{board}/jobs?content=true",
     "lever": LEVER_ROOT + "/{board}?mode=json",
@@ -46,7 +49,7 @@ BOARD_HOSTS = {
 BOARD_LINK_HINT = (
     "请粘贴公司招聘板链接，例如 https://boards.greenhouse.io/<公司>、"
     "https://jobs.lever.co/<公司> 或 https://jobs.ashbyhq.com/<公司>；"
-    "公司官网若链接到这些网站，打开任一岗位即可看到"
+    "也支持腾讯官网 https://careers.tencent.com/zh-cn/search.html"
 )
 
 
@@ -144,6 +147,8 @@ def parse_board_link(link: str) -> tuple[str, str]:
     if "://" not in value:
         value = "https://" + value
     parts = urlsplit(value)
+    if parts.scheme in ("http", "https") and parts.hostname == "careers.tencent.com":
+        return "tencent", "tencent"
     provider = BOARD_HOSTS.get((parts.hostname or "").casefold()) if parts.scheme in ("http", "https") else None
     segments = [segment for segment in parts.path.split("/") if segment]
     board = None
@@ -162,15 +167,62 @@ def _provider(value: str) -> str:
     return value
 
 
+def parse_posting_link(link: str) -> tuple[str, str, str]:
+    """Return (provider, board, job ID) for a supported single-posting URL.
+
+    The URL is never fetched directly: validated identifiers feed the existing
+    fixed public API endpoints. Board homepages and unknown hosts are rejected.
+    """
+    hint = "无法识别为已接入平台的单条岗位链接。"
+    value = link.strip()
+    if not value or len(value) > 4096 or any(char.isspace() or ord(char) < 32 for char in value):
+        raise SearchError(hint)
+    if "://" not in value:
+        value = "https://" + value
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError as exc:
+        raise SearchError(hint) from exc
+    provider = BOARD_HOSTS.get((parts.hostname or "").casefold())
+    if (parts.hostname or "").casefold() == "careers.tencent.com":
+        provider = "tencent"
+    if (not provider or parts.scheme not in ("http", "https") or
+            parts.username is not None or parts.password is not None or
+            port not in (None, 443 if parts.scheme == "https" else 80)):
+        raise SearchError(hint)
+    segments = parts.path.strip("/").split("/")
+    board = job_id = None
+    if provider == "tencent":
+        query = parse_qs(parts.query)
+        if parts.path in ("/zh-cn/jobdesc.html", "/en-us/jobdesc.html") and len(query.get("postId", [])) == 1:
+            board, job_id = "tencent", query["postId"][0]
+    elif provider == "greenhouse":
+        if len(segments) == 3 and segments[1] == "jobs":
+            board, _, job_id = segments
+        elif segments == ["embed", "job_app"]:
+            query = parse_qs(parts.query)
+            if len(query.get("for", [])) == len(query.get("token", [])) == 1:
+                board, job_id = query["for"][0], query["token"][0]
+    elif len(segments) == 2 or (len(segments) == 3 and segments[2] ==
+                               ("apply" if provider == "lever" else "application")):
+        board, job_id = segments[:2]
+    if not board or not job_id:
+        raise SearchError(hint)
+    return provider, _board_token(board), _job_id(job_id, provider)
+
+
 def check_board(provider: str, board: str) -> tuple[str, str]:
     """Validate a (provider, board token) pair before it is stored or put into a URL."""
+    if provider == "tencent" and board != "tencent":
+        raise SearchError("腾讯招聘板标识必须是 tencent")
     return _provider(provider), _board_token(board)
 
 
 def _job_id(value: str, provider: str = "greenhouse") -> str:
-    if provider == "greenhouse":
+    if provider in ("greenhouse", "tencent"):
         if not value.isascii() or not value.isdigit():
-            raise SearchError("Greenhouse 岗位 ID 必须是数字")
+            raise SearchError("岗位 ID 必须是数字")
     elif not POSTING_ID.fullmatch(value):
         raise SearchError("岗位 ID 只能包含字母、数字和连字符")
     return value
@@ -345,21 +397,82 @@ def normalize_board(
     return jobs
 
 
+def _tencent_data(url: str) -> dict[str, Any]:
+    payload = _fetch_json(url)
+    if not isinstance(payload, dict) or payload.get("Code") != 200 or not isinstance(payload.get("Data"), dict):
+        raise SearchError("腾讯岗位接口未返回有效数据")
+    return payload["Data"]
+
+
+def _tencent_posting(raw: Any, captured_at: str, *, detail: bool = False) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise SearchError("腾讯岗位接口包含无效记录")
+    job_id = _job_id(str(raw.get("PostId", "")), "tencent")
+    if raw.get("IsValid") is False:
+        raise SearchError("该腾讯岗位已失效")
+    responsibility = _text_or_none(raw.get("Responsibility"))
+    requirement = _text_or_none(raw.get("Requirement"))
+    if not responsibility or (detail and not requirement):
+        raise SearchError("腾讯岗位缺少完整职责或任职要求")
+    job = _base_posting("tencent", "tencent", captured_at, job_id, raw.get("RecruitPostName"),
+                        f"https://careers.tencent.com/zh-cn/jobdesc.html?postId={job_id}")
+    parts = [raw.get("RequireWorkYearsName") or "", "岗位职责", responsibility]
+    if requirement:
+        parts += ["岗位要求", requirement]
+    else:
+        parts += ["列表摘要；选择岗位时重新读取完整任职要求。"]
+    return {**job, "company": "腾讯", "location": _join_locations([raw.get("CountryName"), raw.get("LocationName")]),
+            # LastUpdateTime is an update date, not the initial publication date.
+            "posted_at": None, "updated_at": raw.get("LastUpdateTime"),
+            "text": _normalize_lines("\n".join(parts)), "raw_content": json.dumps(raw, ensure_ascii=False)}
+
+
+def _fetch_tencent_board() -> list[dict[str, Any]]:
+    """Read every list page before replacing the cache; incomplete reads leave it intact."""
+    captured_at = datetime.now(timezone.utc).isoformat()
+    jobs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    expected = None
+    for page in range(1, TENCENT_MAX_PAGES + 1):
+        data = _tencent_data(f"{TENCENT_ROOT}/Query?pageIndex={page}&pageSize={TENCENT_PAGE_SIZE}&language=zh-cn")
+        count, posts = data.get("Count"), data.get("Posts")
+        if type(count) is not int or count < 0 or not isinstance(posts, list):
+            raise SearchError("腾讯岗位列表缺少总数或岗位数组")
+        if expected is None:
+            expected = count
+        if count != expected:
+            raise SearchError("腾讯岗位列表读取期间发生变化，请重试刷新")
+        for raw in posts:
+            job = _tencent_posting(raw, captured_at)
+            if job["job_id"] in seen:
+                raise SearchError("腾讯岗位分页重复，请重试刷新")
+            seen.add(job["job_id"])
+            jobs.append(job)
+        if len(jobs) == expected:
+            return jobs
+        if not posts or len(jobs) > expected:
+            raise SearchError("腾讯岗位分页不完整，保留原有缓存")
+    raise SearchError("腾讯岗位超过本次读取上限，保留原有缓存")
+
+
 def fetch_board(board: str, provider: str = "greenhouse") -> list[dict[str, Any]]:
-    """Read current published listings from one public Greenhouse, Lever or Ashby board."""
-    provider = _provider(provider)
-    board = _board_token(board)
+    """Read published listings from a supported public company board."""
+    provider, board = check_board(provider, board)
+    if provider == "tencent":
+        return _fetch_tencent_board()
     data = _fetch_json(BOARD_URLS[provider].format(board=board))
     return normalize_board(data, board, datetime.now(timezone.utc).isoformat(), provider)
 
 
 def fetch_selected(board: str, job_id: str, provider: str = "greenhouse") -> dict[str, Any]:
     """Re-fetch a chosen posting instead of trusting an earlier search result."""
-    provider = _provider(provider)
-    board = _board_token(board)
+    provider, board = check_board(provider, board)
     job_id = _job_id(job_id, provider)
     captured_at = datetime.now(timezone.utc).isoformat()
-    if provider == "greenhouse":
+    if provider == "tencent":
+        job = _tencent_posting(_tencent_data(f"{TENCENT_ROOT}/ByPostId?postId={job_id}&language=zh-cn"),
+                               captured_at, detail=True)
+    elif provider == "greenhouse":
         job = _posting(_fetch_json(f"{API_ROOT}/{board}/jobs/{job_id}"), board, captured_at)
     elif provider == "lever":
         job = _lever_posting(_fetch_json(f"{LEVER_ROOT}/{board}/{job_id}"), board, captured_at)

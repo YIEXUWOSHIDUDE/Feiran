@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deepseek_client import DeepSeekError
+from job_search import SearchError
 from facts import confirm_facts, import_facts, list_facts, revise_fact
 from cv_import import STRUCTURE_RULES
 from cv_plan import PLAN_RULES
@@ -199,7 +200,7 @@ class WebTests(unittest.TestCase):
         app = create_app(
             facts_db=self.database, jobs_root=root / "jobs", token=TOKEN,
             profile_path=profile, chat=self.chat, printer=FakePrinter(),
-            starter=[], boards=self.boards, selected_posting=self.read_posting,
+            starter=[], boards=self.boards, selected_posting=self.read_posting, url_posting=self.read_url_posting,
         )
         self.app = app
         self.client = TestClient(app, base_url="http://127.0.0.1:8765")
@@ -213,6 +214,9 @@ class WebTests(unittest.TestCase):
         self.selected.append((provider, board, job_id))
         job = next(job for job in self.boards.jobs if job["job_id"] == job_id)
         return {"jd": {key: value for key, value in job.items()}, "source_status": "测试：公开接口返回"}
+
+    def read_url_posting(self, url):
+        raise SearchError("测试：网页没有职位正文")
 
     def test_only_local_requests_with_the_page_token_reach_the_api(self):
         page = self.client.get("/")
@@ -676,6 +680,104 @@ class WebTests(unittest.TestCase):
         self.assertEqual([item["text"] for item in view["candidates"]], ["Python and SQL"])
         self.assertEqual({item["title"]: item["started_job"] for item in ranked}, {"Data Engineer": job_id, "Designer": None})
 
+
+    def test_url_import_prepares_a_review_draft_and_reuses_existing_job(self):
+        import_facts(self.database, FACTS + CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in FACTS + CV_FACTS])
+        self.chat.requirement_lines = {"Python and SQL"}
+        first = self.client.post("/api/jobs/from-url", headers=self.headers,
+                                 json={"url": "https://boards.greenhouse.io/example/jobs/1?gh_src=first"})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertFalse(first.json()["existing"])
+        job_id = first.json()["job_id"]
+        view = self.job(job_id)
+        self.assertEqual(view["jd"]["title"], "Data Engineer")
+        self.assertEqual(view["jd"]["source"], "https://job-boards.greenhouse.io/example/jobs/1")
+        self.assertTrue(view["jd"]["captured_at"])
+        self.assertEqual([item["text"] for item in view["candidates"]], ["Python and SQL"])
+        self.assertEqual(view["cv"]["en"]["head"], "tailored")
+        again = self.client.post("/api/jobs/from-url", headers=self.headers,
+                                 json={"url": "https://job-boards.greenhouse.io/example/jobs/1?gh_src=second"})
+        self.assertEqual(again.json(), {"job_id": job_id, "existing": True})
+        self.assertEqual(self.selected, [("greenhouse", "example", "1")])
+        self.assertEqual(len(self.app.state.workspace.jobs()), 1)
+
+    def test_url_import_dispatches_lever_and_ashby(self):
+        for provider, host in (("lever", "jobs.lever.co"), ("ashby", "jobs.ashbyhq.com")):
+            with self.subTest(provider=provider):
+                self.boards.jobs[0].update(provider=provider, source=f"https://{host}/example/1")
+                response = self.client.post("/api/jobs/from-url", headers=self.headers,
+                                            json={"url": f"https://{host}/example/1"})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(self.job(response.json()["job_id"])["jd"]["provider"], provider)
+        self.assertEqual(self.selected, [("lever", "example", "1"), ("ashby", "example", "1")])
+
+    def test_url_import_failure_does_not_create_a_job_or_call_the_model(self):
+        for link in ("https://example.com/job", "http://127.0.0.1/private", "https://jobs.lever.co/company"):
+            response = self.client.post("/api/jobs/from-url", headers=self.headers, json={"url": link})
+            self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.selected, [])
+        self.boards.jobs[0]["text"] = "   "
+        empty = self.client.post("/api/jobs/from-url", headers=self.headers,
+                                json={"url": "https://boards.greenhouse.io/example/jobs/1"})
+        self.assertEqual(empty.status_code, 400, empty.text)
+        self.assertEqual(self.app.state.workspace.jobs(), [])
+        self.assertEqual(self.chat.sent, [])
+
+    def test_url_import_reports_fetch_failure_without_saving(self):
+        def failed(*args):
+            raise SearchError("岗位接口读取超时")
+        app = create_app(facts_db=self.database, jobs_root=Path(self.directory.name) / "jobs",
+                         profile_path=self.profile_path, token=TOKEN, chat=self.chat,
+                         starter=[], selected_posting=failed)
+        with TestClient(app, base_url="http://localhost") as client:
+            response = client.post("/api/jobs/from-url", headers=self.headers,
+                                   json={"url": "https://boards.greenhouse.io/example/jobs/1"})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("超时", response.json()["error"])
+        self.assertEqual(app.state.workspace.jobs(), [])
+        self.assertEqual(self.chat.sent, [])
+
+    def test_url_import_and_listing_start_share_one_job(self):
+        self.client.post("/api/sources", json={"link": "https://boards.greenhouse.io/example"}, headers=self.headers)
+        first = self.client.post("/api/listings/start", headers=self.headers,
+                                 json={"provider": "greenhouse", "board": "example", "job_id": "1"})
+        again = self.client.post("/api/jobs/from-url", headers=self.headers,
+                                 json={"url": "https://boards.greenhouse.io/example/jobs/1"})
+        self.assertEqual(again.json(), {"job_id": first.json()["job_id"], "existing": True})
+        self.assertEqual(len(self.app.state.workspace.jobs()), 1)
+
+    def test_generic_url_import_uses_html_and_preserves_retry_identity(self):
+        from job_url import extract_job
+        from test_job_url import HTML, URL
+        calls = []
+        def read_page(url):
+            calls.append(url)
+            return extract_job(HTML, URL)
+        app = create_app(facts_db=self.database, jobs_root=Path(self.directory.name) / "jobs",
+                         profile_path=self.profile_path, token=TOKEN, chat=self.chat,
+                         starter=[], url_posting=read_page)
+        with TestClient(app, base_url="http://localhost", headers=self.headers) as client:
+            first = client.post("/api/jobs/from-url", json={"url": "https://other.example.org/job#apply"})
+            self.assertEqual(first.status_code, 200, first.text)
+            job_id = first.json()["job_id"]
+            view = client.get(f"/api/jobs/{job_id}").json()
+            self.assertEqual(view["jd"]["title"], "Backend Engineer")
+            self.assertEqual(view["jd"]["source"], URL)
+            self.assertEqual(view["jd"]["provider"], "web")
+            self.assertIn("Requirements", view["jd"]["text"])
+            for url in ("https://other.example.org/job", URL):
+                again = client.post("/api/jobs/from-url", json={"url": url})
+                self.assertEqual(again.json(), {"job_id": job_id, "existing": True})
+        self.assertEqual(calls, ["https://other.example.org/job"])
+        self.assertEqual(len(app.state.workspace.jobs()), 1)
+
+    def test_tencent_url_dispatches_to_official_adapter(self):
+        self.boards.jobs[0].update(provider="tencent", board="tencent", source="https://careers.tencent.com/zh-cn/jobdesc.html?postId=1")
+        result = self.client.post("/api/jobs/from-url", headers=self.headers,
+                                  json={"url": "https://careers.tencent.com/zh-cn/jobdesc.html?postId=1"})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(self.selected, [("tencent", "tencent", "1")])
 
     def test_a_started_job_is_ready_for_cv_review_without_clicks(self):
         import_facts(self.database, FACTS + CV_FACTS)

@@ -89,7 +89,7 @@ function uploadReview(proposal, onSaved, onCancel) {
       foundEntryHead(entry),
       entry.facts.length ? el("ul", {}, entry.facts.map((fact) => el("li", {},
         fact.text, fact.known ? el("span", { class: "muted" }, t(" · already in your facts")) : ""))) : ""))));
-  const save = el("button", {}, proposal.has_profile ? t("Replace my CV with this") : t("Save as my CV"));
+  const save = el("button", {}, proposal.language === "zh" ? t("Save Chinese CV") : t("Save English CV"));
   save.addEventListener("click", () => run(async () => {
     const body = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value.trim()]));
     body.links = [...linkRows.children].map((row) => row.link()).filter((link) => link.url);
@@ -112,11 +112,14 @@ function uploadReview(proposal, onSaved, onCancel) {
       ? el("details", {}, el("summary", {}, t`${proposal.not_imported.length} line(s) not imported`),
         el("ul", {}, proposal.not_imported.map((line) => el("li", {}, line))))
       : "",
-    proposal.has_profile ? el("p", { class: "warning" }, t("Saving replaces your current CV layout; the old one is kept in profile-history.")) : "",
+    proposal.has_profile ? el("p", { class: "warning" }, t("Saving updates only this CV language. The other language stays available; earlier versions are kept in history.")) : "",
     el("div", { class: "toolbar" }, save, el("button", { class: "secondary", type: "button", onclick: onCancel }, t("Cancel"))));
 }
 
-function uploadPanel() {
+function uploadPanel(languages) {
+  const language = el("select", { "aria-label": t("CV upload language") },
+    el("option", { value: "zh" }, t("Chinese CV (A4)")),
+    el("option", { value: "en" }, t("English CV (US Letter)")));
   const input = el("input", { type: "file", accept: "application/pdf,.pdf" });
   const box = el("div", {});
   const reset = () => { box.replaceChildren(); input.value = ""; };
@@ -130,7 +133,7 @@ function uploadPanel() {
     if (!file) return;
     box.replaceChildren(el("p", { class: "muted" }, t`Reading ${file.name}…`));
     try {
-      const proposal = await api("/api/cv/upload", { method: "POST", body: file, headers: { "Content-Type": "application/pdf" } });
+      const proposal = await api(`/api/cv/upload?language=${encodeURIComponent(language.value)}`, { method: "POST", body: file, headers: { "Content-Type": "application/pdf" } });
       const cancel = () => run(async () => {
         await api(`/api/cv/uploads/${proposal.upload_id}`, { method: "DELETE" });
         reset();
@@ -146,12 +149,36 @@ function uploadPanel() {
     el("p", { class: "muted" },
       t("Upload your CV as a PDF: each line becomes a fact for you to confirm, and its layout is the base of every job's CV. "),
       t("Your name, email, phone and links stay on this computer; DeepSeek sees the other lines to tell sections, entries and bullets apart.")),
-    el("label", { class: "file-pick" }, el("span", {}, t("Choose a PDF")), input),
+    el("p", { class: "muted" }, languages.length ? I18n.join([t("Available CVs: "),
+      I18n.join(languages.map((lang) => t(lang === "zh" ? "Chinese CV (A4)" : "English CV (US Letter)")), " / ")], "") : t("Upload a Chinese or English PDF to begin.")),
+    el("div", { class: "toolbar" }, field(t("CV upload language"), language),
+      el("label", { class: "file-pick" }, el("span", {}, t("Choose a PDF")), input)),
     box);
 }
 
+function factEditor(fact) {
+  const text = el("textarea", { class: "fact-edit-text", "aria-label": t("Fact text") }, fact.text);
+  const tags = el("input", { type: "text", value: fact.tags.join(", "), "aria-label": t("Skill tags") });
+  const details = el("details", { class: "fact-editor" },
+    el("summary", {}, t("Edit this line")),
+    el("p", { class: "muted" }, t("Saving creates a new version pending confirmation. Earlier text stays in history; affected CVs need review again.")),
+    field(t("Fact text"), text), field(t("Skill tags"), tags));
+  const save = actionButton(t("Save changes"), async () => {
+    await api(`/api/facts/${encodeURIComponent(fact.id)}/edit`, { method: "POST", body: JSON.stringify({
+      expected_version: fact.version, text: text.value.trim(), tags: tags.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
+    }) });
+    await renderFacts();
+    show(t("Saved. Confirm the changed line before preparing the CV again."), "ok");
+  });
+  const cancel = el("button", { class: "secondary", onclick: () => {
+    text.value = fact.text; tags.value = fact.tags.join(", "); details.open = false;
+  } }, t("Cancel"));
+  details.append(el("div", { class: "toolbar" }, save, cancel));
+  return details;
+}
+
 async function renderFacts() {
-  const { facts, interrupted } = await api("/api/facts");
+  const [{ facts, interrupted }, { languages }] = await Promise.all([api("/api/facts"), api("/api/cv/languages")]);
   const pending = facts.filter((fact) => fact.status !== "confirmed");
   const selected = new Set();
   const confirmButton = el("button", { disabled: true }, t("Confirm selected"));
@@ -193,12 +220,12 @@ async function renderFacts() {
     return el("tr", { class: `fact-row ${fact.status}` },
       el("td", {}, box),
       el("td", {}, el("code", {}, fact.id), el("div", { class: "muted" }, t`v${fact.version} · ${t(fact.fact_type)}`)),
-      el("td", {}, fact.text, el("div", { class: "tags" }, fact.tags.map((tag) => el("span", { class: "tag" }, tag)))),
+      el("td", {}, fact.text, el("div", { class: "tags" }, fact.tags.map((tag) => el("span", { class: "tag" }, tag))), factEditor(fact)),
       el("td", {}, el("span", { class: `status ${fact.status}` }, t(fact.status))),
     );
   });
   app.replaceChildren(
-    uploadPanel(),
+    uploadPanel(languages),
     el("section", { class: "panel facts-panel" },
       el("h2", {}, t("Facts")),
       (interrupted || []).map((notice) => unfinishedNote(notice, renderFacts)),
@@ -226,6 +253,29 @@ function field(label, input, hint) {
 
 async function renderJobs() {
   const { jobs } = await api("/api/jobs");
+  const postingURL = el("input", { type: "url", required: true, placeholder: t("Paste a job posting URL") });
+  const importURL = el("button", { type: "submit" }, t("Read and generate"));
+  const urlForm = el("form", {},
+    field(t("Job posting URL"), postingURL, t("Enter any public job posting URL. If the site blocks reading or the description is incomplete, paste it manually below.")),
+    el("div", { class: "toolbar" }, importURL));
+  urlForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (importURL.disabled) return;
+    run(async () => {
+      importURL.disabled = true;
+      I18n.setText(importURL, t("Reading and preparing…"));
+      try {
+        const { job_id, existing } = await api("/api/jobs/from-url", {
+          method: "POST", body: JSON.stringify({ url: postingURL.value.trim() }),
+        });
+        if (existing) flash = [t("This job is already saved. Opened its existing version."), "ok"];
+        location.hash = `#job/${job_id}`;
+      } finally {
+        importURL.disabled = false;
+        I18n.setText(importURL, t("Read and generate"));
+      }
+    });
+  });
   const inputs = {
     title: el("input", { type: "text", required: true, placeholder: t("Software Engineer Intern") }),
     company: el("input", { type: "text", placeholder: t("Company") }),
@@ -252,10 +302,13 @@ async function renderJobs() {
     el("section", { class: "panel jobs-panel" }, el("h2", {}, t("Jobs")), list),
     el("section", { class: "panel new-job-panel" },
       el("h2", {}, t("New job")),
+      el("p", { class: "muted" }, t("Paste a job link to read its description and prepare a CV draft for review.")),
+      urlForm,
+      el("details", {}, el("summary", {}, t("Paste the description manually")),
       el("p", { class: "muted" }, t("Paste a job description from any site. Its requirements are found and your CV is prepared for it automatically.")),
       el("div", { class: "grid" }, field(t("Title *"), inputs.title), field(t("Company"), inputs.company), field(t("Official link"), inputs.url, t("Leave empty if unknown; the source is then recorded as unknown.")), field(t("Location"), inputs.location)),
       field(t("Job description *"), inputs.text),
-      el("div", { class: "toolbar" }, create),
+      el("div", { class: "toolbar" }, create)),
     ),
   );
 }
@@ -289,7 +342,7 @@ function remember(key, value) {
 }
 
 // Filters survive page changes; a download started on one visit is awaited by the next.
-const find = { title: "", location: "", limit: 50, hideSenior: recall("find.hideSenior", false), refreshing: null };
+const find = { title: "", location: "", region: recall("find.region", "all"), limit: 50, hideSenior: recall("find.hideSenior", false), refreshing: null };
 
 function findStatus(text) {
   const node = document.getElementById("find-status");
@@ -359,6 +412,15 @@ async function renderFind() {
     title: el("input", { type: "text", placeholder: t("Title contains, e.g. engineer or intern"), value: find.title }),
     location: el("input", { type: "text", placeholder: t("Location contains, e.g. New York or Remote"), value: find.location }),
   };
+  const region = el("select", { class: "region-select", "aria-label": t("Job region") },
+    [["all", "All regions"], ["cn", "Mainland China"], ["other", "Other regions"], ["unknown", "Unknown region"]]
+      .map(([value, label]) => el("option", { value, selected: value === find.region }, t(label))));
+  region.addEventListener("change", () => run(async () => {
+    find.region = region.value;
+    remember("find.region", find.region);
+    find.limit = 50;
+    await drawList();
+  }));
   const apply = () => run(async () => {
     find.title = inputs.title.value.trim();
     find.location = inputs.location.value.trim();
@@ -384,7 +446,7 @@ async function renderFind() {
 
   async function drawList() {
     const params = new URLSearchParams({
-      title: find.title, location: find.location, limit: String(find.limit), hide_senior: String(find.hideSenior),
+      title: find.title, location: find.location, region: find.region, limit: String(find.limit), hide_senior: String(find.hideSenior),
     });
     const [data, { sources }] = await Promise.all([api(`/api/listings?${params}`), api("/api/sources")]);
     const newest = sources.map((source) => source.fetched_at).filter(Boolean).sort().pop();
@@ -435,6 +497,7 @@ async function renderFind() {
     companiesBox.replaceChildren(el("details", { open: sources.length === 0 },
       el("summary", {}, t`Companies you follow (${sources.length})`),
       el("p", { class: "muted" }, t("Jobs come from each company's public job board (Greenhouse, Lever or Ashby). No login, and nothing about you is sent.")),
+      el("p", { class: "muted" }, t("Tencent's public careers board is also supported: "), "https://careers.tencent.com/zh-cn/search.html"),
       el("div", { class: "toolbar" }, link, add),
       rows.length ? el("table", {},
         el("thead", {}, el("tr", {}, el("th", {}, t("Company")), el("th", {}, t("Open jobs")), el("th", {}, t("Updated")), el("th", {}, ""))),
@@ -461,7 +524,7 @@ async function renderFind() {
       el("p", { class: "muted" },
         t("Most matched first: how many of your confirmed skills each posting mentions. "),
         t("It counts words; it is not a fit score or your chance of an offer. Pending facts never count.")),
-      el("div", { class: "toolbar" }, inputs.title, inputs.location, filterButton,
+      el("div", { class: "toolbar" }, region, inputs.title, inputs.location, filterButton,
         el("label", { class: "check", title: t("Hides Senior, Staff, Principal, Lead, Manager, Director… titles. \"Member of Technical Staff\" stays.") }, hideSenior, t(" Hide senior roles")),
         refreshAll),
       status,
@@ -605,20 +668,21 @@ function cvBlock(view, language, refresh) {
   };
   if (!cv.head) {
     return el("div", { class: "cv-block" }, el("h3", {}, title),
-      stageList(cv.stages) || el("p", { class: "muted" }, t("Not prepared yet.")),
+      cv.stale ? el("p", { class: "warning" }, t("This CV profile changed. Prepare it again and review the new version.")) : stageList(cv.stages) || el("p", { class: "muted" }, t("Not prepared yet.")),
       el("div", { class: "toolbar" }, actionButton(cv.stages ? t("Try again") : t("Prepare this CV"), post("prepare"))));
   }
-  const approved = cv.head === "approved";
+  const approved = cv.head === "approved" && !cv.stale;
   const tools = [];
-  if (cv.head === "draft") tools.push(actionButton(t("Reword with DeepSeek"), post("tailor"), true));
-  if (cv.head === "draft" || cv.head === "tailored") tools.push(actionButton(t("Adjust for this job"), post("plan")));
-  if (cv.head === "planned") tools.push(actionButton(t("Adjust again"), post("plan"), true));
+  if (!cv.stale && cv.head === "draft") tools.push(actionButton(t("Reword with DeepSeek"), post("tailor"), true));
+  if (!cv.stale && (cv.head === "draft" || cv.head === "tailored")) tools.push(actionButton(t("Adjust for this job"), post("plan")));
+  if (!cv.stale && cv.head === "planned") tools.push(actionButton(t("Adjust again"), post("plan"), true));
   tools.push(actionButton(t("Start over"), post("prepare"), true));
   if (approved && !cv.final_pdf) tools.push(actionButton(t("Create final PDF"), post("export")));
   if (cv.final_pdf) {
     tools.push(el("a", { class: "button", href: `/download/${view.job_id}/${language}.pdf?token=${encodeURIComponent(TOKEN)}` }, t("Download final PDF")));
   }
   const notes = [];
+  if (cv.stale) notes.push(el("p", { class: "warning" }, t("Your profile or facts changed. This is an old draft. Start over and review the new version.")));
   if (approved) notes.push(el("p", { class: "ok-text" }, t`Approved ${I18n.date(cv.approved_at, true)}. To change anything, use Start over and approve again.`));
   if (cv.stages) notes.push(stageList(cv.stages));
   else if (cv.head === "draft") notes.push(el("p", { class: "warning" }, t("This is your usual CV: DeepSeek could not reword or adjust it yet. Use the buttons above.")));
@@ -634,7 +698,7 @@ function cvBlock(view, language, refresh) {
     label: el("span", {}, el("span", { class: "muted" }, line.from), " → ", line.to),
   }));
   const changes = [...(cv.changes || []), ...rewrites];
-  const editable = cv.head === "planned";
+  const editable = cv.head === "planned" && !cv.stale;
   if (changes.length) {
     notes.push(el("p", {}, el("strong", {}, t`${changes.length} change(s) from your usual CV`),
       editable ? t(" — undo any you disagree with:") : ":"));
@@ -648,7 +712,7 @@ function cvBlock(view, language, refresh) {
         el("td", {}, line.rejected_text), el("td", { class: "bad-text" }, line.reasons.join("; "))))))));
   }
   let approval = null;
-  if (!approved) {
+  if (!approved && !cv.stale) {
     // Only the CV shown below can be approved: if another tab changed it since, the server
     // refuses and the page shows the current one to read again.
     const approve = actionButton(t("Approve this CV"), post("approve", { expected_content_sha256: cv.content_sha256 }));
@@ -668,12 +732,19 @@ function cvBlock(view, language, refresh) {
 function cvPanel(view, refresh) {
   const main = view.language || "en";
   const other = main === "en" ? "zh" : "en";
+  const language = el("select", { "aria-label": t("CV language for this job") },
+    (view.cv_languages || []).map((lang) => el("option", { value: lang, selected: lang === main }, CV_TITLES[lang])));
+  language.addEventListener("change", () => run(async () => {
+    await api(`/api/jobs/${view.job_id}/language`, { method: "POST", body: JSON.stringify({ language: language.value }) });
+    await refresh();
+  }));
   return el("section", { class: "panel step-panel cv-panel" },
     el("h2", {}, t("2. Your CV for this job")),
     el("p", { class: "muted" },
       t("Made from your confirmed facts and adjusted for this job: the most relevant parts first, what does not help cut, "),
       t("and wording that follows the job's requirements. Nothing is added, and every reworded line is fact-checked. "),
       t("DeepSeek sees only your CV lines and this job's requirements, never your name, contact details, schools or employers.")),
+    field(t("CV language for this job"), language),
     cvBlock(view, main, refresh),
     // A second language is offered only when the resume itself is written in it.
     (view.cv_languages || []).includes(other)
@@ -888,6 +959,7 @@ async function renderJob(jobId) {
         el("p", { class: "muted" },
           [jd.company, jd.location].filter(Boolean).join(" · ") || t("Company unknown"), t(" · captured "), localDate(jd.captured_at)),
         jd.source ? el("p", {}, el("a", { href: jd.source, target: "_blank", rel: "noopener noreferrer" }, jd.source)) : el("p", { class: "muted" }, t("Source: unknown")),
+        jd.provider === "web" ? el("p", { class: "muted" }, t("Read from a public webpage. Check the description below for completeness; the source and whether the role is still open have not been verified.")) : null,
         el("details", {}, el("summary", {}, t("Job description")), el("pre", { class: "jd" }, jd.text)),
         interruptedNote(view.interrupted),
         (view.interrupted_operations || []).map((notice) => unfinishedNote(notice, refresh)),
