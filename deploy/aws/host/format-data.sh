@@ -3,8 +3,10 @@
 # only on purpose, only on the volume this host was given (DATA_DEVICE, named by its EBS volume
 # ID, which must be typed to confirm), only if the stack made that volume (DATA_VOLUME_NEW=1; one
 # given as DataVolumeId held data before), only when it is not mounted, and only when it has no
-# signature of any kind and reads as zeros from end to end, as a new EBS volume does (reading it
-# all takes a few minutes). It makes an ext4 file system with data/.workbench-data, owned by the
+# signature of any kind and reads as zeros from end to end (reading it all takes a few minutes).
+# Fresh EBS blocks can also read as pseudorandom data; that case is deliberately refused here.
+# See docs/aws-deployment.md for the snapshot-backed empty-volume check before initialization.
+# It makes an ext4 file system with data/.workbench-data, owned by the
 # container's user.
 #
 #   format-data.sh <volume ID>      (the stack's DataVolumeId output, e.g. vol-0123456789abcdef0)

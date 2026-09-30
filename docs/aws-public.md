@@ -4,7 +4,10 @@ This deployment keeps the single-user database and encrypted data volume from
 [the AWS deployment](aws-deployment.md). It adds a CloudFront HTTPS address with a private
 VPC connection to EC2. All pages, APIs, previews and downloads require the owner login.
 There is no signup, multi-user isolation or public demo. `/healthz` returns only health status.
-The original localhost mode remains optional. AWS deployment acceptance is still pending.
+The original localhost mode remains optional. The first owner workspace was deployed on
+2026-09-30 UTC. HTTPS authentication, CSRF protection, synthetic PDF rendering and backup
+restoration passed; real DeepSeek calls and the remaining operational drills are pending.
+See the [acceptance record](aws-acceptance.md).
 
 ## Deploy
 

@@ -5,9 +5,11 @@ approval guarantees, survives routine restarts and updates, and can be restored 
 backup.** This page lists the checks that show it, what each has shown so far, and a place to
 record every run on AWS.
 
-**Status: not met yet.** Nothing has been deployed, so no check below has run on AWS. What has run
-is the same logic on a laptop and in CI (GitHub's Ubuntu runners, with Docker, real Chromium and,
-for the host scripts, AWS and systemd stubbed). Each result is one of:
+**Status: owner workspace deployed; initial checks passed, full matrix incomplete.** On
+2026-09-30 UTC, release `613f902` was installed behind CloudFront HTTPS with owner authentication.
+Real DeepSeek calls await the cloud secret. The host reboot, interruption and rollback drills
+below are not claimed as completed. Earlier CI used GitHub's Ubuntu runners, Docker and real
+Chromium, with AWS and systemd stubbed for host-script tests. Each result is one of:
 
 - **Passed**: it ran, and the result was the one required.
 - **Failed**: it ran, and the result was not the one required.
@@ -22,15 +24,15 @@ restore over its data, or install a release made to fail.
 
 | # | Scenario | Required result | Without AWS (tests, CI) | On AWS |
 |---|---|---|---|---|
-| 1 | Recreate the container | The data is still there | Passed: CI runs the smoke check in a new container after the one that made the data is gone | Not performed |
+| 1 | Recreate the container | The data is still there | Passed: CI runs the smoke check in a new container after the one that made the data is gone | Passed on isolated synthetic data on the EBS volume; new test containers preserved facts, profile, job, approval and PDF |
 | 2 | Restart the EC2 host | The right data volume is mounted before the app starts | Passed (logic): the mount script on real ext4 loop devices; the app refuses a folder without the volume marker | Not performed |
 | 3 | The model provider is unavailable | An explicit failure or a fallback; never a made-up success | Passed: unit tests with DeepSeek failing | Not performed |
 | 4 | Approve from a stale browser tab | A conflict; nothing the page did not show is approved | Passed: unit tests | Not performed |
 | 5 | Interrupt generation | The restart notices, and what was finished stays usable | Passed: unit tests that kill the app mid-step | Not performed |
-| 6 | Restore into an empty environment | Facts, profile, jobs and approvals agree | Passed: unit tests; CI restores a backup into an empty folder and runs the smoke check on it | Not performed |
+| 6 | Restore into an empty environment | Facts, profile, jobs and approvals agree | Passed: unit tests; CI restores a backup into an empty folder and runs the smoke check on it | Passed: synthetic archive restored into an empty folder; first production backup uploaded to private S3 after restore verification. Cross-stack restore not performed |
 | 7 | Roll back a release | The release before runs against the same data | Passed (logic): host scripts with stubs | Not performed |
-| 8 | Inspect the cloud logs | No key, token or CV text | Passed: unit tests; CI checks the container's log | Not performed |
-| 9 | Check public reachability | No open public port reaches the app | Passed: the template has no inbound rule; CI checks the app is published on the loopback only | Not performed |
+| 8 | Inspect the cloud logs | No key, token or CV text | Passed: unit tests; CI checks the container's log | Passed: 35 CloudWatch records scanned, no tested token/key-prefix/synthetic-CV patterns found; this is a bounded check |
+| 9 | Check public reachability | The optional HTTPS entry requires owner login; direct host ports remain inaccessible | Passed: base deployment has no inbound rule; public-mode tests enforce login | Passed: HTTPS 200 health, 401 without/wrong login, authenticated page/API 200, API without CSRF token 403; S3 public-access blocks enabled; HTTP 403 and direct ports 22/8765 timed out |
 
 ## Each check
 
@@ -184,6 +186,11 @@ restore over its data, or install a release made to fail.
 
 ### 9. Check public reachability
 
+The commands below describe the original private-only deployment. For the optional
+[public owner mode](aws-public.md), the listener is deliberately available inside the VPC,
+with ingress restricted to CloudFront and owner authentication on all private content.
+Use that guide's HTTPS/401/CSRF checks instead of requiring an empty security group.
+
 - **Evidence so far.**
   - `check-template.py`: the security group has no inbound rule.
   - CI: Docker publishes the app on `127.0.0.1` only, nothing else listens on its port, and requests
@@ -212,4 +219,19 @@ came back, and the result. Keep failed runs.
 
 | Date | Release (commit) | Check | Commands | What came back | Result |
 |---|---|---|---|---|---|
-| — | — | — | — | — | — |
+| 2026-09-30 UTC | 613f902 | New data volume | `format-data.sh` | Refused nonzero raw blocks before changing anything | Failed safely |
+| 2026-09-30 UTC | 613f902 | New volume recovery | Completed safety snapshot; `ListSnapshotBlocks`; guarded zero initialization; original formatter | Exact new, unmounted volume; zero snapshot blocks and no continuation token; formatter then passed | Passed |
+| 2026-09-30 UTC | 613f902 | Install and owner login | `workbench-release`; `enable-public.sh` | Installed pinned image, first S3 backup restored/verified, owner authentication active | Passed |
+| 2026-09-30 UTC | 613f902 | Public access | HTTPS requests with/without owner credentials and page token | Health 200; unauthenticated page/API/preview/download 401; bad login 401; authenticated page/API 200; missing page token 403 | Passed |
+| 2026-09-30 UTC | 613f902 | Synthetic export, first harness | Isolated `docker run ... deploy/smoke.py create` | Harness omitted writable HOME used by Compose; Chromium exited -5. Production configuration unchanged | Failed |
+| 2026-09-30 UTC | 613f902 | Synthetic workflow and restore | Same image/security profile, `HOME=/tmp`, EBS test folder; smoke create/verify; backup create/restore; smoke verify | English and Chinese PDFs each one page with expected text/fonts; facts and approval survived new containers and archive restoration | Passed |
+| 2026-09-30 UTC | 613f902 | Storage and logs | S3 public-access configuration; CloudWatch pattern scan | All four S3 public-access blocks enabled; 35 log records, zero tested sensitive-pattern matches | Passed |
+
+The synthetic workflow used a scripted model and real Chromium. It proves rendering and
+application state handling, not live DeepSeek output quality. Test data remained in separate
+EBS folders, outside the owner's production data directory. No personal CV was migrated.
+
+The public Tencent board import was attempted through the authenticated cloud API. It returned
+HTTP 400 because the upstream pagination repeated a posting; the adapter refused to save an
+incomplete batch. Live bulk import remains unverified. Individual posting URLs and manual JD
+entry are separate paths.
