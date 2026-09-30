@@ -7,8 +7,8 @@ record every run on AWS.
 
 **Status: owner workspace deployed; initial checks passed, full matrix incomplete.** On
 2026-09-30 UTC, release `613f902` was installed behind CloudFront HTTPS with owner authentication.
-Real DeepSeek calls await the cloud secret. The host reboot, interruption and rollback drills
-below are not claimed as completed. Earlier CI used GitHub's Ubuntu runners, Docker and real
+Real DeepSeek calls await the cloud secret. Host reboot and recovery passed; interruption
+and rollback drills below are not claimed as completed. Earlier CI used GitHub's Ubuntu runners, Docker and real
 Chromium, with AWS and systemd stubbed for host-script tests. Each result is one of:
 
 - **Passed**: it ran, and the result was the one required.
@@ -25,7 +25,7 @@ restore over its data, or install a release made to fail.
 | # | Scenario | Required result | Without AWS (tests, CI) | On AWS |
 |---|---|---|---|---|
 | 1 | Recreate the container | The data is still there | Passed: CI runs the smoke check in a new container after the one that made the data is gone | Passed on isolated synthetic data on the EBS volume; new test containers preserved facts, profile, job, approval and PDF |
-| 2 | Restart the EC2 host | The right data volume is mounted before the app starts | Passed (logic): the mount script on real ext4 loop devices; the app refuses a folder without the volume marker | Not performed |
+| 2 | Restart the EC2 host | The right data volume is mounted before the app starts | Passed (logic): the mount script on real ext4 loop devices; the app refuses a folder without the volume marker | Passed: host rebooted, correct EBS mount and service active, synthetic data verified, health 200 and owner gate 401 |
 | 3 | The model provider is unavailable | An explicit failure or a fallback; never a made-up success | Passed: unit tests with DeepSeek failing | Not performed |
 | 4 | Approve from a stale browser tab | A conflict; nothing the page did not show is approved | Passed: unit tests | Not performed |
 | 5 | Interrupt generation | The restart notices, and what was finished stays usable | Passed: unit tests that kill the app mid-step | Not performed |
@@ -235,3 +235,8 @@ The public Tencent board import was attempted through the authenticated cloud AP
 HTTP 400 because the upstream pagination repeated a posting; the adapter refused to save an
 incomplete batch. Live bulk import remains unverified. Individual posting URLs and manual JD
 entry are separate paths.
+
+Host reboot completed at 2026-09-30 09:04:23 UTC. After boot, the data device was mounted at
+`/srv/workbench`, the production service was active, and the isolated synthetic facts, profile,
+job, approval and PDF still passed `deploy/smoke.py verify`. Local and public health returned
+200, and unauthenticated private content still returned 401.
