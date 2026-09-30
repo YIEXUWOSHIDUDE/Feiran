@@ -113,9 +113,23 @@ helper; it runs nothing until a release is installed.
 
 An account can have only one OIDC provider for GitHub. If `aws iam list-open-id-connect-providers`
 already lists `token.actions.githubusercontent.com`, add `GitHubOidcProviderArn=<its ARN>` to the
-parameters, or the stack fails to create. `GitHubRepository` (this repository) and
+parameters, or the stack fails to create. `GitHubRepository` (the exact OIDC repo identity below) and
 `GitHubEnvironment` (`aws`) name the only workflow jobs the release role trusts; `MonthlyBudgetUsd`
 sets the budget.
+
+Before creating the stack, read the repository's actual OIDC identity:
+
+```sh
+REPO=YIEXUWOSHIDUDE/Feiran
+PREFIX=$(gh api "repos/$REPO/actions/oidc/customization/sub" --jq .sub_claim_prefix)
+printf '%s\n' "${PREFIX#repo:}"
+```
+
+Pass that value as `GitHubRepository`. New GitHub repositories use `owner@ID/name@ID`;
+older ones may use `owner/name`. Keep the numeric IDs and the exact case. The template allows
+both formats but never wildcards. Renaming a repository requires updating this parameter.
+The release log's `sub` must match `repo:<that value>:environment:aws` exactly.
+See [GitHub's OIDC reference](https://docs.github.com/en/actions/reference/security/oidc).
 
 ## 3. Set up releases from GitHub
 
@@ -126,7 +140,7 @@ outputs as environment secrets, except for the region. The identifiers are not c
 keeping them as secrets prevents this public repository's logs from publishing them:
 
 ```sh
-REPO=YIEXUWOSHIDUDE/job-fit-materials-workbench
+REPO=YIEXUWOSHIDUDE/Feiran
 output() {
   aws cloudformation describe-stacks --stack-name "$STACK" \
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
@@ -159,8 +173,7 @@ gh workflow run release.yml --repo "$REPO" --ref main -f install=false
 ```
 
 and approve it when GitHub asks. The run's "Sign in" step prints the token's claims: `sub` must read
-`repo:YIEXUWOSHIDUDE/job-fit-materials-workbench:environment:aws`, which is what the release role
-trusts. When the run has finished, its summary names the image; or look it up:
+`repo:<the configured GitHubRepository>:environment:aws`, exactly matching the release role. When the run has finished, its summary names the image; or look it up:
 
 ```sh
 git fetch origin main

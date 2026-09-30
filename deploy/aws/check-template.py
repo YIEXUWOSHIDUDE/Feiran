@@ -92,6 +92,13 @@ def problems(template: dict) -> list[str]:
     check(values.get("VolumeNew") == {"Fn::If": ["CreateDataVolume", "1", "0"]},
           "the host may format a data volume the stack did not make (one given as DataVolumeId holds data)")
 
+    # The repository identity is exact for both legacy and immutable GitHub subjects.
+    identity_pattern = template["Parameters"]["GitHubRepository"]["AllowedPattern"]
+    for valid in ("example/project", "example@123/project@456"):
+        check(bool(re.fullmatch(identity_pattern, valid)), "a valid GitHub identity is refused")
+    for invalid in ("*/*", "example/project:*", "example@123/project", "example/project@456"):
+        check(not re.fullmatch(identity_pattern, invalid), "an ambiguous GitHub identity is accepted")
+
     # Releases: only this repository's jobs in one GitHub environment, and only the release command.
     trust = resources["ReleaseRole"]["Properties"]["AssumeRolePolicyDocument"]["Statement"]
     conditions = [statement.get("Condition", {}) for statement in trust]
