@@ -6,7 +6,8 @@ VPC connection to EC2. All pages, APIs, previews and downloads require the owner
 There is no signup, multi-user isolation or public demo. `/healthz` returns only health status.
 The original localhost mode remains optional. The first owner workspace was deployed on
 2026-09-30 UTC. HTTPS authentication, CSRF protection, synthetic PDF rendering and backup
-restoration passed; real DeepSeek calls and the remaining operational drills are pending.
+restoration passed. The owner supplied the DeepSeek secret and a bounded live API call passed;
+the remaining operational drills are recorded separately.
 See the [acceptance record](aws-acceptance.md).
 
 ## Deploy
@@ -54,7 +55,8 @@ clears its cached login. A dedicated account portal or MFA is not implemented.
 Only after these checks should the owner upload personal data into the authenticated workspace.
 New job data is imported through the app and stays on the data volume. New features are released
 as tested container images through the existing manual GitHub workflow; code releases do not
-replace the data directory. DeepSeek remains unavailable until its secret is configured.
+replace the data directory. Each new deployment requires its own DeepSeek secret. The first
+owner deployment has connected it and passed a one-request synthetic connectivity check.
 
 ## Cost and removal
 
@@ -67,3 +69,14 @@ Keep the base stack while the data is needed. Do not delete the encrypted data v
 AWS references: [VPC origins](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html),
 [managed origin policies](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html),
 [managed cache policies](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html).
+
+## Connect or rotate DeepSeek
+
+Store the raw API key as a plaintext Secrets Manager value, never a JSON wrapper or a repository
+file. Set the base stack's `DeepSeekSecretArn` to that secret's ARN and review the change set.
+For an already-running host, also update only `DEEPSEEK_SECRET_ARN` in its protected
+`/etc/workbench/env`, retaining the owner-login settings, then restart `workbench.service`.
+Changing EC2 user data alone does not rerun the initial bootstrap on an existing Linux host.
+The service fetches the key into its protected memory-backed file on startup. Later rotations
+of the same secret only need a service restart. Verify health, the owner gate and a bounded
+synthetic API call; never print the key.
