@@ -262,7 +262,7 @@ WORKBENCH_DATA_DIR=~/workbench-data docker compose up -d --build
 - Chromium 用 Liberation Sans（字宽与 Arial 相同）和 Noto Sans CJK 打印简历，并保留沙箱：compose 使用 `deploy/seccomp-chromium.json` 运行容器，即 Docker 默认的 seccomp 配置，再允许沙箱创建的用户、PID 和网络命名空间，其他种类一律不允许。
 - `GET /healthz` 无需令牌即可返回 `{"status": "ok"}`。每个请求记录方法（只记 HTTP 自己的方法，其他写成 `(other)`）、路由（例如 `/api/jobs/{job_id}`，不是请求里的原始路径，预览和下载链接的查询字符串里有令牌）、状态码、耗时和请求编号。在容器中，每行日志是一个 JSON 对象：简历各阶段的结果和原因代码，DeepSeek 调用的耗时、token 数和重试，错误只记类型和出错位置（500 响应带上请求编号，页面可以引用），其他库的日志只有已知是固定措辞（例如服务器自己的启动提示）时才保留。日志里没有简历文字、JD、提示词、模型回答、密钥或令牌。
 - `deploy/smoke.py` 使用合成数据、脚本化的 DeepSeek 替身和真实 PDF 将整个工作流运行一次；CI 在每个 pull request 中都会在容器里运行它。它会上传简历并确认事实，所以拒绝任何已有数据（事实、简历、岗位或提示）的目录：只能给它一个空的临时目录，或者工作台只在上面启动过的目录，绝不能用你的真实数据目录。
-- 在 AWS 上运行（一台只能通过 Session Manager 端口转发访问的 EC2 主机，每晚备份到私有 S3 桶，CloudWatch 日志和告警）见 [docs/aws-deployment.md](docs/aws-deployment.md)（英文）。还没有实际部署过。
+- 在 AWS 上运行（一台只能通过 Session Manager 端口转发访问的 EC2 主机，每晚备份到私有 S3 桶，CloudWatch 日志和告警）见 [docs/aws-deployment.md](docs/aws-deployment.md)（英文）；发布从 GitHub 手动触发，判断它是否可用的验收检查见 [docs/aws-acceptance.md](docs/aws-acceptance.md)（英文）。还没有实际部署过。
 
 ## 数据与限制
 
