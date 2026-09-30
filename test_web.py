@@ -2,8 +2,16 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+import anyio
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -18,12 +26,14 @@ from requirement_flow import FIND_RULES
 from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
 from test_gaps import resume_ids, sent_lines
 from test_listings import FakeBoards, posting
+from test_workspace import PROCESS_DIES, REPO, dies_after_renaming_into, dies_before_renaming_into
 
 HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
 HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
 if HAS_FASTAPI:
     from fastapi.testclient import TestClient
 
+    import web as web_module
     from web import DATA_MARKER, create_app, data_problem, main, server_settings
 
 TOKEN = "test-token"
@@ -48,6 +58,7 @@ class FakeDeepSeek(FakeChat):
         self.evidence = None
         self.cv_structure = None
         self.tailor_error = None
+        self.while_planning = None  # runs while DeepSeek "adjusts" a CV, to hold a request open
         self.sent = []
         self.systems = []
 
@@ -75,6 +86,8 @@ class FakeDeepSeek(FakeChat):
         if messages[0]["content"] == MATCH_RULES or (messages[0]["content"] == PLAN_RULES and self.plan is None):
             raise DeepSeekError("测试中不联网", reason="unreachable")
         if messages[0]["content"] == PLAN_RULES:
+            if self.while_planning:
+                self.while_planning()
             return {"model": "deepseek-flash", "content": resume_ids(self.plan, json.loads(messages[-1]["content"])),
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
         if messages[0]["content"] != FIND_RULES:
@@ -86,6 +99,85 @@ class FakeDeepSeek(FakeChat):
                  if line["text"].lstrip("- ") in self.requirement_lines]
         return {"model": "deepseek-flash", "content": {"requirements": picks},
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+
+class Gate:
+    """Stands in for a slow DeepSeek call: records each request that reaches it and holds it
+    there until released, counting how many are inside at once."""
+
+    def __init__(self):
+        self.arrived = threading.Semaphore(0)
+        self.release = threading.Event()
+        self.guard = threading.Lock()
+        self.inside = self.most = self.count = 0
+
+    def __call__(self):
+        with self.guard:
+            self.inside += 1
+            self.count += 1
+            self.most = max(self.most, self.inside)
+        self.arrived.release()
+        self.release.wait(10)
+        with self.guard:
+            self.inside -= 1
+
+
+class WatchedLock:
+    """Stands in for the storage lock, and tells when a thread has to wait for it."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.waiting = threading.Event()
+
+    def acquire(self, blocking=True, timeout=-1):
+        if self.lock.acquire(blocking=False):
+            return True
+        self.waiting.set()
+        return self.lock.acquire(blocking, timeout)
+
+    def release(self):
+        self.lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exception):
+        self.release()
+
+
+def wait_until(condition, seconds=5):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("waited in vain")
+        time.sleep(0.01)
+
+
+async def asgi_post(app, path, body_ends=True):
+    """Send one POST straight to the ASGI app, as the server would, from a client that stays;
+    with body_ends=False the client sends part of a body and then nothing more. Returns the
+    status code."""
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "scheme": "http",
+             "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+             "headers": [(b"host", b"127.0.0.1:8765"), (b"x-workbench-token", TOKEN.encode()),
+                         (b"content-type", b"application/pdf" if not body_ends else b"application/json")],
+             "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765)}
+    body_sent, status = False, []
+
+    async def receive():
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": b"%PDF-1.4" if not body_ends else b"", "more_body": not body_ends}
+        await anyio.sleep_forever()
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status.append(message["status"])
+
+    await app(scope, receive, send)
+    return status[0] if status else None
 
 
 @unittest.skipUnless(HAS_FASTAPI, "web tests need the packages in requirements.txt")
@@ -108,6 +200,7 @@ class WebTests(unittest.TestCase):
             profile_path=profile, chat=self.chat, printer=FakePrinter(),
             starter=[], boards=self.boards, selected_posting=self.read_posting,
         )
+        self.app = app
         self.client = TestClient(app, base_url="http://127.0.0.1:8765")
         self.headers = {"X-Workbench-Token": TOKEN}
 
@@ -295,6 +388,20 @@ class WebTests(unittest.TestCase):
         self.assertEqual(cancelled.status_code, 200)
         self.assertEqual(list(uploads.glob("*.json")), [])
 
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_an_upload_still_works_when_another_one_removed_an_old_upload_first(self):
+        from test_cv_import import minimal_pdf
+
+        uploads = self.profile_path.parent / "cv-uploads"
+        uploads.mkdir()
+        # A link to nothing: reading its age fails as it does for an old upload that another
+        # upload removed after this one listed the folder.
+        (uploads / "0123456789abcdef.json").symlink_to(uploads / "removed.json")
+        self.chat.cv_structure = {"sections": [{"kind": "skills", "heading": 2, "entries": [{"facts": [{"lines": [3], "tags": []}]}]}]}
+        pdf = minimal_pdf([(72, 740, "ALEX EXAMPLE"), (72, 700, "SKILLS"), (72, 686, "Languages: Python, Java")])
+        upload = self.client.post("/api/cv/upload", content=pdf, headers={**self.headers, "Content-Type": "application/pdf"})
+        self.assertEqual(upload.status_code, 200, upload.text)
+
     def test_nothing_is_sent_when_the_private_details_cannot_be_read(self):
         # Found in review by Codex: an unreadable profile gave an empty list of private words,
         # which replaced the CV's own, so an employer went out verbatim.
@@ -433,8 +540,8 @@ class WebTests(unittest.TestCase):
         # A Chinese posting gets its Chinese CV at once; the English one comes on request.
         self.assertEqual((view["language"], view["cv"]["zh"]["head"], view["cv"]["en"]["head"]), ("zh", "tailored", None))
         prepared = self.cv_step(job_id, "prepare")
-        preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}")
-        approved = self.cv_step(job_id, "approve")
+        preview = self.client.get(f"/preview/{job_id}/en?token={TOKEN}&v={prepared['content_sha256']}")
+        approved = self.approve(job_id, prepared["content_sha256"]).json()["cv"]["en"]
         final = self.cv_step(job_id, "export")
         download = self.client.get(f"/download/{job_id}/en.pdf?token={TOKEN}")
         self.assertEqual(prepared["head"], "tailored")  # planning is offline in these tests
@@ -550,6 +657,521 @@ class WebTests(unittest.TestCase):
         # Talking points are optional extra reading: making them leaves the CV alone.
         self.assertEqual(talking.status_code, 200, talking.text)
         self.assertIn("cv-planned-en", talking.json()["steps"])
+
+    def planned_job(self):
+        """A job whose English CV is adjusted for it, with one cut line that can be put back."""
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        self.chat.plan = {
+            "sections": ["education", "skills", "experience"],
+            "entries": [{"entry": "s1e0", "lines": ["fact-intern-tests"]}],
+            "reasons": [{"target": "fact-intern-api", "reason": "REST APIs are not asked for."}],
+        }
+        return self.client.post(
+            "/api/jobs", json={"title": "Test Engineer", "text": "Requirements:\n- Writing unit tests"}, headers=self.headers,
+        ).json()["job_id"]
+
+    def approve(self, job_id, fingerprint, language="en"):
+        return self.client.post(f"/api/jobs/{job_id}/cv/{language}/approve",
+                                json={"expected_content_sha256": fingerprint}, headers=self.headers)
+
+    def put_back_the_cut_line(self, job_id):
+        self.client.post(f"/api/jobs/{job_id}/cv/en/change",
+                         json={"change_id": "cut:fact-intern-api", "undone": True}, headers=self.headers)
+
+    def test_approving_approves_only_the_cv_the_page_showed(self):
+        job_id = self.planned_job()
+        shown = self.job(job_id)["cv"]["en"]["content_sha256"]  # tab A shows the CV
+        self.put_back_the_cut_line(job_id)  # meanwhile tab B changes it
+        stale = self.approve(job_id, shown)  # tab A approves what it showed
+        unnamed = self.client.post(f"/api/jobs/{job_id}/cv/en/approve", headers=self.headers)
+        now = self.job(job_id)["cv"]["en"]
+        self.assertEqual(stale.status_code, 409)
+        self.assertIn("changed", stale.json()["error"])
+        self.assertEqual(unnamed.status_code, 422)  # an approval must say which CV it is for
+        self.assertEqual(now["head"], "planned")
+        self.assertNotEqual(now["content_sha256"], shown)
+        approved = self.approve(job_id, now["content_sha256"])  # after reading it again
+        self.assertEqual(approved.json()["cv"]["en"]["head"], "approved")
+
+    def test_a_second_click_on_approve_changes_nothing(self):
+        job_id = self.planned_job()
+        shown = self.job(job_id)["cv"]["en"]["content_sha256"]
+        first, second = self.approve(job_id, shown), self.approve(job_id, shown)
+        self.assertEqual((first.status_code, second.status_code), (200, 200), second.text)
+        self.assertEqual(second.json()["cv"]["en"]["approved_at"], first.json()["cv"]["en"]["approved_at"])
+        self.assertEqual(second.json()["cv"]["en"]["content_sha256"], shown)
+
+    def test_the_preview_shows_only_the_cv_the_page_holds(self):
+        job_id = self.planned_job()
+        shown = self.job(job_id)["cv"]["en"]["content_sha256"]
+        current = self.client.get(f"/preview/{job_id}/en?token={TOKEN}&v={shown}")
+        self.put_back_the_cut_line(job_id)
+        stale = self.client.get(f"/preview/{job_id}/en?token={TOKEN}&v={shown}")
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(stale.status_code, 409)
+        self.assertIn("changed", stale.text)
+        self.assertNotIn("REST APIs", stale.text)  # the newer CV is not shown in its place
+
+    def test_changes_from_two_tabs_run_one_at_a_time(self):
+        # While DeepSeek adjusts the CV for one tab, a change from another waits for it to finish,
+        # so two requests never write one job's files at the same moment.
+        job_id = self.planned_job()
+        gate = self.chat.while_planning = Gate()
+        plan = f"/api/jobs/{job_id}/cv/en/plan"
+        with TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(2) as pool:
+            try:
+                first = pool.submit(client.post, plan, headers=self.headers)
+                self.assertTrue(gate.arrived.acquire(timeout=5))
+                second = pool.submit(client.post, plan, headers=self.headers)
+                wait_until(lambda: self.app.state.waiting_changes == 1)  # the second has reached the lock
+                self.assertFalse(gate.arrived.acquire(timeout=0.5))  # and does not get past it
+            finally:
+                gate.release.set()
+            replies = [first.result(10), second.result(10)]
+        self.assertEqual([reply.status_code for reply in replies], [200, 200])
+        self.assertEqual((gate.count, gate.most), (2, 1))
+
+    def test_a_change_whose_client_goes_away_keeps_others_out_until_it_has_finished(self):
+        # The handler keeps running in its thread after its request is cancelled (a closed tab,
+        # a stopping server); the next change must still wait for it.
+        job_id = self.planned_job()
+        gate = self.chat.while_planning = Gate()
+        plan = f"/api/jobs/{job_id}/cv/en/plan"
+
+        async def scenario():
+            async with anyio.create_task_group() as group:
+                first = anyio.CancelScope()
+
+                async def run_first():
+                    with first:
+                        await asgi_post(self.app, plan)
+
+                group.start_soon(run_first)
+                try:
+                    self.assertTrue(await anyio.to_thread.run_sync(gate.arrived.acquire, True, 5))
+                    first.cancel()
+                    group.start_soon(asgi_post, self.app, plan)
+                    with anyio.fail_after(5):
+                        while self.app.state.waiting_changes != 1 and gate.count < 2:
+                            await anyio.sleep(0.01)
+                    return await anyio.to_thread.run_sync(gate.arrived.acquire, True, 0.5)
+                finally:
+                    gate.release.set()
+
+        self.assertFalse(anyio.run(scenario))  # the second change never got in while the first ran
+        self.assertEqual((gate.count, gate.most), (2, 1))
+
+    def test_a_stalled_upload_holds_up_no_change(self):
+        # An upload only writes its own new file, so a client that stops sending in the middle of
+        # a PDF must not keep the user's changes waiting.
+        job_id = self.planned_job()
+
+        async def scenario():
+            async with anyio.create_task_group() as group:
+                group.start_soon(asgi_post, self.app, "/api/cv/upload", False)
+                await anyio.sleep(0.1)
+                with anyio.fail_after(3):
+                    status = await asgi_post(self.app, f"/api/jobs/{job_id}/cv/en/plan")
+                group.cancel_scope.cancel()
+                return status
+
+        self.assertEqual(anyio.run(scenario), 200)
+
+    def test_following_and_refreshing_companies_never_waits_for_a_cv_change(self):
+        # Job boards are refreshed four at a time when Find jobs opens; they live in their own
+        # store, so they need not wait while DeepSeek adjusts a CV.
+        job_id = self.planned_job()
+        gate = self.chat.while_planning = Gate()
+        with TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(3) as pool:
+            try:
+                slow = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+                self.assertTrue(gate.arrived.acquire(timeout=5))
+                follow = pool.submit(client.post, "/api/sources", json={"link": "https://boards.greenhouse.io/example"},
+                                     headers=self.headers).result(timeout=3)
+                refresh = pool.submit(client.post, "/api/sources/greenhouse/example/refresh",
+                                      headers=self.headers).result(timeout=3)
+            finally:
+                gate.release.set()
+            self.assertEqual(slow.result(10).status_code, 200)
+        self.assertEqual((follow.status_code, refresh.status_code), (200, 200), refresh.text)
+
+    def test_a_busy_database_is_reported_as_busy(self):
+        with patch("web.ranked_listings", side_effect=sqlite3.OperationalError("database is locked")):
+            response = self.client.get("/api/listings", headers=self.headers)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Try again", response.json()["error"])
+
+    def test_a_page_never_sees_a_step_half_moved_to_history(self):
+        # Start over moves the old draft, rewording and layout to history one file at a time; a page
+        # loaded at that moment waits the moment out instead of showing a chain with a hole in it.
+        job_id = self.planned_job()
+        paused, resume = threading.Event(), threading.Event()
+        real_rename = Path.rename
+
+        def slow_rename(source, target):
+            if source.name == "cv-tailored-en.json" and "history" in target.parts:
+                paused.set()
+                resume.wait(5)
+            return real_rename(source, target)
+
+        watched = self.app.state.workspace.lock = WatchedLock()
+        with patch.object(Path, "rename", slow_rename), \
+                TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(2) as pool:
+            try:
+                start_over = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+                self.assertTrue(paused.wait(5))
+                page = pool.submit(client.get, f"/api/jobs/{job_id}", headers=self.headers)
+                self.assertTrue(watched.waiting.wait(5))  # the page has reached the storage lock
+                self.assertFalse(page.done())  # and waits there while the move is half done
+            finally:
+                resume.set()
+            view = page.result(10).json()
+            self.assertEqual(start_over.result(10).status_code, 200)
+        steps = set(view["steps"])
+        self.assertTrue("cv-draft-en" in steps or not steps & {"cv-tailored-en", "cv-planned-en"}, sorted(steps))
+
+    def test_no_step_moves_while_a_page_is_being_read(self):
+        # The page reads a job's steps one file at a time; Start over must not move them between
+        # two of those reads, or the page would mix the old chain with the new.
+        job_id = self.planned_job()
+        draft = Path(self.directory.name) / "jobs" / job_id / "cv-draft-en.json"
+        before = draft.read_bytes()
+        reading, resume = threading.Event(), threading.Event()
+        workspace = self.app.state.workspace
+        real_state = type(workspace).state
+
+        def slow_state(this, job):  # the page's first read pauses there
+            steps = real_state(this, job)
+            if not reading.is_set():
+                reading.set()
+                resume.wait(5)
+            return steps
+
+        watched = workspace.lock = WatchedLock()
+        with patch.object(type(workspace), "state", slow_state), \
+                TestClient(self.app, base_url="http://127.0.0.1:8765") as client, \
+                ThreadPoolExecutor(1) as reader, ThreadPoolExecutor(1) as writer:
+            try:
+                page = reader.submit(client.get, f"/api/jobs/{job_id}", headers=self.headers)
+                self.assertTrue(reading.wait(5))
+                start_over = writer.submit(client.post, f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+                self.assertTrue(watched.waiting.wait(5))  # Start over has reached the storage lock
+                self.assertFalse(start_over.done())
+                self.assertEqual(draft.read_bytes(), before)  # and has moved nothing
+            finally:
+                resume.set()
+            self.assertEqual((page.result(10).status_code, start_over.result(10).status_code), (200, 200))
+
+    def test_a_change_that_waits_too_long_is_told_to_try_again(self):
+        job_id = self.planned_job()
+        gate = self.chat.while_planning = Gate()
+        change = {"change_id": "cut:fact-intern-api", "undone": True}
+        with patch("web.CHANGE_WAIT_SECONDS", 0.05), \
+                TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(3) as pool:
+            try:
+                slow = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
+                self.assertTrue(gate.arrived.acquire(timeout=5))
+                waited = client.post(f"/api/jobs/{job_id}/cv/en/change", json=change, headers=self.headers)
+                # Both answer while the slow change is still held: reading and the token check never wait for it.
+                page = pool.submit(client.get, f"/api/jobs/{job_id}", headers=self.headers).result(timeout=2)
+                stranger = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/change", json=change).result(timeout=2)
+                self.assertEqual(gate.inside, 1)
+            finally:
+                gate.release.set()
+            self.assertEqual(slow.result(10).status_code, 200)
+        self.assertEqual(waited.status_code, 409)
+        self.assertIn("Try again", waited.json()["error"])
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(stranger.status_code, 403)
+        cut = next(item for item in self.job(job_id)["cv"]["en"]["changes"] if item["id"] == "cut:fact-intern-api")
+        self.assertFalse(cut["undone"])  # the refused change was not made
+
+    def restarted(self):
+        """A client for the next start of the workbench, on the same folders."""
+        return TestClient(create_app(
+            facts_db=self.database, jobs_root=Path(self.directory.name) / "jobs", token=TOKEN,
+            profile_path=self.profile_path, chat=self.chat, printer=FakePrinter(), starter=[],
+        ), base_url="http://127.0.0.1:8765")
+
+    def die_in_app(self, action, crash_point):
+        """Run ``action`` (using ``client``, ``headers`` and ``chat``) against this test's folders
+        in a new process that dies at ``crash_point`` the way a killed one does: no finally, no
+        except, no temporary file removed."""
+        code = "\n".join([
+            "import os, sys, json", "from pathlib import Path", f"sys.path.insert(0, {str(REPO)!r})",
+            "from fastapi.testclient import TestClient", "from test_web import FakeDeepSeek, TOKEN",
+            "from test_cv import FakePrinter", "from test_cv_import import minimal_pdf", "from web import create_app",
+            "chat = FakeDeepSeek({'fact-intern-api': 'For an internal tool, built REST APIs.'})",
+            f"app = create_app(facts_db=Path({str(self.database)!r}), jobs_root=Path({str(Path(self.directory.name) / 'jobs')!r}),"
+            f" token=TOKEN, profile_path=Path({str(self.profile_path)!r}), chat=chat, printer=FakePrinter(), starter=[])",
+            "client = TestClient(app, base_url='http://127.0.0.1:8765')", "headers = {'X-Workbench-Token': TOKEN}",
+            "real_replace, real_rename, real_open = os.replace, Path.rename, Path.open", crash_point, action,
+        ])
+        result = subprocess.run([sys.executable, "-B", "-c", code], capture_output=True, text=True, cwd=REPO,
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        self.assertEqual(result.returncode, PROCESS_DIES, result.stderr[-1500:])
+
+    def line_job(self, requirements=("Hands-on Docker and Kubernetes",), suggestions=None):
+        """A job whose requirement check found nothing showing each requirement."""
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        text = "Requirements:\n" + "\n".join(f"- {line}" for line in requirements)
+        job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": text}, headers=self.headers).json()["job_id"]
+        self.chat.evidence = lambda request: [{"id": item["id"], "verdict": "none"} for item in request["requirements"]]
+        self.chat.gap_suggestions = suggestions or (lambda ids: [])
+        gaps = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]
+        return job_id, gaps
+
+    def own_line(self, gaps, index=0, text="Deployed the internal tool with Docker."):
+        place = next(place["id"] for place in gaps["places"] if place["kind"] == "bullet")
+        return gaps["requirements"][index]["requirement_id"], {"place": place, "text": text}
+
+    UPLOAD = """
+chat.cv_structure = {"sections": [
+    {"kind": "experience", "heading": 3, "entries": [
+        {"title": [4, 1], "location": [4, 2], "subtitle": [5, 1], "dates": [5, 2],
+         "facts": [{"lines": [6], "tags": ["REST APIs"]}]}]},
+    {"kind": "skills", "heading": 7, "entries": [{"facts": [{"lines": [8], "tags": ["Python", "Java"]}]}]},
+]}
+pdf = minimal_pdf([
+    (72, 740, "ALEX EXAMPLE"), (72, 726, "Los Angeles, CA | 000-000-0000 | alex@example.com"),
+    (72, 700, "EXPERIENCE"), (72, 686, "Example Corp"), (430, 686, "Chengdu, China"),
+    (72, 672, "Software Intern"), (430, 672, "Jun 2025 - Aug 2025"),
+    (72, 658, "- Built REST APIs for an internal tool."), (72, 630, "SKILLS"), (72, 616, "Languages: Python, Java"),
+])
+contact = {"name": "Alex Example", "location": "Los Angeles, CA", "phone": "000-000-0000", "email": "alex@example.com", "links": []}
+def upload_and_save():
+    proposal = client.post("/api/cv/upload", content=pdf, headers={**headers, "Content-Type": "application/pdf"}).json()
+    return client.post(f"/api/cv/uploads/{proposal['upload_id']}/save", json=contact, headers=headers)
+"""
+
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_saving_an_uploaded_cv_cut_short_is_reported_and_can_be_repeated(self):
+        self.die_in_app(self.UPLOAD + "upload_and_save()", dies_before_renaming_into("cv-profile.json"))
+        client = self.restarted()
+        stopped = client.get("/api/facts", headers=self.headers).json()
+        self.assertEqual([notice["kind"] for notice in stopped["interrupted"]], ["save_cv"])
+        self.assertEqual(json.loads(self.profile_path.read_text(encoding="utf-8"))["name"], PROFILE["name"])  # still the old one
+        # The same PDF, uploaded and saved again: its lines are reused and the notice is settled.
+        self.die_in_app(self.UPLOAD + "upload_and_save(); os._exit(9)", "")
+        self.assertNotIn("interrupted", client.get("/api/facts", headers=self.headers).json())
+        self.assertEqual(json.loads(self.profile_path.read_text(encoding="utf-8"))["name"], "Alex Example")
+        texts = [fact["text"] for fact in list_facts(self.database)]
+        self.assertEqual(sorted(texts), sorted(set(texts)))  # nothing added twice
+
+    @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
+    def test_a_refused_retry_keeps_the_notice_about_the_action_it_repeats(self):
+        self.die_in_app(self.UPLOAD + "upload_and_save()", dies_before_renaming_into("cv-profile.json"))
+        # The same PDF again, refused before anything is written (no name): the notice stays.
+        self.die_in_app(self.UPLOAD + "contact['name'] = ''\nassert upload_and_save().status_code == 400\nos._exit(9)", "")
+        stopped = self.restarted().get("/api/facts", headers=self.headers).json()
+        self.assertEqual([notice["kind"] for notice in stopped["interrupted"]], ["save_cv"])
+
+    def test_a_notice_that_finishes_while_the_page_reads_it_is_not_shown(self):
+        unfinished = self.profile_path.parent / "unfinished"
+        (unfinished / "0123456789abcdef.json").write_text('{"kind": "save_cv"}', encoding="utf-8")
+        real_read = Path.read_text
+
+        def finished(file, *args, **kwargs):
+            if file.parent == unfinished:
+                raise FileNotFoundError(file)  # removed after the folder was listed
+            return real_read(file, *args, **kwargs)
+
+        with patch.object(Path, "read_text", finished):
+            self.assertNotIn("interrupted", self.client.get("/api/facts", headers=self.headers).json())
+
+    def test_an_error_partway_through_adding_a_line_leaves_a_notice(self):
+        # A storage error after the fact went in: the page shows the error, and the notice
+        # stays, since part of the change is done.
+        job_id, gaps = self.line_job()
+        requirement, line = self.own_line(gaps)
+        real_write = web_module.write_atomically
+
+        def disk_full(path, data):
+            if Path(path).name == "cv-profile.json":
+                raise OSError(28, "No space left on device")
+            real_write(path, data)
+
+        client = TestClient(self.app, base_url="http://127.0.0.1:8765", raise_server_exceptions=False)
+        with patch("web.write_atomically", disk_full):
+            refused = client.post(f"/api/jobs/{job_id}/gaps/{requirement}/write", headers=self.headers, json=line)
+        self.assertEqual(refused.status_code, 500)
+        notices = self.job(job_id)["interrupted_operations"]
+        self.assertEqual([(notice["kind"], notice["requirement"], notice["line"], notice["language"]) for notice in notices],
+                         [("add_line", "Hands-on Docker and Kubernetes", line["text"], "en")])
+
+    def test_adding_a_line_cut_short_after_it_was_recorded_can_be_finished_by_adding_it_again(self):
+        job_id, gaps = self.line_job()
+        requirement, line = self.own_line(gaps)
+        write = f"/api/jobs/{job_id}/gaps/{requirement}/write"
+        self.die_in_app(f"client.post({write!r}, headers=headers, json={line!r})",
+                        dies_after_renaming_into("gaps.json"))  # the fact, profile and gaps are all in
+        client = self.restarted()
+        view = client.get(f"/api/jobs/{job_id}", headers=self.headers).json()
+        self.assertEqual([notice["line"] for notice in view["interrupted_operations"]], [line["text"]])
+        again = client.post(write, headers=self.headers, json=line)
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertNotIn("interrupted_operations", again.json())
+        self.assertIn(line["text"], client.get(f"/preview/{job_id}/en?token={TOKEN}").text)  # the CV was prepared again
+        self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line["text"]), 1)
+
+    def test_accepting_a_skill_cut_short_is_reported_and_can_be_repeated(self):
+        # Cut short before the requirement check recorded it as added, just after, and while the
+        # CV was being prepared again.
+        for index, (label, crash_point) in enumerate((("before", dies_before_renaming_into("gaps.json")),
+                                                      ("after", dies_after_renaming_into("gaps.json")),
+                                                      ("preparing", dies_before_renaming_into("cv-draft-en.json")))):
+            with self.subTest(label):
+                if index:  # a fresh workbench for each crash point
+                    self.tearDown()
+                    self.setUp()
+                job_id, gaps = self.line_job(("Experience with Go",), suggestions=lambda ids: [
+                    {"requirement": ids["Experience with Go"], "kind": "skill", "line": "fact-skills-languages", "items": ["Go"]}])
+                requirement = gaps["requirements"][0]["requirement_id"]
+                accept = f"/api/jobs/{job_id}/gaps/{requirement}/accept"
+                self.die_in_app(f"client.post({accept!r}, headers=headers)", crash_point)
+                client = self.restarted()
+                self.assertEqual([(notice["requirement"], notice["line"]) for notice in client.get(
+                    f"/api/jobs/{job_id}", headers=self.headers).json()["interrupted_operations"]],
+                                 [("Experience with Go", "Languages: Python, Java, Go")])
+                again = client.post(accept, headers=self.headers)
+                self.assertEqual(again.status_code, 200, again.text)
+                self.assertNotIn("interrupted_operations", again.json())
+                languages = [fact for fact in list_facts(self.database) if fact["id"] == "fact-skills-languages"]
+                self.assertEqual([(fact["text"], fact["status"]) for fact in languages],
+                                 [("Languages: Python, Java, Go", "confirmed")])
+
+    def test_a_crash_while_the_cv_is_prepared_again_keeps_the_notice_until_it_is(self):
+        # The line is in; the process dies preparing the CV again, which the notice waits for.
+        job_id, gaps = self.line_job()
+        requirement, line = self.own_line(gaps)
+        write = f"/api/jobs/{job_id}/gaps/{requirement}/write"
+        self.die_in_app(f"client.post({write!r}, headers=headers, json={line!r})",
+                        dies_before_renaming_into("cv-draft-en.json"))
+        client = self.restarted()
+        view = client.get(f"/api/jobs/{job_id}", headers=self.headers).json()
+        self.assertEqual(view["interrupted"]["step"], "cv-draft-en")  # the CV says it was cut short
+        self.assertEqual([notice["line"] for notice in view["interrupted_operations"]], [line["text"]])
+        again = client.post(write, headers=self.headers, json=line)  # the same line: saved already, so only the CV is prepared
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertNotIn("interrupted_operations", again.json())
+        self.assertIn(line["text"], client.get(f"/preview/{job_id}/en?token={TOKEN}").text)
+        self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line["text"]), 1)
+
+    def test_a_retry_that_stops_just_before_its_notice_goes_leaves_the_notice(self):
+        job_id, gaps = self.line_job()
+        requirement, line = self.own_line(gaps)
+        write = f"client.post({f'/api/jobs/{job_id}/gaps/{requirement}/write'!r}, headers=headers, json={line!r})"
+        self.die_in_app(write, dies_before_renaming_into("gaps.json"))  # the first try leaves a notice
+        self.die_in_app(write, dies_after_renaming_into("cv-status-en.json"))  # the retry prepares the CV, then dies
+        client = self.restarted()
+        [notice] = client.get(f"/api/jobs/{job_id}", headers=self.headers).json()["interrupted_operations"]
+        self.assertEqual(notice["line"], line["text"])
+        self.assertIn(line["text"], client.get(f"/preview/{job_id}/en?token={TOKEN}").text)
+        self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line["text"]), 1)
+
+    def test_writing_the_suggested_line_yourself_finishes_the_same_action(self):
+        job_id, gaps = self.line_job(suggestions=lambda ids: [
+            {"requirement": ids["Hands-on Docker and Kubernetes"], "kind": "bullet", "entry": "s1e0",
+             "text": "Deployed the internal tool with Docker.", "tags": ["Docker"]}])
+        [record] = gaps["requirements"]
+        accept = f"/api/jobs/{job_id}/gaps/{record['requirement_id']}/accept"
+        self.die_in_app(f"client.post({accept!r}, headers=headers)", dies_before_renaming_into("gaps.json"))
+        own = {"place": f"entry:{record['suggestion']['entry_key']}", "text": record["suggestion"]["text"]}
+        done = self.restarted().post(f"/api/jobs/{job_id}/gaps/{record['requirement_id']}/write", headers=self.headers, json=own)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertNotIn("interrupted_operations", done.json())
+
+    def test_an_action_still_under_way_is_not_shown_as_unfinished(self):
+        job_id, gaps = self.line_job()
+        requirement, line = self.own_line(gaps)
+        self.chat.plan = {"sections": ["education", "skills", "experience"], "entries": [], "reasons": []}
+        gate = self.chat.while_planning = Gate()
+        unfinished = self.profile_path.parent / "unfinished"
+        with TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(1) as pool:
+            try:
+                adding = pool.submit(client.post, f"/api/jobs/{job_id}/gaps/{requirement}/write", headers=self.headers,
+                                     json=line)
+                self.assertTrue(gate.arrived.acquire(timeout=5))  # the line is saved; the CV is being prepared again
+                self.assertEqual(len(list(unfinished.glob("*.json"))), 1)  # its file is there, in case the process dies
+                self.assertNotIn("interrupted_operations", client.get(f"/api/jobs/{job_id}", headers=self.headers).json())
+            finally:
+                gate.release.set()
+            self.assertEqual(adding.result(10).status_code, 200)
+        self.assertEqual(list(unfinished.glob("*.json")), [])
+
+    def test_finishing_another_line_leaves_the_notice_about_this_one(self):
+        job_id, gaps = self.line_job(("Hands-on Docker and Kubernetes", "Experience with Go"))
+        first, first_line = self.own_line(gaps, 0)
+        second, second_line = self.own_line(gaps, 1, text="Wrote a small service in Go.")
+        write_first = f"/api/jobs/{job_id}/gaps/{first}/write"
+        self.die_in_app(f"client.post({write_first!r}, headers=headers, json={first_line!r})",
+                        dies_before_renaming_into("gaps.json"))
+        client = self.restarted()
+        done = client.post(f"/api/jobs/{job_id}/gaps/{second}/write", headers=self.headers, json=second_line)
+        [notice] = done.json()["interrupted_operations"]
+        self.assertEqual(notice["line"], first_line["text"])
+        client.post("/api/notices/dismiss", headers=self.headers, json={"id": notice["id"]})
+        self.assertNotIn("interrupted_operations", client.get(f"/api/jobs/{job_id}", headers=self.headers).json())
+
+    def test_another_line_for_the_same_requirement_leaves_the_notice_about_the_first(self):
+        job_id, gaps = self.line_job()
+        requirement, first = self.own_line(gaps)
+        _, second = self.own_line(gaps, text="Ran the internal tool in Docker containers.")
+        write = f"/api/jobs/{job_id}/gaps/{requirement}/write"
+        self.die_in_app(f"client.post({write!r}, headers=headers, json={first!r})", dies_before_renaming_into("gaps.json"))
+        done = self.restarted().post(write, headers=self.headers, json=second)
+        self.assertEqual(done.status_code, 200, done.text)
+        self.assertEqual([notice["line"] for notice in done.json()["interrupted_operations"]], [first["text"]])
+
+    def test_a_notice_that_cannot_be_read_is_shown_and_kept_until_dismissed(self):
+        unfinished = self.profile_path.parent / "unfinished"
+        unfinished.mkdir(exist_ok=True)
+        (unfinished / "0123456789abcdef.json").write_text("{ not json", encoding="utf-8")
+        (unfinished / "notes.json").write_text('{"kind": "save_cv"}', encoding="utf-8")  # not a notice's name
+        (unfinished / "fedcba9876543210.json").symlink_to(self.profile_path)  # nor is a link
+        client = self.restarted()
+        stopped = client.get("/api/facts", headers=self.headers).json()["interrupted"]
+        self.assertEqual([(notice["kind"], notice["id"]) for notice in stopped], [("unknown", "0123456789abcdef")])
+        job_id, gaps = self.line_job()  # other actions finish around it
+        requirement, line = self.own_line(gaps)
+        self.assertEqual(client.post(f"/api/jobs/{job_id}/gaps/{requirement}/write", headers=self.headers,
+                                     json=line).status_code, 200)
+        self.assertEqual((unfinished / "0123456789abcdef.json").read_text(encoding="utf-8"), "{ not json")
+        for strange in ("../cv-profile", "0123456789ABCDEF", ""):
+            self.assertEqual(client.post("/api/notices/dismiss", headers=self.headers, json={"id": strange}).status_code, 400)
+        self.assertTrue(self.profile_path.exists())
+        client.post("/api/notices/dismiss", headers=self.headers, json={"id": "0123456789abcdef"})
+        self.assertNotIn("interrupted", client.get("/api/facts", headers=self.headers).json())
+
+    def test_an_approval_cut_short_by_a_crash_is_no_approval_after_the_restart(self):
+        job_id = self.planned_job()
+        shown = self.job(job_id)["cv"]["en"]["content_sha256"]
+        approve = f"/api/jobs/{job_id}/cv/en/approve"
+        self.die_in_app(f"client.post({approve!r}, headers=headers, json={{'expected_content_sha256': {shown!r}}})",
+                        dies_before_renaming_into("cv-approved-en.json"))
+        view = self.restarted().get(f"/api/jobs/{job_id}", headers=self.headers).json()
+        self.assertEqual(view["cv"]["en"]["head"], "planned")  # recovery never approves
+        self.assertEqual(view["cv"]["en"]["content_sha256"], shown)
+        self.assertEqual(view["interrupted"]["step"], "cv-approved-en")
+
+    def test_a_restart_during_generation_shows_only_what_was_finished(self):
+        job_id = self.planned_job()
+        dies_rewording = """
+real_call = FakeDeepSeek.__call__
+def dying(self, messages, model, effort):
+    if messages[0]["content"].startswith("You rewrite resume lines"):
+        os._exit(9)
+    return real_call(self, messages, model, effort)
+FakeDeepSeek.__call__ = dying
+"""
+        prepare = f"/api/jobs/{job_id}/cv/en/prepare"
+        self.die_in_app(f"client.post({prepare!r}, headers=headers)", dies_rewording)  # Start over
+        view = self.restarted().get(f"/api/jobs/{job_id}", headers=self.headers).json()
+        self.assertEqual(view["cv"]["en"]["head"], "draft")  # the finished draft stays; nothing after it exists
+        self.assertNotIn("stages", view["cv"]["en"])  # no stage is reported as done for this draft
+        self.assertNotIn("interrupted", view)  # no file was cut short, so nothing needed undoing
 
     def test_nothing_found_leaves_the_requirements_step_to_the_user_and_can_be_retried(self):
         import_facts(self.database, FACTS)

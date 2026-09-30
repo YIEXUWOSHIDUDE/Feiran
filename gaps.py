@@ -565,14 +565,16 @@ def accept_gap(
     A suggestion applies only to what it was made for: the skills line with the same text, or
     the entry with the same name, role, place and dates wherever it now sits. Every step
     can be repeated, so if saving stops before the caller records the gap as added, accepting
-    it again finishes the job without adding anything twice.
+    it again finishes the job without adding anything twice; accepting a suggestion recorded as
+    added writes nothing and succeeds, so a retry after a stop can finish (the caller then
+    prepares the CV again).
     """
     updated = copy.deepcopy(gaps)
     gap = _gap(updated, requirement_id)
     if gap["status"] == "declined":
         raise ValueError("这条建议已标记为不属实；如需添加请重新检查缺口")
     if gap["status"] == "added":
-        raise ValueError("这条建议已经添加过")
+        return updated, None
     suggestion = gap["suggestion"]
     if not suggestion:
         raise ValueError("这条要求没有可添加的建议")
@@ -663,15 +665,27 @@ def places(cv: dict[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
-def write_line(
-    gaps: dict[str, Any], requirement_id: str, place_id: str, text: str, cv: dict[str, Any],
-    facts_db: Path, profile: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """The user writes what shows a requirement themselves: skills for one of the skills lines,
-    or a new line under an entry, even after saying a suggestion was not true. It is their own
-    words, so it becomes a confirmed fact as written, numbers included; it is only refused when
-    empty, too long, already on the CV, or when its place is gone. Adding works as for a
-    suggestion (see accept_gap), with the same protection against a changed line or entry."""
+def addition(suggestion: dict[str, Any]) -> dict[str, str]:
+    """What adding ``suggestion`` puts on the CV, however it was asked for (accepted, or written
+    by the user): the line or entry it goes to and the text there. Two requests add the same
+    thing exactly when these are equal; tags and where it was shown do not matter."""
+    if suggestion["kind"] == "skill":
+        return {"where": f"skill:{suggestion['fact_id']}", "text": suggestion["new_text"]}
+    return {"where": f"entry:{suggestion['entry_key']}", "text": suggestion["text"]}
+
+
+def suggested_addition(gaps: dict[str, Any], requirement_id: str) -> dict[str, str]:
+    """What accepting the requirement's suggestion adds (see addition); refused when there is none."""
+    suggestion = _gap(gaps, requirement_id)["suggestion"]
+    if not suggestion:
+        raise ValueError("这条要求没有可添加的建议")
+    return addition(suggestion)
+
+
+def line_to_write(gaps: dict[str, Any], requirement_id: str, place_id: str, text: str, cv: dict[str, Any]) -> dict[str, Any]:
+    """The suggestion a line the user writes makes: skills for one of the skills lines, or a new
+    line under an entry. It is refused when empty, too long, already on the CV, or when its
+    place is gone; nothing has been written by then."""
     place = next((item for item in places(cv) if item["id"] == place_id), None)
     if place is None:
         raise ValueError("这个位置已不在简历中，请刷新页面后重试")
@@ -701,7 +715,23 @@ def write_line(
         named = [tag for tag in ((gap.get("suggestion") or {}).get("tags") or []) if tag_pattern(tag).search(text)]
         suggestion = {"kind": "bullet", "entry_key": place["entry_key"], "fact_type": place["fact_type"],
                       "text": text, "tags": named, "where": place["where"]}
+    return suggestion
+
+
+def write_line(
+    gaps: dict[str, Any], requirement_id: str, place_id: str, text: str, cv: dict[str, Any],
+    facts_db: Path, profile: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """The user writes what shows a requirement themselves (see line_to_write), even after
+    saying a suggestion was not true. It is their own words, so it becomes a confirmed fact as
+    written, numbers included. Adding works as for a suggestion (see accept_gap), with the same
+    protection against a changed line or entry."""
+    suggestion = line_to_write(gaps, requirement_id, place_id, text, cv)
+    gap = _gap(gaps, requirement_id)
     if gap["status"] == "added":
+        done = gap.get("suggestion") or {}
+        if done.get("written") and all(done.get(key) == value for key, value in suggestion.items()):
+            return copy.deepcopy(gaps), None  # the same line again, after a stop: saved already
         raise ValueError("这条要求已经添加过一行")
     updated = copy.deepcopy(gaps)
     _gap(updated, requirement_id).update(suggestion={**suggestion, "written": True}, status="open")

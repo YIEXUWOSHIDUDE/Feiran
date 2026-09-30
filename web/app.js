@@ -149,7 +149,7 @@ function uploadPanel() {
 }
 
 async function renderFacts() {
-  const { facts } = await api("/api/facts");
+  const { facts, interrupted } = await api("/api/facts");
   const pending = facts.filter((fact) => fact.status !== "confirmed");
   const selected = new Set();
   const confirmButton = el("button", { disabled: true }, "Confirm selected");
@@ -199,6 +199,7 @@ async function renderFacts() {
     uploadPanel(),
     el("section", { class: "panel facts-panel" },
       el("h2", {}, "Facts"),
+      (interrupted || []).map((notice) => unfinishedNote(notice, renderFacts)),
       el("p", { class: "muted" },
         `${facts.length} facts, ${pending.length} pending. Only confirmed facts can be matched or used in a CV. `,
         "Read each one carefully before confirming."),
@@ -593,9 +594,10 @@ function cvBlock(view, language, refresh) {
   const cv = view.cv[language];
   const title = CV_TITLES[language];
   // A failed retry still records why; refresh either way so the page shows it.
-  const post = (action) => async () => {
+  const post = (action, body) => async () => {
     try {
-      await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`, { method: "POST" });
+      await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`,
+        body ? { method: "POST", body: JSON.stringify(body) } : { method: "POST" });
     } finally {
       await refresh();
     }
@@ -646,7 +648,9 @@ function cvBlock(view, language, refresh) {
   }
   let approval = null;
   if (!approved) {
-    const approve = actionButton("Approve this CV", post("approve"));
+    // Only the CV shown below can be approved: if another tab changed it since, the server
+    // refuses and the page shows the current one to read again.
+    const approve = actionButton("Approve this CV", post("approve", { expected_content_sha256: cv.content_sha256 }));
     approve.disabled = true;
     const read = el("input", { type: "checkbox" });
     read.addEventListener("change", () => { approve.disabled = !read.checked; });
@@ -655,7 +659,7 @@ function cvBlock(view, language, refresh) {
   }
   const preview = el("iframe", {
     class: "preview", sandbox: "", title: `${title} preview`,
-    src: `/preview/${view.job_id}/${language}?token=${encodeURIComponent(TOKEN)}&v=${Date.now()}`,
+    src: `/preview/${view.job_id}/${language}?token=${encodeURIComponent(TOKEN)}&v=${encodeURIComponent(cv.content_sha256)}`,
   });
   return el("div", { class: "cv-block" }, el("h3", {}, title), el("div", { class: "toolbar" }, tools), notes, approval, preview);
 }
@@ -829,6 +833,54 @@ function gapsPanel(view, refresh) {
     el("div", { class: "toolbar" }, check));
 }
 
+// A change the server was making when it stopped is undone at the next start; say what it was.
+function interruptedNote(interrupted) {
+  if (!interrupted) return null;
+  const step = interrupted.step;
+  if (step === "unknown") {
+    return el("p", { class: "warning" },
+      "The workbench stopped in the middle of a change to this job and could not tell which one, so it left the files as they were. "
+      + "If the requirements or your CV look wrong, save the requirements again or use Start over.");
+  }
+  const what = step.startsWith("cv-approved-") ? "approving your CV"
+    : step.startsWith("cv-final-") ? "creating the final PDF"
+      : step.startsWith("cv-") ? "preparing your CV"
+        : step === "gaps" ? "checking what your CV shows for each requirement"
+          : step === "matches" || step === "linked" ? "finding talking points"
+            : "saving this job's requirements";
+  return el("p", { class: "warning" },
+    `The workbench stopped while ${what}, so that change was undone and nothing half-done was kept. Do it again if you still want it.`);
+}
+
+// An action that spans the facts, the CV layout and a job did not finish (the workbench stopped,
+// or saving failed partway). Nothing is repeated for the user; repeating it is safe.
+function unfinishedNote(notice, refresh) {
+  const text = notice.kind === "save_cv"
+    ? "Saving an uploaded CV did not finish. Some of its lines may already be here, waiting for confirmation, and "
+      + "your CV layout may still be the old one. Upload the same PDF again and save: lines already saved are reused, "
+      + "never added twice."
+    : notice.kind === "add_line"
+      ? `Adding “${notice.line}” for “${notice.requirement}” did not finish. If that requirement below still offers `
+        + "to add it, add it again with the same words: it will not be added twice. If it says the line was added, "
+        + "prepare the CV again so the CV shows it."
+      : "A change did not finish, and its record could not be read. Check your facts and your CV, and repeat what "
+        + "you were doing.";
+  const dismiss = async () => {
+    await api("/api/notices/dismiss", { method: "POST", body: JSON.stringify({ id: notice.id }) });
+    await refresh();
+  };
+  const tools = [];
+  if (notice.kind === "add_line" && notice.job_id && notice.language) {
+    // Once the CV is prepared again with the line recorded, adding it is done: the notice goes.
+    tools.push(actionButton("Prepare the CV again", async () => {
+      await api(`/api/jobs/${notice.job_id}/cv/${notice.language}/prepare`, { method: "POST" });
+      await dismiss();
+    }, true));
+  }
+  tools.push(actionButton("Dismiss", dismiss, true));
+  return el("p", { class: "warning" }, text, " ", ...tools);
+}
+
 async function renderJob(jobId) {
   // Requirements are checked against the CV once it exists, after the page shows, so Start
   // stays quick; and again, at most once per refresh, whenever the facts or the CV's wording
@@ -843,6 +895,8 @@ async function renderJob(jobId) {
           [jd.company, jd.location].filter(Boolean).join(" · ") || "Company unknown", " · captured ", localDate(jd.captured_at)),
         jd.source ? el("p", {}, el("a", { href: jd.source, target: "_blank", rel: "noopener noreferrer" }, jd.source)) : el("p", { class: "muted" }, "Source: unknown"),
         el("details", {}, el("summary", {}, "Job description"), el("pre", { class: "jd" }, jd.text)),
+        interruptedNote(view.interrupted),
+        (view.interrupted_operations || []).map((notice) => unfinishedNote(notice, refresh)),
       ),
       requirementsPanel(view, refresh),
       cvPanel(view, refresh),

@@ -6,22 +6,26 @@ so other websites open in the browser cannot read facts or trigger DeepSeek call
 """
 
 import argparse
+import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import tempfile
-import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, NamedTuple
+from typing import Callable, Iterable, Iterator, Mapping, NamedTuple
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -29,6 +33,7 @@ from cv import (
     CVError,
     approve_draft,
     build_draft,
+    content_fingerprint,
     export_pdf,
     is_final_approval,
     print_with_chrome,
@@ -42,7 +47,18 @@ from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, str
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs
-from gaps import GAPS_VERSION, accept_gap, coverage, decline_gap, find_gaps, places, write_line
+from gaps import (
+    GAPS_VERSION,
+    accept_gap,
+    addition,
+    coverage,
+    decline_gap,
+    find_gaps,
+    line_to_write,
+    places,
+    suggested_addition,
+    write_line,
+)
 from job_search import (
     SearchError,
     fetch_board,
@@ -71,7 +87,15 @@ from requirement_flow import (
     propose_requirements,
 )
 from review import build_report
-from workspace import DEFAULT_ROOT, Workspace, WorkspaceError
+from workspace import (
+    DEFAULT_ROOT,
+    Workspace,
+    WorkspaceError,
+    make_folder,
+    remove_durably,
+    remove_leftovers,
+    write_atomically,
+)
 
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -84,6 +108,21 @@ access_log = logging.getLogger("workbench.access")
 CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by", "extraction_method")
 CV_LANGUAGES = ("en", "zh")
 QUERY_TOKEN_PATHS = ("/preview/", "/download/")
+READ_ONLY_METHODS = ("GET", "HEAD", "OPTIONS")
+# Changes to their own store only, so they neither wait for nor hold up the others: the followed
+# companies and their postings (a SQLite database of their own, with its own transactions) and a
+# new CV upload (its own new file; saving it, which changes facts and the profile, does wait).
+OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload")
+# How long a change waits for the one before it (DeepSeek can take a minute) before the page is
+# told to try again.
+CHANGE_WAIT_SECONDS = 90
+BUSY = "Another change is still being made (DeepSeek can take a minute). Try again in a moment."
+# Changes that span the fact store, the CV profile and a job's files: saving an uploaded CV, and
+# adding a line the user confirmed. Each has a file in unfinished/ while it runs, which stays as
+# the notice if it does not finish.
+OPERATIONS = ("save_cv", "add_line")
+UNFINISHED = "unfinished"
+NOTICE_ID = re.compile(r"[0-9a-f]{16}")
 UPLOAD_KEEP_SECONDS = 24 * 3600
 
 
@@ -137,6 +176,9 @@ STAGES = ("draft", "rewording", "layout")
 STAGE_FAILED = {"draft": "Not prepared", "rewording": "Not reworded", "layout": "Not adjusted for this job"}
 STAGE_KEPT = {"rewording": "Your confirmed wording is used.", "layout": "Your usual layout is used."}
 STAGE_KEPT_EARLIER = {"rewording": "The earlier rewording below is kept.", "layout": "The earlier adjusted layout below is kept."}
+CV_CHANGED = "This CV changed after the page showed it (another tab or window changed it). Read it again below, then approve."
+PREVIEW_CHANGED = ("<!doctype html><meta charset=\"utf-8\"><p>This CV changed after the page showed it. "
+                   "Reload the page to read the current version.</p>")
 
 
 def _reason(exc: Exception) -> str:
@@ -221,6 +263,18 @@ class WriteLineRequest(BaseModel):
 class ChangeRequest(BaseModel):
     change_id: str
     undone: bool = True
+
+
+class DismissRequest(BaseModel):
+    """The notice the user has read, by the id the page was given."""
+
+    id: str
+
+
+class ApproveRequest(BaseModel):
+    """The fingerprint of the CV the page showed; only that CV can be approved."""
+
+    expected_content_sha256: str
 
 
 class ContactLink(BaseModel):
@@ -328,11 +382,105 @@ def create_app(
 ) -> FastAPI:
     token = token or secrets.token_urlsafe(32)
     workspace = Workspace(jobs_root)
+    # A change the last run was making when it stopped is finished or undone before anything is served.
+    for change in workspace.recover():
+        logging.getLogger("workbench").warning("undid a change cut short by a stop: job %s, step %s",
+                                               change["job_id"], change["step"])
+    uploads = Path(profile_path).parent / "cv-uploads"
+    unfinished = Path(profile_path).parent / UNFINISHED
+    make_folder(unfinished)
+    for folder in (Path(profile_path).parent, Path(profile_path).parent / "profile-history", uploads, unfinished):
+        remove_leftovers(folder)
+
+    running: set[str] = set()  # this process's actions under way: theirs are not notices yet
+
+    def read_notices() -> list[dict]:
+        """Actions that did not finish, oldest first, each with the id the page dismisses it by.
+        A record that cannot be read is shown as an unknown action and kept for a person to see."""
+        notices = []
+        for path in unfinished.glob("*.json"):
+            if not NOTICE_ID.fullmatch(path.stem) or path.is_symlink() or path.stem in running:
+                continue
+            try:
+                notice = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue  # it has just finished
+            except (OSError, ValueError):
+                notice = None
+            if not isinstance(notice, dict) or notice.get("kind") not in OPERATIONS:
+                notice = {"kind": "unknown"}
+            notices.append({**notice, "id": path.stem})
+        return sorted(notices, key=lambda notice: str(notice.get("started_at") or ""))
+
+    @contextmanager
+    def operation(kind: str, job_id: str | None = None, key: str | None = None, **shown: str | None) -> Iterator[None]:
+        """A change that spans the fact store, the CV profile and a job's files, which no single
+        journal covers. It has its own file in unfinished/, named after exactly this action (its
+        kind, job and key: the uploaded PDF's hash, or the requirement and the line), written
+        before it starts and removed once it is done. If the workbench stops, or a store fails
+        partway, the file stays and is the notice the page shows, with what is ``shown`` in it.
+        So no other action, not even another line for the same requirement, settles or replaces
+        it; only the same action done again, or the user, does. A refusal comes before anything
+        is written and leaves things as they were. Nothing is replayed: repeating is safe, since
+        a saved CV's lines are reused and a line is never added twice."""
+        name = hashlib.sha256(json.dumps([kind, job_id, key]).encode("utf-8")).hexdigest()[:16]
+        path = unfinished / f"{name}.json"
+        earlier = path.exists()  # the same action stopped before: its notice stays until this one is done
+        running.add(name)
+        try:
+            if not earlier:
+                write_atomically(path, json.dumps({"kind": kind, "job_id": job_id, "key": key, **shown,
+                                                   "started_at": datetime.now(timezone.utc).isoformat()},
+                                                  ensure_ascii=False).encode("utf-8"))
+            try:
+                yield
+            except (OSError, sqlite3.Error, FactStoreError):
+                raise  # part of the action may be done: the file stays as the notice
+            except Exception:
+                if not earlier:
+                    remove_durably(path)
+                raise
+            remove_durably(path)
+        finally:
+            running.discard(name)
+
+    def added_line(gaps: dict, requirement_id: str, adds: dict) -> dict:
+        """How a notice names a line being added: its requirement and the line, and in the key
+        a fingerprint of what goes where (see gaps.addition). So another line is another action,
+        and the same line, accepted or written, the same one."""
+        requirement = next((item for item in gaps["requirements"] if item["requirement_id"] == requirement_id), {})
+        digest = hashlib.sha256(json.dumps(adds, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        return {"key": f"{requirement_id}:{digest[:12]}", "requirement": requirement.get("text"), "line": adds["text"],
+                "language": gaps.get("language")}
     # Next to the fact store by default, so tests with a temporary fact store stay temporary too.
     listings_db = Path(listings_db or Path(facts_db).parent / "listings.db")
     initialize(listings_db, load_starter() if starter is None else starter)
-    start_lock = threading.Lock()
+    changes = asyncio.Lock()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.waiting_changes = 0
+
+    # Declared first, so it runs inside the host and token check below.
+    @app.middleware("http")
+    async def one_change_at_a_time(request: Request, call_next):
+        """Requests that change the facts, the CV profile or a job's files run one at a time, so
+        two tabs or a double click never write the same files at the same moment. Reading never
+        waits here."""
+        if request.method in READ_ONLY_METHODS or OWN_STORE.fullmatch(request.url.path):
+            return await call_next(request)
+        app.state.waiting_changes += 1  # how many changes wait here now (the event loop's thread only)
+        try:
+            await asyncio.wait_for(changes.acquire(), CHANGE_WAIT_SECONDS)
+        except TimeoutError:
+            return JSONResponse({"error": BUSY}, status_code=409)
+        finally:
+            app.state.waiting_changes -= 1
+        try:
+            # A cancelled request (a closed tab, a stopping server) does not stop its handler, which
+            # runs on in a thread; the shield keeps the lock held until the handler has finished.
+            with anyio.CancelScope(shield=True):
+                return await call_next(request)
+        finally:
+            changes.release()
 
     @app.middleware("http")
     async def local_only(request: Request, call_next):
@@ -384,6 +532,14 @@ def create_app(
     async def domain_error(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
+    @app.exception_handler(sqlite3.OperationalError)
+    async def database_busy(_request: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+        """SQLite waits up to 30 seconds for another writer; after that the page is told to retry.
+        Any other database error stays an error."""
+        if "locked" in str(exc) or "busy" in str(exc):
+            return JSONResponse({"error": BUSY}, status_code=409)
+        raise exc
+
     def require(job_id: str, step: str) -> dict:
         data = workspace.read(job_id, step)
         if data is None:
@@ -391,7 +547,12 @@ def create_app(
         return data
 
     def job_view(job_id: str) -> dict:
-        """What the page needs for one job: the JD and the current file of each step."""
+        """What the page needs for one job: the JD and the current file of each step, all read
+        while no step is being moved or replaced, so they agree with each other."""
+        with workspace.lock:
+            return job_view_locked(job_id)
+
+    def job_view_locked(job_id: str) -> dict:
         steps = workspace.state(job_id)
         jd = {key: value for key, value in require(job_id, "input")["jd"].items() if key != "raw_content"}
         view: dict = {
@@ -415,6 +576,12 @@ def create_app(
         if linked:
             view["report"] = build_report(linked)
         view["cv"] = {language: cv_view(job_id, language) for language in CV_LANGUAGES}
+        interrupted = workspace.read_note(job_id, "interrupted")
+        if interrupted:
+            view["interrupted"] = interrupted
+        stopped = [notice for notice in read_notices() if notice.get("job_id") == job_id]
+        if stopped:
+            view["interrupted_operations"] = stopped
         gaps = workspace.read(job_id, "gaps")
         if gaps:
             view["gaps"] = gaps_view(job_id, gaps)
@@ -450,6 +617,7 @@ def create_app(
         head_step, head = cv_head(job_id, language)
         view: dict = {
             "head": head_step,
+            "content_sha256": content_fingerprint(head) if head else None,
             "final_pdf": workspace.path(job_id, f"cv-final-{language}").exists(),
         }
         draft = workspace.read(job_id, f"cv-draft-{language}")
@@ -491,12 +659,9 @@ def create_app(
             except ValueError:
                 readable = False
             # A broken file is kept for the user to look at, but never read as a backup.
-            with (history / f"cv-profile-{stamp}.{'json' if readable else 'broken'}").open("xb") as backup:
-                backup.write(raw)
+            write_atomically(history / f"cv-profile-{stamp}.{'json' if readable else 'broken'}", raw)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(path)
+        write_atomically(path, (json.dumps(profile, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
     # The page exists to help the user present their best CV for each job, not to grade them.
     # Everything up to the CV review happens by itself: the requirements DeepSeek (or the
@@ -654,9 +819,11 @@ def create_app(
 
     @app.get("/api/facts")
     def facts() -> dict:
+        unfinished = [notice for notice in read_notices() if not notice.get("job_id")]
+        stopped = {"interrupted": unfinished} if unfinished else {}
         if not Path(facts_db).exists():
-            return {"facts": []}
-        return {"facts": list_facts(facts_db)}
+            return {"facts": [], **stopped}
+        return {"facts": list_facts(facts_db), **stopped}
 
     @app.post("/api/facts/confirm")
     def confirm(request: ConfirmRequest) -> dict:
@@ -665,7 +832,6 @@ def create_app(
 
     # An uploaded CV is read here; DeepSeek only sees its lines without the name and contact
     # details. What it proposes waits in cv-uploads/ until the user checks the details and saves.
-    uploads = Path(profile_path).parent / "cv-uploads"
 
     def upload_path(upload_id: str) -> Path:
         if not re.fullmatch(r"[0-9a-f]{16}", upload_id):
@@ -675,13 +841,18 @@ def create_app(
     def propose_cv(data: bytes) -> dict:
         pdf = read_pdf(data)
         proposal = structure_cv(pdf["lines"], chat, links=pdf["links"])
+        proposal["source_sha256"] = hashlib.sha256(data).hexdigest()  # names this PDF if saving is cut short
         upload_id = secrets.token_hex(8)
         uploads.mkdir(parents=True, exist_ok=True)
         # An upload holds contact details; one neither saved nor cancelled is not kept for long.
         for forgotten in uploads.glob("*.json"):
-            if time.time() - forgotten.stat().st_mtime > UPLOAD_KEEP_SECONDS:
+            try:
+                stale = time.time() - forgotten.stat().st_mtime > UPLOAD_KEEP_SECONDS
+            except FileNotFoundError:
+                continue  # another upload, tidying at the same time (uploads wait for nothing)
+            if stale:
                 forgotten.unlink(missing_ok=True)
-        (uploads / f"{upload_id}.json").write_text(json.dumps(proposal, ensure_ascii=False), encoding="utf-8")
+        write_atomically(uploads / f"{upload_id}.json", json.dumps(proposal, ensure_ascii=False).encode("utf-8"))
         known = {fact["text"] for fact in list_facts(facts_db)} if Path(facts_db).exists() else set()
         for section in proposal["sections"]:
             for entry in section["entries"]:
@@ -702,20 +873,30 @@ def create_app(
     def save_uploaded_cv(upload_id: str, request: SaveCVRequest) -> dict:
         """Import the CV's lines as pending facts and make it the CV layout, old one backed up."""
         path = upload_path(upload_id)
-        if not path.exists():
-            raise CVImportError("找不到这次上传；请重新上传 PDF")
-        proposal = json.loads(path.read_text(encoding="utf-8"))
-        profile, items, reused = build_profile(proposal, request.model_dump(), facts_db)
-        if items:
-            import_facts(facts_db, items)
-        save_profile(profile)
-        path.unlink()
+        try:
+            proposal = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise CVImportError("找不到这次上传；请重新上传 PDF") from None
+        with operation("save_cv", key=proposal.get("source_sha256")):
+            profile, items, reused = build_profile(proposal, request.model_dump(), facts_db)
+            if items:
+                import_facts(facts_db, items)
+            save_profile(profile)
+            path.unlink(missing_ok=True)
         return {"imported": len(items), "reused": reused}
 
     @app.delete("/api/cv/uploads/{upload_id}")
     def cancel_upload(upload_id: str) -> dict:
         upload_path(upload_id).unlink(missing_ok=True)
         return {"cancelled": True}
+
+    @app.post("/api/notices/dismiss")
+    def dismiss_notice(request: DismissRequest) -> dict:
+        """The user has read a notice about an action that did not finish."""
+        if not NOTICE_ID.fullmatch(request.id):
+            raise ValueError("没有这条提示")
+        remove_durably(unfinished / f"{request.id}.json")
+        return {"dismissed": True}
 
     def started_jobs() -> dict[str, str]:
         """Official posting link -> the newest job already made from it."""
@@ -758,15 +939,15 @@ def create_app(
 
     @app.post("/api/listings/start")
     def start_listing(request: StartListingRequest) -> dict:
-        # One job per posting: a second click, even a concurrent one, opens the first job.
-        with start_lock:
-            listing = get_listing(listings_db, request.provider, request.board, request.job_id)
-            existing = started_jobs().get(listing["source"])
-            if existing:
-                return {"job_id": existing, "existing": True}
-            selected = selected_posting(request.board, request.job_id, request.provider)
-            selected["jd"]["company"] = selected["jd"].get("company") or listing["company"]
-            return {"job_id": create_prepared_job(prepare_review_input(selected)), "existing": False}
+        # One job per posting: a second click opens the first job. A concurrent one waits for the
+        # first to finish (changes run one at a time), then finds it.
+        listing = get_listing(listings_db, request.provider, request.board, request.job_id)
+        existing = started_jobs().get(listing["source"])
+        if existing:
+            return {"job_id": existing, "existing": True}
+        selected = selected_posting(request.board, request.job_id, request.provider)
+        selected["jd"]["company"] = selected["jd"].get("company") or listing["company"]
+        return {"job_id": create_prepared_job(prepare_review_input(selected)), "existing": False}
 
     @app.get("/api/jobs")
     def jobs() -> dict:
@@ -863,11 +1044,13 @@ def create_app(
     def accept_suggestion(job_id: str, requirement_id: str) -> dict:
         """The user says the suggested line is true: it becomes a confirmed fact on the CV."""
         gaps = require(job_id, "gaps")
-        updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
-        if profile is not None:
-            save_profile(profile)
-        workspace.write(job_id, "gaps", updated)
-        prepare_again(job_id, gaps["language"])
+        adds = suggested_addition(gaps, requirement_id)
+        with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
+            updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile())
+            if profile is not None:
+                save_profile(profile)
+            workspace.write(job_id, "gaps", updated)
+            prepare_again(job_id, gaps["language"])  # the notice stays until the CV has been prepared again
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/write")
@@ -877,11 +1060,13 @@ def create_app(
         _, head = cv_head(job_id, gaps["language"])
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历")
-        updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile())
-        if profile is not None:
-            save_profile(profile)
-        workspace.write(job_id, "gaps", updated)
-        prepare_again(job_id, gaps["language"])
+        adds = addition(line_to_write(gaps, requirement_id, request.place, request.text, head))  # refused before any write
+        with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
+            updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile())
+            if profile is not None:
+                save_profile(profile)
+            workspace.write(job_id, "gaps", updated)
+            prepare_again(job_id, gaps["language"])  # the notice stays until the CV has been prepared again
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/decline")
@@ -914,14 +1099,17 @@ def create_app(
         workspace.write(job_id, f"cv-planned-{language}", set_change(planned, request.change_id, request.undone))
         return job_view(job_id)
 
-    @app.post("/api/jobs/{job_id}/cv/{language}/approve")
-    def cv_approve(job_id: str, language: str) -> dict:
+    @app.post("/api/jobs/{job_id}/cv/{language}/approve", response_model=None)
+    def cv_approve(job_id: str, language: str, request: ApproveRequest) -> dict | JSONResponse:
+        """Approve exactly the CV the page showed. If another tab changed it since, nothing is
+        approved; a second click on the same CV approves nothing new."""
         head_step, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先生成简历草稿")
-        if head_step == "approved":
-            raise CVError("这份简历已经批准；如需修改请重新生成草稿")
-        workspace.write(job_id, f"cv-approved-{language}", approve_draft(head, facts_db))
+        if content_fingerprint(head) != request.expected_content_sha256:
+            return JSONResponse({"error": CV_CHANGED}, status_code=409)
+        if head_step != "approved":
+            workspace.write(job_id, f"cv-approved-{language}", approve_draft(head, facts_db))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/cv/{language}/export")
@@ -934,11 +1122,16 @@ def create_app(
         workspace.write_bytes(job_id, f"cv-final-{language}", data)
         return job_view(job_id)
 
-    @app.get("/preview/{job_id}/{language}", response_class=HTMLResponse)
-    def cv_preview(job_id: str, language: str) -> str:
-        head_step, head = cv_head(job_id, language)
+    @app.get("/preview/{job_id}/{language}", response_class=HTMLResponse, response_model=None)
+    def cv_preview(job_id: str, language: str, v: str = "") -> str | HTMLResponse:
+        """The CV as it will print. The page asks for the version it holds (v, its fingerprint),
+        so the frame never shows a newer CV than the changes and the Approve button beside it."""
+        with workspace.lock:
+            head_step, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先生成简历草稿")
+        if v and v != content_fingerprint(head):
+            return HTMLResponse(PREVIEW_CHANGED, status_code=409)
         try:
             final = head_step == "approved" and is_final_approval(head)
         except CVError:
@@ -946,11 +1139,13 @@ def create_app(
         return render_html(head, final=final)
 
     @app.get("/download/{job_id}/{language}.pdf")
-    def cv_download(job_id: str, language: str) -> FileResponse:
-        path = workspace.path(job_id, f"cv-final-{check_language(language)}")
-        if not path.exists():
+    def cv_download(job_id: str, language: str) -> Response:
+        # Read whole (a CV is small), so a new export moving this one to history cannot cut it off.
+        data = workspace.read_bytes(job_id, f"cv-final-{check_language(language)}")
+        if data is None:
             raise WorkspaceError("还没有已批准的最终 PDF")
-        return FileResponse(path, media_type="application/pdf", filename=f"CV-{language.upper()}.pdf")
+        return Response(data, media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="CV-{language.upper()}.pdf"'})
 
     app.state.workspace = workspace
     return app

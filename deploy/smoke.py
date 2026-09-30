@@ -153,7 +153,9 @@ def create(data: Path, out: Path) -> None:
     statuses = {item["text"]: item["status"] for item in gaps["requirements"]}
     check(statuses == {"Experience building REST APIs": "shown", "Hands-on Docker": "none"},
           f"what the CV shows for each requirement: {statuses}")
-    ok(client.post(f"/api/jobs/{job}/cv/en/approve", headers=HEADERS), "approve the CV")
+    shown = view["cv"]["en"]["content_sha256"]  # the CV as opened above; checking requirements leaves it alone
+    ok(client.post(f"/api/jobs/{job}/cv/en/approve", json={"expected_content_sha256": shown}, headers=HEADERS),
+       "approve the CV that was opened")
     view = ok(client.post(f"/api/jobs/{job}/cv/en/export", headers=HEADERS), "export the PDF")
     check(view["cv"]["en"]["final_pdf"], "final PDF created")
     download = client.get(f"/download/{job}/en.pdf?token={TOKEN}")
