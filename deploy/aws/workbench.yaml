@@ -52,9 +52,9 @@ Parameters:
     AllowedValues: [7, 14, 30, 60, 90, 180, 365]
   GitHubRepository:
     Type: String
-    Default: YIEXUWOSHIDUDE/job-fit-materials-workbench
-    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
-    Description: The repository whose release workflow may push images and install them (owner/name, exactly as GitHub writes it).
+    Default: YIEXUWOSHIDUDE/Feiran
+    AllowedPattern: "^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+@[0-9]+/[A-Za-z0-9_.-]+@[0-9]+)$"
+    Description: The repo segment of GitHub sub_claim_prefix, without repo:. New repositories include immutable IDs (owner@ID/name@ID); see the deployment guide.
   GitHubEnvironment:
     Type: String
     Default: aws
