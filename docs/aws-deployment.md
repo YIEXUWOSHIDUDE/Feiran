@@ -275,19 +275,21 @@ commit for linux/amd64, runs the tests inside the image, pushes it tagged with t
 never pushed twice), and sends the host the release command with the image's digest. The install
 then:
 
-1. refuses a release whose data format is older than the data's, before anything is stopped (see
-   the data format below);
-2. stops the workbench, so the data cannot change in between, and runs two read-only checks of the
-   data (`backup.py verify`): the new release's and the last good release's. If the new one finds a
-   problem the last good one does not, nothing is switched, the workbench starts again as it was,
-   and the run fails;
+1. checks that the data volume itself is mounted, then refuses a release whose data format is older
+   than the data's, before anything is stopped (see the data format below);
+2. stops the workbench (and refuses if it does not stop), so the data cannot change in between, and
+   runs two read-only checks of the data (`backup.py verify`): the new release's and the last good
+   release's. If the new one finds a problem the last good one does not, nothing is switched, the
+   workbench starts again as it was, and the run fails. It also starts again if the install fails
+   or is stopped before switching;
 3. switches to the new release and waits up to two minutes for it to start and answer. If it does
    not, the last good release is installed again and the run fails; its log says why.
 
 The last good release is the last one that passed all of this; an install cut short never becomes
-it. The host keeps the running release's image and the good release before it; every tagged release
-stays in the registry until you delete it. The install itself never replaces or rewrites the data
-folder.
+it. If the host itself stops in the middle of an install (a power cut, say), the new release may be
+left selected without having passed; install again, or install the last good release by hand. The
+host keeps the running release's image and the good release before it; every tagged release stays
+in the registry until you delete it. The install itself never replaces or rewrites the data folder.
 
 To go back by hand to any earlier release, install its digest; it goes through the same checks:
 
@@ -300,15 +302,17 @@ run_on_host "/usr/local/sbin/workbench-release $REPOSITORY@sha256:<the digest>"
 **Data format.** `workspace.DATA_FORMAT` says how the data folder stores things as a whole; every
 release so far uses format 1, so any of them can read the data. Each start of the workbench records
 its format in the data folder (`.workbench-format`), so the record goes with the data, its backups
-and a replaced host; a release refuses to start on data a newer one has recorded, and the install
-refuses it before anything stops. A release that stores data so an older one could not read it must
-raise the number. Installing such a release:
+and a replaced host (data from before the record existed counts as format 1, and a restore of such a
+backup writes the record). A release refuses to start on data a newer one has recorded, and the
+install refuses it before anything stops. A release that stores data so an older one could not read
+it must raise the number. Installing such a release:
 
 - needs a backup from the last hour (`run_on_host "systemctl start workbench-backup"` first);
 - is never undone automatically: once it has started, the data may be in the new format. If it
   fails, the run says so, and going back is by hand: stop the workbench
-  (`run_on_host "systemctl stop workbench"`), restore that backup with `restore.sh`, then install the
-  release before.
+  (`run_on_host "systemctl stop workbench"`), restore that backup
+  (`run_on_host "/opt/workbench/current/deploy/aws/host/restore.sh backups/<its name>"`), then install
+  the release before.
 
 Backups record their format, and no release restores a backup newer than itself.
 
