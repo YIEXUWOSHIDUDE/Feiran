@@ -88,7 +88,7 @@ def private_terms(cv: dict[str, Any]) -> list[str]:
 
 def stand_ins(ids: Iterable[str], prefix: str = "L") -> tuple[dict[str, str], dict[str, str]]:
     """Short IDs to send in place of fact IDs, and the way back. A fact ID can be made from its
-    text (fact-usc-coursework), so it never goes out; an answer names the stand-in."""
+    text (fact-example-university-coursework), so it never goes out; an answer names the stand-in."""
     out = {real: f"{prefix}{number}" for number, real in enumerate(dict.fromkeys(ids), 1)}
     return out, {alias: real for real, alias in out.items()}
 
