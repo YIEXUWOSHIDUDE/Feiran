@@ -363,7 +363,7 @@ class CVTailorTests(unittest.TestCase):
         self.assertIn("For an internal tool, built REST APIs.", printer.html)
 
     def test_lines_go_out_under_stand_in_ids_never_their_fact_ids(self):
-        # A fact ID can be made from its text, such as fact-usc-coursework, and so name a school.
+        # A fact ID can be made from its text, such as fact-example-university-coursework, and so name a school.
         chat = FakeChat({"fact-intern-api": "For an internal tool, built REST APIs."})
         with tempfile.TemporaryDirectory() as directory:
             database = make_store(directory)
