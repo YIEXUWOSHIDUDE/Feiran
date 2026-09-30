@@ -60,6 +60,58 @@ Feiran prepares and reviews materials. It does not submit applications, track ap
 
 Follow these steps only if you want to run your own copy of Feiran. Cloud users can skip this section. Local and cloud data are separate and do not sync automatically.
 
+### Windows (PowerShell)
+
+Install [Git for Windows](https://git-scm.com/install/windows), the [Python Install Manager](https://www.python.org/downloads/windows/), and [Google Chrome](https://www.google.com/chrome/), then open a new PowerShell window. These steps use Python 3.14; skip `pymanager install 3.14` if it is already installed. See the [official Python Windows guide](https://docs.python.org/3.14/using/windows.html) for installation details.
+
+1. Download the code and install dependencies:
+
+   ```powershell
+   pymanager install 3.14
+   git clone https://github.com/YIEXUWOSHIDUDE/Feiran.git
+   cd Feiran
+   py -3.14 -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
+
+   These commands call the virtual environment's Python directly, so you do not need to activate a script or change PowerShell's execution policy.
+
+2. For AI features, paste your own DeepSeek API key into the hidden prompt and press Enter to save it, then configure the file path:
+
+   ```powershell
+   New-Item -ItemType Directory -Force .local | Out-Null
+   .\.venv\Scripts\python.exe -c "from getpass import getpass; from pathlib import Path; Path('.local/deepseek_api_key').write_text(getpass('DeepSeek API key: ').strip(), encoding='utf-8')"
+   $env:DEEPSEEK_API_KEY_FILE = (Resolve-Path .\.local\deepseek_api_key).Path
+   ```
+
+   Input is hidden and stays out of command history; the key is saved in a local file ignored by Git. Do not share `.local`. An existing `DEEPSEEK_API_KEY` environment variable takes precedence over the file.
+
+3. Configure Chrome for PDF export. These commands check three common installation locations:
+
+   ```powershell
+   $chromeCandidates = @(
+       "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+       "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+       "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+   )
+   $env:CHROME_PATH = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+   if (-not $env:CHROME_PATH) { throw 'Chrome not found. Set CHROME_PATH to the full path of chrome.exe.' }
+   ```
+
+   For a custom installation, set `$env:CHROME_PATH` to the actual full path of `chrome.exe`. Chinese PDF export also requires a font with Chinese character support on your system.
+
+4. Start Feiran in the same PowerShell window:
+
+   ```powershell
+   .\.venv\Scripts\python.exe web.py
+   ```
+
+   Open <http://127.0.0.1:8765/>; press `Ctrl+C` to stop. On later starts, enter the `Feiran` directory, set `$env:DEEPSEEK_API_KEY_FILE` and `$env:CHROME_PATH` again as above, and run the startup command. You do not need to reinstall dependencies or save the key again.
+
+These instructions have been checked against the code and official installation documentation. End-to-end operation and PDF export have not yet been verified on Windows.
+
+### macOS / Linux
+
 The commands below are for macOS / Linux. Install Python 3.14 (the version used by CI and the container) and Google Chrome or Chromium for PDF export.
 
 1. Download the code and install dependencies:

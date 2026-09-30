@@ -60,6 +60,58 @@ Feiran 用于准备和审核材料，不会提交申请、跟踪投递或预测�
 
 仅在希望自行运行 Feiran 时执行以下步骤。云端用户可以跳过本节。本地与云端的数据各自独立，不会自动同步。
 
+### Windows（PowerShell）
+
+先安装 [Git for Windows](https://git-scm.com/install/windows)、[Python Install Manager](https://www.python.org/downloads/windows/) 和 [Google Chrome](https://www.google.com/chrome/)，安装后重新打开 PowerShell。下列步骤使用 Python 3.14；已有该版本时可跳过 `pymanager install 3.14`。Python 安装细节见[官方 Windows 指南](https://docs.python.org/3.14/using/windows.html)。
+
+1. 下载代码并安装依赖：
+
+   ```powershell
+   pymanager install 3.14
+   git clone https://github.com/YIEXUWOSHIDUDE/Feiran.git
+   cd Feiran
+   py -3.14 -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
+
+   这里直接调用虚拟环境中的 Python，无需激活脚本或修改 PowerShell 执行策略。
+
+2. 使用 AI 功能时，在隐藏输入提示中粘贴自己的 DeepSeek API key，按回车保存，再设置文件路径：
+
+   ```powershell
+   New-Item -ItemType Directory -Force .local | Out-Null
+   .\.venv\Scripts\python.exe -c "from getpass import getpass; from pathlib import Path; Path('.local/deepseek_api_key').write_text(getpass('DeepSeek API key: ').strip(), encoding='utf-8')"
+   $env:DEEPSEEK_API_KEY_FILE = (Resolve-Path .\.local\deepseek_api_key).Path
+   ```
+
+   输入不会显示，也不会写进命令历史；key 保存在 Git 忽略的本地文件中。不要分享 `.local` 目录。已有 `DEEPSEEK_API_KEY` 环境变量时，应用优先使用该变量。
+
+3. 指定用于 PDF 导出的 Chrome。以下命令检查三个常见安装位置：
+
+   ```powershell
+   $chromeCandidates = @(
+       "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+       "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+       "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+   )
+   $env:CHROME_PATH = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+   if (-not $env:CHROME_PATH) { throw 'Chrome not found. Set CHROME_PATH to the full path of chrome.exe.' }
+   ```
+
+   若 Chrome 装在其他位置，手动将 `$env:CHROME_PATH` 设为实际 `chrome.exe` 的完整路径。中文 PDF 导出还需要系统安装支持中文的字体。
+
+4. 在同一个 PowerShell 窗口启动：
+
+   ```powershell
+   .\.venv\Scripts\python.exe web.py
+   ```
+
+   打开 <http://127.0.0.1:8765/>；停止服务按 `Ctrl+C`。以后启动时，进入 `Feiran` 目录，重新设置上述 `$env:DEEPSEEK_API_KEY_FILE` 和 `$env:CHROME_PATH`，再运行启动命令；无需重复安装或重新保存 key。
+
+这些说明已对照现有代码和官方安装文档核对，但尚未在 Windows 上完成端到端运行及 PDF 导出验证。
+
+### macOS / Linux
+
 以下命令适用于 macOS / Linux。先安装 Python 3.14（与项目 CI 和容器使用的版本一致），以及用于导出 PDF 的 Google Chrome 或 Chromium。
 
 1. 下载代码并安装依赖：
