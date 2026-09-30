@@ -1,7 +1,7 @@
 // Interface copy only. Imported jobs, facts and CV text are never translated here.
 window.WorkbenchChinese = {
   "Feiran": "Feiran · 斐然",
-  "Write a brighter next step.": "让经历成章",
+  "What oft was thought, but ne’er so well express’d.": "What oft was thought, but ne’er so well express’d.",
   "Facts": "事实资料",
   "Find jobs": "发现岗位",
   "My jobs": "我的岗位",
