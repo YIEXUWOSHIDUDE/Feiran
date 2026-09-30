@@ -393,7 +393,8 @@ def create_app(
     selected_posting: Callable[..., dict] = fetch_selected,
 ) -> FastAPI:
     token = token or secrets.token_urlsafe(32)
-    claim_data_format(Path(profile_path).parent)  # before anything reads or changes the data
+    # Before anything reads or changes the data, wherever the options put it.
+    claim_data_format(Path(profile_path).parent, also=(Path(facts_db).parent, Path(jobs_root).parent))
     workspace = Workspace(jobs_root)
     # A change the last run was making when it stopped is finished or undone before anything is served.
     for change in workspace.recover():
