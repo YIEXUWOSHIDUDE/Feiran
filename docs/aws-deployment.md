@@ -18,10 +18,15 @@ than one user. Nothing here has been deployed yet (see [What is not verified](#w
 | Backup bucket | A private, encrypted, versioned S3 bucket, TLS only; backups expire after 35 days by default | **Yes** |
 | Logs | A CloudWatch log group (30 days by default) | No |
 | Alarms | Emailed through SNS: the app stops answering or reporting, no backup for 26 hours, an error was logged, EC2 status checks fail | No |
+| Releases | A release role that only this repository's release workflow, running in the GitHub environment `aws`, can take on; and a release command (an SSM document) that installs a release of this registry by digest and runs nothing else. The account's OIDC provider for GitHub is made too, unless the account has one | No |
+| Budget | A monthly cost budget for the account ($40 by default) that emails you at 80% spent and when the month's forecast passes it | No |
 
 The host's role can be managed through Session Manager, pull from this registry, write to this log
 group, write and read backups (never delete them), report health metrics, and read the one DeepSeek
-secret you name. The app itself runs in the container with none of these permissions.
+secret you name. The app itself runs in the container with none of these permissions. The release
+role is a separate one: it can push images to this registry and send the host the release command,
+and nothing else; it cannot read the data, the backups or the key. Whoever can release can still put
+code next to your data, so only you should be able to run the release workflow (step 3).
 
 ### What it costs
 
@@ -45,16 +50,21 @@ rejected: the host needs the internet anyway for DeepSeek and the job boards.
 images in ECR, the secret, and the CloudWatch metrics and alarms. The public address is released
 while the instance is stopped. **After you delete the stack**, the data volume and the backup bucket
 are kept on purpose and keep costing a little until you delete them yourself (see
-[Cleaning up](#cleaning-up)). A budget alert is set up in the next step of the plan; it notifies,
-it does not stop spending.
+[Stopping and cleaning up](#stopping-and-cleaning-up)).
+
+**The budget only notifies.** It emails you (with `AlertEmail` set) when 80% of `MonthlyBudgetUsd`
+has been spent in a month and when the month's forecast passes it. Nothing is stopped and spending
+is not capped; AWS's figures can also lag by several hours.
 
 ## Before you start
 
 - On your computer: the AWS CLI v2 and the Session Manager plugin for it.
 - AWS credentials in your terminal (for example `aws configure sso`). Never paste keys into a chat.
-- Permission to create the stack's resources, including an IAM role (`CAPABILITY_IAM`).
-- A machine with Docker to build the image, until the release workflow (next step of the plan)
-  builds and pushes it from GitHub.
+- Permission to create the stack's resources, including IAM roles (`CAPABILITY_IAM`), the account's
+  OIDC provider for GitHub (unless it has one) and a budget.
+- Admin rights on the GitHub repository, to set up the `aws` environment, and the `gh` CLI.
+- Nothing to build on your computer: the release workflow builds, tests and pushes each release on
+  GitHub.
 
 Set these once in your terminal (the region is your choice):
 
@@ -99,30 +109,69 @@ Confirm the subscription email AWS sends, or alarms will not reach you. At first
 installs Docker, the Compose plugin (checked against its published SHA-256) and the ECR credential
 helper; it runs nothing until a release is installed.
 
-## 3. Build and push a release
+An account can have only one OIDC provider for GitHub. If `aws iam list-open-id-connect-providers`
+already lists `token.actions.githubusercontent.com`, add `GitHubOidcProviderArn=<its ARN>` to the
+parameters, or the stack fails to create. `GitHubRepository` (this repository) and
+`GitHubEnvironment` (`aws`) name the only workflow jobs the release role trusts; `MonthlyBudgetUsd`
+sets the budget.
 
-Releases are tagged with their Git commit and installed by digest:
+## 3. Set up releases from GitHub
+
+Releases come from the **Release to AWS** workflow (`.github/workflows/release.yml`), run by hand;
+a merge never releases. It runs in the GitHub environment `aws` and signs in to AWS with the job's
+OIDC token, so no AWS key is stored anywhere. Create the environment and give it the stack's
+outputs as variables (none of them is secret):
 
 ```sh
-REPOSITORY=$(aws cloudformation describe-stacks --stack-name "$STACK" \
-  --query "Stacks[0].Outputs[?OutputKey=='RepositoryUri'].OutputValue" --output text)
-COMMIT=$(git rev-parse HEAD)
-docker build --platform linux/amd64 --build-arg REVISION="$COMMIT" -t "$REPOSITORY:$COMMIT" .
-aws ecr get-login-password | docker login --username AWS --password-stdin "${REPOSITORY%%/*}"
-docker push "$REPOSITORY:$COMMIT"
+REPO=YIEXUWOSHIDUDE/job-fit-materials-workbench
+output() {
+  aws cloudformation describe-stacks --stack-name "$STACK" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+gh api -X PUT "repos/$REPO/environments/aws" > /dev/null
+gh variable set AWS_REGION --repo "$REPO" --env aws --body "$AWS_REGION"
+gh variable set AWS_RELEASE_ROLE_ARN --repo "$REPO" --env aws --body "$(output ReleaseRoleArn)"
+gh variable set AWS_REPOSITORY_URI --repo "$REPO" --env aws --body "$(output RepositoryUri)"
+gh variable set AWS_HOST_ID --repo "$REPO" --env aws --body "$(output HostId)"
+gh variable set AWS_RELEASE_DOCUMENT --repo "$REPO" --env aws --body "$(output ReleaseDocumentName)"
+```
+
+Then, on GitHub, under Settings → Environments → `aws`: add yourself as a **required reviewer**, and
+under deployment branches allow **`main` only**. Every release then waits for your approval, and a
+job from another branch cannot take on the release role.
+
+The repository is public, so the release runs' logs are public too. They show the AWS account ID
+(it is part of the registry's address), the host's ID and what the install printed: the release,
+its revision, and the names of any files the data check flags. They never show data, keys or
+tokens; the workflow masks the credentials it gets.
+
+## 4. Push the first release, format the data volume, install
+
+Push the first release **without installing it**: in the Actions tab, run Release to AWS with
+"Install it on the host" turned off, or
+
+```sh
+gh workflow run release.yml --repo "$REPO" --ref main -f install=false
+```
+
+and approve it when GitHub asks. The run's "Sign in" step prints the token's claims: `sub` must read
+`repo:YIEXUWOSHIDUDE/job-fit-materials-workbench:environment:aws`, which is what the release role
+trusts. When the run has finished, its summary names the image; or look it up:
+
+```sh
+git fetch origin main
+COMMIT=$(git rev-parse origin/main)  # the commit the run built
+REPOSITORY=$(output RepositoryUri)
 RELEASE="$REPOSITORY@$(aws ecr describe-images --repository-name "${REPOSITORY#*/}" \
   --image-ids imageTag="$COMMIT" --query 'imageDetails[0].imageDigest' --output text)"
 echo "$RELEASE"
 ```
 
-## 4. Install it on the host
-
 Commands run on the host through Session Manager. This helper waits until a command has ended,
 prints what it printed, and fails when it failed (works in bash and zsh):
 
 ```sh
-HOST=$(aws cloudformation describe-stacks --stack-name "$STACK" \
-  --query "Stacks[0].Outputs[?OutputKey=='HostId'].OutputValue" --output text)
+HOST=$(output HostId)
 run_on_host() {
   local id state
   id=$(aws ssm send-command --instance-ids "$HOST" --document-name AWS-RunShellScript \
@@ -150,8 +199,7 @@ end to end (reading it all takes a few minutes). Skip this if you gave the stack
 that volume already holds your data, and the script refuses it.
 
 ```sh
-VOLUME=$(aws cloudformation describe-stacks --stack-name "$STACK" \
-  --query "Stacks[0].Outputs[?OutputKey=='DataVolumeId'].OutputValue" --output text)
+VOLUME=$(output DataVolumeId)
 run_on_host "set -o pipefail; docker pull $RELEASE && \
   docker run --rm --entrypoint cat $RELEASE /app/deploy/aws/host/format-data.sh | bash -s $VOLUME"
 ```
@@ -165,10 +213,7 @@ first backup.
 run_on_host "/usr/local/sbin/workbench-release $RELEASE"
 ```
 
-Later releases install the same way, next to the same data. To go back to an earlier
-release, install its digest again: the registry keeps every tagged release until you delete it. So
-far no release has changed the data format, so any of them can read the data; a future change that
-does will say so and handle it explicitly.
+Every later release goes through the workflow; see [Releasing and rolling back](#releasing-and-rolling-back).
 
 ## 5. Open the workbench
 
@@ -222,6 +267,51 @@ databases, approvals that still match their CVs and the confirmed facts) before 
 the synthetic data it replaces stays on the volume as `data.before-<time>` until you delete it. The
 copy on your Mac is deleted only if the restore succeeded.
 
+## Releasing and rolling back
+
+For every later release, run Release to AWS (install on), or
+`gh workflow run release.yml --repo "$REPO" --ref main`, and approve it. The workflow builds the
+commit for linux/amd64, runs the tests inside the image, pushes it tagged with the commit (a tag is
+never pushed twice), and sends the host the release command with the image's digest. The install
+then:
+
+1. refuses a release whose data format is older than the data's, before anything is stopped (see
+   the data format below);
+2. stops the workbench, so the data cannot change in between, and runs two read-only checks of the
+   data (`backup.py verify`): the new release's and the last good release's. If the new one finds a
+   problem the last good one does not, nothing is switched, the workbench starts again as it was,
+   and the run fails;
+3. switches to the new release and waits up to two minutes for it to start and answer. If it does
+   not, the last good release is installed again and the run fails; its log says why.
+
+The last good release is the last one that passed all of this; an install cut short never becomes
+it. The host keeps the running release's image and the good release before it; every tagged release
+stays in the registry until you delete it. The install itself never replaces or rewrites the data
+folder.
+
+To go back by hand to any earlier release, install its digest; it goes through the same checks:
+
+```sh
+aws ecr describe-images --repository-name "${REPOSITORY#*/}" \
+  --query 'sort_by(imageDetails, &imagePushedAt)[-5:].[imagePushedAt, imageTags[0], imageDigest]' --output table
+run_on_host "/usr/local/sbin/workbench-release $REPOSITORY@sha256:<the digest>"
+```
+
+**Data format.** `workspace.DATA_FORMAT` says how the data folder stores things as a whole; every
+release so far uses format 1, so any of them can read the data. Each start of the workbench records
+its format in the data folder (`.workbench-format`), so the record goes with the data, its backups
+and a replaced host; a release refuses to start on data a newer one has recorded, and the install
+refuses it before anything stops. A release that stores data so an older one could not read it must
+raise the number. Installing such a release:
+
+- needs a backup from the last hour (`run_on_host "systemctl start workbench-backup"` first);
+- is never undone automatically: once it has started, the data may be in the new format. If it
+  fails, the run says so, and going back is by hand: stop the workbench
+  (`run_on_host "systemctl stop workbench"`), restore that backup with `restore.sh`, then install the
+  release before.
+
+Backups record their format, and no release restores a backup newer than itself.
+
 ## Backups and restoring
 
 - Every night at 03:30 UTC (give or take 15 minutes) the host stops the workbench for the moment its
@@ -241,15 +331,19 @@ copy on your Mac is deleted only if the restore succeeded.
 - Backups expire after `BackupRetentionDays` (35 by default). An overwritten backup stays for 30 more
   days as an earlier version. The host cannot delete backups.
 
-## Cleaning up
+## Stopping and cleaning up
 
 - **Stop the host** (`aws ec2 stop-instances --instance-ids "$HOST"`): the app stops; the volumes,
-  backups, images and alarms keep costing (the not-answering alarm will fire).
+  backups, images and alarms keep costing (the not-answering alarm will fire). Start it again with
+  `aws ec2 start-instances`; the workbench starts once the data volume is mounted.
 - **Delete the stack** (`aws cloudformation delete-stack --stack-name "$STACK"`): removes the host,
-  network, registry and its images, log group and alarms. **The data volume and the backup bucket
-  are kept.** To carry on with the same data, create the stack again with
+  network, registry and its images, log group, alarms, budget, and the release role and command.
+  **The data volume and the backup bucket are kept**, and so is the OIDC provider for GitHub, which
+  other workflows in the account may use (it costs nothing; a new stack needs its ARN as
+  `GitHubOidcProviderArn`). To carry on with the same data, create the stack again with
   `DataVolumeId=<the DataVolumeId output>` in the same availability zone; the new stack gets a new
-  bucket, so copy any backups you still want into it.
+  bucket, so copy any backups you still want into it. Then delete the `aws` environment on GitHub,
+  whose variables name what is gone.
 - **Delete the data for good**: `aws ec2 delete-volume --volume-id <vol-…>` and, for the bucket, empty
   it (all versions; the console's "Empty" button does this) and delete it. This cannot be undone.
 
@@ -272,7 +366,11 @@ how systemd really orders a restart against a backup, and whether a swap survive
 were reasoned about, not observed. Not yet verified: the first boot on Amazon Linux 2023 (the package
 `amazon-ecr-credential-helper`, the Compose plugin, the NVMe device name of the data volume),
 Chromium's sandbox under that kernel, the awslogs driver and the alarms, Session Manager port
-forwarding and Run Command (the `run_on_host` helper above), and every step of the checklist above.
+forwarding and Run Command (the `run_on_host` helper above), and every step of the checklist above. The release workflow has not run: the OIDC sign-in, the
+environment's protection rules, the release command's pattern as SSM applies it, and the budget are
+unverified; actionlint checks the workflow's syntax and shell, and `check-template.py` the release
+role's trust and the command's pattern (with Python's regular expressions). The acceptance checks
+and their results so far are in [aws-acceptance.md](aws-acceptance.md).
 
 The host role gives the Session Manager agent only the actions AWS documents for it, not AWS's
 managed policy (which would also let the host read every Parameter Store parameter); if the host
