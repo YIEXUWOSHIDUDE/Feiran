@@ -4,305 +4,46 @@
 
 English | [简体中文](README.zh-CN.md)
 
-An AI-powered workspace to turn your real experience into tailored, evidence-backed resumes and job application materials — faster, clearer, and with confidence.
+An AI-powered workspace that helps you turn real experience into clearer, job-specific resumes. Understand what a role asks for, refine how you present your experience, and review every change before exporting.
 
 ![Feiran — real experience, clearer stories, brighter next steps](web/feiran-brand.png)
 
-### Real experience. Clearer stories. Brighter next steps.
+## Real experience. Clearer stories. Brighter next steps.
 
-- **Understand job requirements** — find what truly matters in the job description.
-- **Tailor with AI** — refine the wording while preserving the truth.
-- **Organize your story** — bring relevant experience into a clearer narrative.
-- **Review & approve** — inspect the changes and stay in control of the final CV.
-- **Move forward** — export the materials you have reviewed for your next application.
+- **Understand the role** — identify requirements in the job description and review anything missed or misclassified.
+- **Present relevant experience** — use your confirmed facts to prepare a CV for each job.
+- **Refine the wording and structure** — review AI suggestions for phrasing, ordering and what to leave out.
+- **Stay in control** — inspect changes, undo them individually, and approve the exact version you want.
+- **Export your CV** — download the PDF after reviewing and approving it.
 
 *Same you. A stronger story.*
 
-Purpose: for each job, help the candidate present the best CV they can make from their own confirmed, real experience: what to put first, what to cut, and how to word it in the job's language. It does not judge whether the candidate qualifies. Nothing beyond the candidate's facts is ever added, and the candidate reviews and approves the final CV.
+## Availability
 
-Candidate facts are stored in SQLite with versions, a type and tags, in the private data directory of the running Feiran instance. In a cloud deployment, that data lives on the cloud host; local operation keeps it on your own computer. Jobs come from public Greenhouse, Lever and Ashby job boards, or from a pasted job description (JD). The web page is the main entry point; the command line is for development and testing. The repository contains no real candidate data.
-
-Architecture, business invariants and current limits: [development.md](development.md) (in Chinese).
-
-## Cloud workspace
-
-The intended primary way to use Feiran is a hosted workspace in your browser. Running the application on your own computer is optional.
-
-**Availability: not live yet.** There is currently no public demo or ready-to-use hosted URL. The prepared AWS deployment is a private, single-user beta accessed through an authenticated Session Manager port forward. It still needs to be deployed and pass the cloud acceptance checks; it is not a public sign-up service.
-
-For operators: [AWS deployment](docs/aws-deployment.md) · [Deployment acceptance checks](docs/aws-acceptance.md).
+Feiran is being prepared as a browser-based cloud workspace. **It is not live yet:** there is no public demo, hosted URL or open registration. The prepared deployment is a private, single-user beta and still needs deployment and cloud acceptance checks.
 
 ## Using Feiran
 
-Choose 简体中文 or English in the top-right corner. The interface follows the browser language initially and remembers your choice. Switching keeps unsaved input and selections, makes no model call, and leaves job descriptions, facts and CV content in their original language.
+Once you have access to a running workspace:
 
-- **Facts**: upload your CV as a PDF, check your name and contact details, and save. Each line becomes a pending fact (a line identical to a fact you already have reuses it), and the CV's layout becomes your profile (the old one is first backed up to `profile-history/`). Your name, email, phone and links are read by your Feiran instance and never sent to DeepSeek; DeepSeek sees the other lines by number and says which are headings, entries and bullets, and the program copies the text itself. Then confirm pending facts, several at once. Once every fact is confirmed, the page moves to Find jobs.
-- **Find jobs**: all open jobs of the companies you follow, ranked by how many of your confirmed skill tags they mention, most first; ties go to the newest posting. One role posted in several cities is one row. Filter by title and location, or tick "Hide senior roles" (hides Senior, Staff, Principal, Lead, Manager, Director and similar titles; "Member of Technical Staff" stays). **Start** reads the job again and adds it to My jobs; clicking it again opens the same job instead of making a second one.
-- **My jobs**: the jobs you started; you can also paste a JD from any source to create a job.
-- **Each job** (done automatically after Start or pasting; about 5 seconds in 2026-09):
-  1. **What this job asks for**: DeepSeek picks the requirement lines of the JD by line number and the program copies them word for word, so no requirement is invented; all of them count. Each line shows whether the posting marks it required or preferred (or neither), and whether it was counted automatically or reviewed by you; saving your review marks the list as reviewed. You can mark a line "Not a requirement", add a missed line, or let DeepSeek look again; saving prepares the CV again.
-  2. **Your CV for this job**: CVs come only in the language(s) your own resume is written in, judged by the language of the name in your profile. With only an English name there is only an English CV, even for a Chinese JD. The draft is built automatically, reworded for the job (every line passes the fact check, which rejects a reworded line that adds numbers, technologies or leadership words, moves a number onto something else, drops "not", "prototype", "helped" or "in progress", or adds scale words such as "production" or "customers"), and DeepSeek then proposes structure changes: section order, entry and bullet order, and cutting what does not help this job. Every change is listed with its reason and can be undone or redone on its own, without calling DeepSeek again. Tick "I read the CV and every change", approve, then create and download the final PDF. Approving names the exact CV the page shows: if another tab or window changed it meanwhile, nothing is approved and the page shows the current CV to read again. If your resume has a second language, that CV can be prepared with one click.
-  3. **What this CV shows for each requirement**: DeepSeek compares each requirement with your confirmed facts, with this CV's lines in the words it shows (a reworded line is judged as reworded), and with each entry's role or degree and dates; each line goes with its own entry, so years come only from that entry's dates. A line that is only about the same thing never counts as showing a requirement, and neither does a matching skill word. Each requirement gets one status, worked out from the CV as it is shown right now, so undoing a cut changes it at once:
-     - **Shown**: a line, or a group of lines together, that shows it is on this CV.
-     - **Left out**: your facts show it, but this CV cuts that line, rewords it so it no longer shows it, or does not include it at all. A cut or a rewording can be undone right there ("Put it back", "Use your own wording", or both at once).
-     - **Related only**: lines about the same thing that do not show all of it, with what is missing (for example "3+ years").
-     - **No evidence**: none of your confirmed facts states it. That does not mean you lack it.
-     - **Not checked**: DeepSeek could not answer, so nothing counts as shown until it does.
+1. **Bring your experience.** Upload your CV as a PDF, check the extracted information, and confirm the experience statements you want Feiran to use.
+2. **Choose a job.** Browse jobs from companies you follow or paste a job description. Feiran supports public Greenhouse, Lever and Ashby boards; pasted descriptions can come from other sources.
+3. **Review your tailored CV.** Check the job requirements, proposed wording and layout changes. See which requirements your CV supports, which evidence was left out, and where information is missing. Add suggested experience only when it is true for you.
+4. **Approve and export.** Read the CV and every change, approve that version, and download the final PDF. Changed content needs a new review.
 
-     For related-only and no-evidence requirements DeepSeek suggests at most one addition: a tool for one of your skills lines, or a new line under one of your jobs or projects. **It is added only when you click "True for me"**: a skill becomes a new confirmed version of that skills line; a new line becomes a new confirmed fact and is written into your profile (the old profile is first backed up to `profile-history/`); then the CV is prepared again. "Not true" keeps it off your CV, and the same suggestion stays declined when the check runs again. Requirements about years, seniority, degrees, personal traits, qualities or scale (efficient, real-time, large-scale), or work that needs a project of its own (a model architecture, a research area) get no suggestion. DeepSeek is told to offer a new line only under an entry whose lines already show related work and never to reword a line you have, and each new line is shown next to the lines already under that entry. Suggestions with numbers or leadership words, and lines already on the CV (even with a word or two changed), are dropped. A suggestion applies only to the job entry or skills line it was made for: if that entry or line has changed since (for example after uploading a new CV), it is refused and you check again. You can also write the line yourself, or edit the suggestion first ("Write your own line"): choose one of your skills lines or one of your jobs or projects, type it, and click "Add to my CV". It is added exactly as you wrote it, as a confirmed fact (numbers included, since the words are yours); it is refused only when empty, already on the CV, or when its place has changed. The check runs again by itself when your confirmed facts or the CV's wording change; cutting, reordering and undoing need no new check.
+Switch between **English** and **简体中文** at the top of the page. The interface remembers your choice; changing the interface language does not translate your job descriptions, experience statements or CV. CV languages depend on the information in your profile.
 
-Notes:
+## Your information and your decisions
 
-- Followed companies and downloaded jobs are stored in `.local/listings.db`, separate from the fact store; deleting it only loses the company list and downloaded jobs. It starts with the 30 companies in `starter_boards.json`; a company you remove does not come back on the next start. Add a company under Companies by pasting a `boards.greenhouse.io/…`, `jobs.lever.co/…` or `jobs.ashbyhq.com/…` link.
-- When Find jobs opens, companies not updated in the last 24 hours are downloaded again (4 at a time; 30 companies took about 6 seconds in 2026-09). There is no background schedule. Only GET requests without any personal data go to the public job boards; ranking happens entirely within your Feiran instance.
-- The ranking number is a word count, not a match score or a chance of an offer. "AI" appears in 79% of jobs, so the number is only good for ordering. Tag matches are saved in `listings.db` and recomputed only when a job's text or your confirmed skills change (about 5 seconds the first time for about 9,000 jobs, then about 0.05 seconds).
-- Each job is stored in `.local/jobs/<job id>/`, one file per step. Redoing a step moves that step and every later one into the job's `history/`; nothing is overwritten or deleted. The CV depends only on the requirements, so talking points and requirement checks never change it. Each file is written whole or not at all. A change to a step counts once its new file is in place; if the workbench stops before that, the next start puts the old files back and the job's page says so. An operation that writes several steps (preparing a CV: draft, rewording, adjusting) keeps the steps it finished, and the page shows how far it got. If saving an uploaded CV or adding a line you confirmed does not finish (the workbench stopped, or saving failed partway), the Facts page or the job's page says so, naming the line and the requirement. The note stays until that same action is done again (the same PDF, or the same line at the same place for the same requirement, suggested or written) or you dismiss it; other actions never clear it. Adding a line includes preparing the CV again, so the note stays until the CV has the line; its Prepare the CV again button does that and clears it. Repeating is safe: nothing is added twice. A fact-store error always leaves a note, even one refused before anything was saved; check and dismiss it. Crashes were tested by killing real processes at the points listed in `development.md`; every write is flushed to disk, but a power cut was not tested.
-- Changes to your facts, CV profile and jobs run one at a time, so two tabs never write the same files at once; one that waits more than 90 seconds for another (DeepSeek can take a minute) is refused with "try again". Following or refreshing companies and uploading a CV do not wait for them; reading waits only for the moment a file is being moved.
-- Structure changes are limited: education is always kept, in its place; jobs stay in date order and keep at least one line each; a change can only reorder or leave out existing lines, never add one or move it to another entry. The CV file keeps every line, so undoing a change only changes what is shown.
-- Every DeepSeek request uses temperature 0. Even so, a borderline requirement (such as "architect distributed systems") can be judged "related only" in one check and "shown" in the next; each job's check is saved, and runs again only when your facts or the CV's wording change, or when you click "Check again".
-- DeepSeek only receives JD lines, CV line texts (confirmed facts or their rewrites), each entry's role or degree with its dates (for the requirement check) and the job's requirements; never the name, contact details, schools, companies, project names or fact IDs (lines go out under stand-ins such as L1, since a fact ID can be made from its text). If DeepSeek is unavailable, requirements come from the heading rules and the CV stops at the last step that worked, with a prompt to retry.
-- Only requests to 127.0.0.1/localhost are accepted, and every API call needs a random token created when the page starts (preview and download links carry the same token in the URL). Other websites cannot read your facts or trigger DeepSeek calls.
-- Use `--facts-db`, `--jobs`, `--profile` and `--port` to change paths and the port; `listings.db` lives next to the fact store.
-- Web tests need the virtual environment: `.venv/bin/python -m unittest`. With plain `python3` the web tests are skipped.
+- Your experience and saved materials stay in the private data directory of your Feiran instance. In a cloud workspace, this is on the cloud host; local operation stores it on your computer.
+- AI features send relevant job and experience text to DeepSeek. The application filters known identifying details and uses temporary references for experience statements. Filtering does not guarantee anonymity; experience text can still be identifying.
+- Suggestions are not new facts. You decide whether an addition is true and which wording to approve.
+- Approval belongs to the version you reviewed. Changing the content or relevant facts can require you to review and approve again.
 
-## Run locally (optional)
+## Current limits
 
-Python 3.10 or newer. The command-line tools need no third-party packages. TypeSafe/Jev is only used for optional semantic checks of JD requirements; the normal offline flow needs no API key. The web page needs a small virtual environment.
+AI can misunderstand a requirement or change the meaning of a sentence. Automated checks catch some unsupported changes, but they cannot verify your real experience or replace your review.
 
-The web page needs a virtual environment inside the project (install once; nothing is installed globally):
+Job ordering is based on skill-word overlap, not eligibility or the probability of an offer. Missing evidence does not mean you lack a qualification, and a saved job description does not prove a role is still open.
 
-```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-```
-
-Start it, open http://127.0.0.1:8765/ in the browser, and press Ctrl+C to stop:
-
-```sh
-.venv/bin/python web.py
-```
-
-## Command-line flow (optional, for development)
-
-### 1. Build and confirm candidate facts
-
-Every fact needs a coarse type; `--tag` can be repeated and records the skills, domains and qualifications used for search.
-
-```sh
-python3 facts.py add \
-  --type project \
-  --tag Python \
-  --tag FastAPI \
-  --tag backend \
-  --text "Built a backend course project with Python and FastAPI."
-
-python3 facts.py list
-python3 facts.py confirm fact-xxxxxxxxxxxx@1
-```
-
-Supported types: `project`, `experience`, `skill`, `education`, `eligibility`, `availability`, `achievement`, `other`.
-
-Many facts can be imported from one JSON file; see [examples/synthetic_facts_import.json](examples/synthetic_facts_import.json). Each item needs `type` and `text`; `tags` and `id` are optional; any other field is rejected.
-
-`id` is a readable ID of your choice (for example `fact-uni-coursework`; letters, digits and hyphens after `fact-`). The CV profile uses it to refer to facts; see [examples/synthetic_cv_facts.json](examples/synthetic_cv_facts.json). For an item with an `id`: a new ID creates the fact; unchanged content changes nothing; changed content creates a new `pending` version of that fact, which needs confirming again. So you can edit the JSON file and import it again. A new ID whose content exactly matches an existing fact is rejected, so one fact never exists twice.
-
-```sh
-python3 facts.py import .local/my-facts.json
-python3 facts.py confirm fact-aaaaaaaaaaaa@1 fact-bbbbbbbbbbbb@1
-```
-
-Import validates every item first; if any item is invalid, nothing is written. All new facts start as `pending`, and importing the same content again creates no duplicates. The import output's `next_step` lists the `FACT_ID@VERSION` refs you can confirm: check each one and keep only the ones that are right. When confirming several versions at once, if any one is not the current version, none is confirmed. Items without an `id` never modify existing facts; to change a fact use `revise` or re-import with its `id`. Keep personal fact files under `.local/` and never commit them.
-
-Changing the text, type or tags creates a new `pending` version; fields you do not give are carried over from the current version:
-
-```sh
-python3 facts.py revise fact-xxxxxxxxxxxx --text "Updated fact text"
-python3 facts.py revise fact-xxxxxxxxxxxx --type experience --tag Python --tag backend
-python3 facts.py revise fact-xxxxxxxxxxxx --clear-tags
-python3 facts.py list --history fact-xxxxxxxxxxxx
-python3 facts.py confirm fact-xxxxxxxxxxxx@2
-```
-
-A single fact can still be confirmed the old way: `confirm fact-xxxxxxxxxxxx --version 2`.
-
-Once v2 exists, the confirmed v1 is kept as history but is no longer used for new matches. Text, type and tags are confirmed together as one complete version.
-
-### 2. Get the job description
-
-A job from any source (LinkedIn, a company site, a Chinese job site, …) can be pasted as plain text:
-
-```sh
-python3 job_search.py paste \
-  --file .local/acme-jd.txt \
-  --title "Software Engineer Intern" \
-  --company "Acme" \
-  --url "https://jobs.example.com/123" \
-  --output .local/acme-input.json
-
-# On macOS you can read the clipboard directly
-pbpaste | python3 job_search.py paste --file - --title "Backend Developer Intern" --output .local/xx-input.json
-```
-
-Without `--url` the source is recorded as unknown. `captured_at` is when you pasted it, not the official posting date, and pasted text does not prove the job is still open. `--output` writes the same review-input format as `select`.
-
-Greenhouse, Lever and Ashby boards can be searched directly (`--provider` defaults to `greenhouse`). Search can rank locally by the tags of the current confirmed fact versions; candidate facts are never sent to the job boards. Jobs are ranked by the number of distinct tags they mention; a tag used by several facts counts once. Ranking reads only tags and fact IDs; fact text is read only for the evidence shown, at most 20 items per job. Timeouts, connection failures, 429 and 5xx responses are retried once; a 404 usually means the board name or job ID is wrong.
-
-```sh
-python3 job_search.py search \
-  --board duolingounirecruitment \
-  --facts-db .local/workbench.db \
-  --title Intern
-
-python3 job_search.py select \
-  --board duolingounirecruitment \
-  --job-id <job id> \
-  --output .local/review-input.json
-```
-
-For Lever use `--provider lever --board palantir`; for Ashby `--provider ashby --board openai`. The board name is the part after `jobs.lever.co/`, `jobs.ashbyhq.com/` or `boards.greenhouse.io/`.
-
-`select` reads the chosen job again and writes only a JD snapshot. It does not copy any facts yet, and if the job is gone or the API fails, it never passes off old content as current.
-
-### 3. Extract and confirm requirements
-
-```sh
-python3 requirement_flow.py propose \
-  .local/review-input.json \
-  --output .local/review-candidates.json
-
-python3 requirement_flow.py decide \
-  .local/review-candidates.json \
-  --confirm req-xxxxxxxxxx \
-  --exclude req-yyyyyyyyyy \
-  --output .local/review-decided.json
-```
-
-`propose` copies JD lines word for word from known requirement sections; every candidate starts as `pending`. It recognizes common English headings (`Requirements`, `Minimum Requirements`, `You have`, `Nice to have`, `What we look for`, …) and Chinese headings (`岗位要求`, `任职要求`, `职位要求`, `加分项`, …), handles decorations and numbering such as `**…**`, `【…】`, `一、` and `1.`, and headings with content on the same line (`任职要求：熟悉 Python`). `decide` only confirms or excludes requirements; it no longer links facts. Candidate IDs are derived from the text, so they are stable.
-
-Requirements the rules miss can be added by hand, but only as exact JD text (part of a line is fine). Added candidates also start as `pending` and need `decide`:
-
-```sh
-python3 requirement_flow.py add \
-  .local/review-candidates.json \
-  --text "Comfortable with SQL and Linux" \
-  --output .local/review-candidates-2.json
-```
-
-Text not in the JD, an existing candidate, or a file already at the fact-matching stage is rejected.
-
-To add Jev's judgments (is it an applicant requirement, its category, required or preferred), enter the API key without echo in zsh:
-
-```sh
-read -s "TYPESAFE_API_KEY?TypeSafe API key: "
-export TYPESAFE_API_KEY
-python3 requirement_flow.py propose \
-  .local/review-input.json \
-  --typesafe \
-  --output .local/review-candidates.json
-unset TYPESAFE_API_KEY
-```
-
-This request sends only the JD and the requirement candidates, never candidate facts. Jev's output is a signal to check; it never confirms a requirement by itself. Never put the key in a command, a JSON file or the repository.
-
-### 4. Find supporting facts and link them
-
-```sh
-python3 matching.py propose \
-  .local/review-decided.json \
-  --facts-db .local/workbench.db \
-  --limit 10 \
-  --output .local/review-matches.json
-
-python3 matching.py decide \
-  .local/review-matches.json \
-  --facts-db .local/workbench.db \
-  --link req-xxxxxxxxxx=fact-xxxxxxxxxxxx \
-  --no-match req-yyyyyyyyyy \
-  --output .local/review-linked.json
-
-python3 review.py .local/review-linked.json
-```
-
-Search first narrows fact types by the requirement's category signal, then looks for candidates by versioned tags. English tags only use ASCII letters and digits as word boundaries, so `熟悉Python` still matches `Python`; Chinese tags match as substrings. Short tags of one or two letters/digits (such as `Go`, `R`, `C`, `AI`) are case-sensitive and may not touch `&`, and single letters may not touch `-`, so `go to market`, `R&D` and `C-suite` do not match; a sentence starting with `Go` can still match, so prefer a more specific tag such as `Golang`. The output copies only the facts the user chose, never the whole fact store. If a fact was changed, lost its confirmation or is no longer the current version after the candidates were made, `decide` rejects the old candidate and asks for a new search.
-
-`--no-match` records "no supporting fact for now", and the report keeps it as unknown. Search order and candidate counts are not a match score, an eligibility verdict or a chance of an offer.
-
-### 5. Build the CV PDF
-
-A CV has two parts. `.local/cv-profile.json` holds the name, contact details, school/company/title/dates layout and the fact IDs each entry uses (format: [examples/synthetic_cv_profile.json](examples/synthetic_cv_profile.json)). Every line of body text is copied word for word from the current confirmed fact version. Text fields can be a plain string (same in every language) or `{"en": ..., "zh": ...}`; a blank Chinese value falls back to English and is listed in the output's `language_fallbacks`.
-
-```sh
-python3 cv.py draft --profile .local/cv-profile.json --language en --output .local/cv-draft-en.json
-python3 cv.py pdf .local/cv-draft-en.json --output .local/cv-en.pdf
-
-python3 cv.py draft --profile .local/cv-profile.json --language zh --output .local/cv-draft-zh.json
-python3 cv.py pdf .local/cv-draft-zh.json --output .local/cv-zh.pdf
-```
-
-- English defaults to US Letter and Chinese to A4; change it with `--paper`. `--job .local/review-linked.json` puts the facts linked to that job's requirements first in each entry, adding or removing nothing.
-- `draft` refuses to use unconfirmed facts and lists the `FACT_ID@VERSION` refs to confirm. `pdf` checks again: a changed fact or a hand-edited draft is refused, and the draft must be built again.
-- The PDF is printed by the local Google Chrome in headless mode (set `CHROME_PATH` if it is not found). All text in the HTML is escaped and no network loading is allowed. A CV longer than one page is reported.
-- Any PDF from an unapproved draft carries a "DRAFT / 草稿" watermark; approval is described at the end of this section.
-- Output files are always new; existing files are never overwritten.
-
-Rewording or translating for a job (DeepSeek):
-
-```sh
-python3 cv.py tailor .local/cv-draft-zh.json \
-  --job .local/review-linked.json \
-  --output .local/cv-tailored-zh.json
-python3 cv.py pdf .local/cv-tailored-zh.json --output .local/cv-tailored-zh.pdf
-```
-
-- The API key is read from the `DEEPSEEK_API_KEY` environment variable, then from the macOS Keychain (service `deepseek-api-key`); it is never written to a file. To store or replace it: `security add-generic-password -U -a "$USER" -s deepseek-api-key -w` (it prompts without echo).
-- Only the text of education details, experience and project bullets and skills lines is sent, plus the job title and its confirmed requirements; never the name, contact details, school or company names, or publications.
-- Each line is one fact. A rewrite is rejected if it adds a number, technology or skill the fact does not have, a stronger claim ("led", "managed", 主导, 负责, …), a link, or has the wrong shape; that line keeps the fact's own words, and the reasons are in the command output and the draft. Translations may use the other language's word for a term the line already has (前端 for "frontend", 接口 for "API"). These checks are word-level and cannot prove the meaning is identical, so read every line before exporting.
-- `--job` is optional; without it the draft is only translated and polished. The default model is `deepseek-flash` with `--effort low`; use `--model deepseek-v4-pro` or `--effort high` to change it.
-
-Review, approval and the final PDF:
-
-```sh
-python3 cv.py approve .local/cv-tailored-zh.json --output .local/cv-approved-zh.json
-python3 cv.py pdf .local/cv-approved-zh.json --output .local/cv-final-zh.pdf
-```
-
-- Check every line in the watermarked PDF first. `approve` checks all facts again, lists every line DeepSeek changed (original → rewrite), and records the approval time and a content fingerprint in a new file.
-- Only an approved file whose content has not changed at all since approval exports as a final PDF without the watermark. If anything changes after approval (including the name or dates), or a fact it uses is revised, the final export is refused; build a new draft and approve again.
-- An approved file cannot be reworded again or approved twice.
-
-## Run in a container (optional)
-
-The same web page runs in a Linux container (linux/amd64, the way it will run on the AWS host; an Apple Silicon Mac emulates it, which is slower). Data never goes into the image; it stays in a folder on the host, mounted at `/data`:
-
-```sh
-mkdir -p ~/workbench-data && touch ~/workbench-data/.workbench-data
-WORKBENCH_DATA_DIR=~/workbench-data docker compose up -d --build
-```
-
-Open http://127.0.0.1:8765/; `docker compose down` stops it. The folder keeps the facts, the CV profile and the jobs, and a new container picks them up. `.local/` has the same layout, so it can be the folder too (add the `.workbench-data` file, and stop `web.py` first: one server at a time).
-
-- The port is published on the host's loopback only. The Host and token checks are the same as above.
-- The container runs as uid 10001, which must be able to write the folder (on Linux: `sudo chown -R 10001:10001 <folder>`).
-- With `WORKBENCH_REQUIRE_DATA=1` the app refuses to start when the folder has no `.workbench-data` file, so a missing volume never starts an empty workbench.
-- The DeepSeek key comes from a file on the host: `DEEPSEEK_KEY_FILE=<file>`. Compose mounts it as a secret; the key is never in the image or an environment variable. Without it, the DeepSeek steps fail with a clear message.
-- Chromium prints the CV with Liberation Sans (Arial's widths) and Noto Sans CJK, and keeps its sandbox: compose runs the container with `deploy/seccomp-chromium.json`, Docker's default seccomp profile plus the user, PID and network namespaces the sandbox makes, and no other kind.
-- `GET /healthz` answers `{"status": "ok"}` without the token. Each request is logged with its method (one of HTTP's own, else `(other)`), route (such as `/api/jobs/{job_id}`, never the path as sent, whose query carries the token for previews and downloads), status, time and a request id. In the container every log line is one JSON object: CV stages with how they went and why, DeepSeek calls with their time, tokens and retries, errors by their type and place only (a 500 carries the request id for the page to quote), and other libraries' lines only when their wording is known to be fixed, such as the server's own startup lines. No log line holds CV text, a job description, a prompt, an answer, a key or the token.
-- `deploy/smoke.py` runs the whole workflow once with synthetic data, a scripted stand-in for DeepSeek and real PDFs; CI runs it in the container on every pull request. It uploads a CV and confirms facts, so it refuses any folder that already holds data (facts, a CV, jobs or notices): give it an empty throwaway folder, or one the workbench has only started on, never your real one.
-- To run it on AWS (one EC2 host reached only through a Session Manager port forward, nightly backups to a private S3 bucket, CloudWatch logs and alarms), see [docs/aws-deployment.md](docs/aws-deployment.md); releases go out by hand from GitHub, and [docs/aws-acceptance.md](docs/aws-acceptance.md) lists the checks that decide it works. It has not been deployed yet.
-
-## Data and limits
-
-- `.local/workbench.db`, run files, `.env` and all personal data are ignored by Git.
-- Every command that writes creates a new JSON file; existing files are never overwritten.
-- The SQLite schema is v2; v1 data is kept and migrated automatically, with old facts typed `other` and no tags.
-- `search --profile` is kept for the synthetic examples, and its `confirmed` field is only a claim in the input file; use `--facts-db` for real use.
-- Jobs come from public Greenhouse, Lever and Ashby boards and from pasted JDs. Sites that need a login, such as LinkedIn, are not scraped, and there is no whole-web job discovery. Paste jobs from Chinese company sites.
-- The web page finds requirements with DeepSeek first and falls back to the heading rules; the command-line `propose` uses only the heading rules (`section-lines-v3`). Across 8,787 jobs downloaded in 2026-09, the heading rules found no requirement line for 9% of Greenhouse, 7% of Ashby and 1% of Lever jobs; for those, add lines by hand with `add` or the page's "Add missed requirement".
-- TypeSafe only judges JD requirements. With the user's consent, DeepSeek receives the text of confirmed facts (for rewording, structure changes, matching and gap suggestions), but never the name, contact details, schools, companies, project names or fact IDs.
-- There is no application tracking, no automatic applying and no prediction of offers. Fact text cannot yet be edited on the web page (use the command line). The location filter only matches text; there is no country filter such as "US only".
-
-Run all tests:
-
-```sh
-python3 -m unittest -v
-```
+Feiran prepares and reviews materials. It does not submit applications, track applications or predict hiring outcomes. Optional semantic review remains an unvalidated experiment and is not part of the normal web workflow.
