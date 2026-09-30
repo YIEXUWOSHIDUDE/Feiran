@@ -9,8 +9,8 @@ from deepseek_client import DeepSeekError
 from facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
 from gaps import EVIDENCE_RULES, SUGGEST_RULES, accept_gap, addition, coverage, decline_gap, find_gaps, places, write_line
 from requirement_flow import apply_requirement_decisions, propose_requirements
-from test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
-from test_cv_plan import FakePlanner
+from tests.test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
+from tests.test_cv_plan import FakePlanner
 
 
 JD = """Requirements:

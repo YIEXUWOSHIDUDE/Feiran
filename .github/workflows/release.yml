@@ -67,7 +67,7 @@ jobs:
       - name: Build the image for linux/amd64, labelled and tagged with the commit
         run: docker build --platform linux/amd64 --build-arg REVISION="$GITHUB_SHA" -t "$REPOSITORY:$GITHUB_SHA" .
       - name: The tests pass inside the image
-        run: docker run --rm "$REPOSITORY:$GITHUB_SHA" python -m unittest discover -p "test_*.py"
+        run: docker run --rm "$REPOSITORY:$GITHUB_SHA" python -m unittest discover -s tests -t . -p "test_*.py"
       - name: Push it (a tag is never replaced) and read its digest
         id: push
         run: |

@@ -10,8 +10,8 @@ from fastapi.testclient import TestClient
 from cv import build_draft, approve_draft, content_fingerprint
 from facts import import_facts, confirm_facts, list_facts
 from job_search import prepare_pasted_jd, prepare_review_input
-from test_web import FakeDeepSeek, TOKEN
-from test_cv import FakePrinter
+from tests.test_web import FakeDeepSeek, TOKEN
+from tests.test_cv import FakePrinter
 from web import create_app
 
 

@@ -498,7 +498,7 @@ class CVCommandLineTests(unittest.TestCase):
         self.assertTrue(printed["final"])
 
     def test_documented_example_profile_and_facts_work_together(self):
-        examples = Path(__file__).parent / "examples"
+        examples = Path(__file__).resolve().parent.parent / "examples"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "workbench.db"

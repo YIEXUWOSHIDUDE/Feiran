@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from listings import location_regions, ranked_listings, add_source, ListingsError
-from test_listings import posting, FakeBoards
+from tests.test_listings import posting, FakeBoards
 
 class RegionTests(unittest.TestCase):
     def test_place_evidence_only(self):

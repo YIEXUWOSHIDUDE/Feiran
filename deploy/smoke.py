@@ -35,7 +35,7 @@ from cv_plan import PLAN_RULES  # noqa: E402
 from facts import confirm_facts, import_facts  # noqa: E402
 from gaps import EVIDENCE_RULES, SUGGEST_RULES  # noqa: E402
 from requirement_flow import FIND_RULES  # noqa: E402
-from test_cv_import import minimal_pdf  # noqa: E402
+from tests.test_cv_import import minimal_pdf  # noqa: E402
 from web import create_app  # noqa: E402
 from workspace import DATA_FORMAT_FILE  # noqa: E402
 

@@ -11,7 +11,7 @@ from backup import BackupError, create_backup, main, restore_backup, verify_data
 from cv import approve_draft, build_draft
 from facts import confirm_facts, list_facts, revise_fact
 from listings import initialize
-from test_cv import PROFILE, make_store
+from tests.test_cv import PROFILE, make_store
 from workspace import DATA_FORMAT, DATA_FORMAT_FILE, Workspace
 
 

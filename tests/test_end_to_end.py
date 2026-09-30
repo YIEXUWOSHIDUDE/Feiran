@@ -14,7 +14,7 @@ import requirement_flow
 import review
 
 
-EXAMPLES = Path(__file__).parent / "examples"
+EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
 
 class EndToEndTests(unittest.TestCase):

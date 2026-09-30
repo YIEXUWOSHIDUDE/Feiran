@@ -2,6 +2,20 @@
 
 状态：**可运行的本地工作流，尚非完整产品架构**。本文记录已实现行为、关键不变量与后续讨论方向；界面、材料批准和部署方式仍待决定。
 
+## 本地开发入口
+
+以下命令从仓库根目录运行；测试位于 `tests/`，全部使用合成资料和离线模型替身。
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -t . -p "test_*.py"
+.venv/bin/python -m unittest tests.test_review -v
+.venv/bin/python web.py
+```
+
+网页启动后访问 `http://127.0.0.1:8765/`。真实 AI 功能的数据去向与授权要求仍见下文；运行离线测试无需模型密钥。
+
 ## 工程尺度原则
 
 后续仍按可验收增量推进，但每个增量按实际使用条件设计：真实事实会增长、内容会修改、检索可能误召回或漏召回、外部模型可能失败，个人数据范围必须可解释。不能因为当前样例少就把全部事实复制到每个岗位、跳过 schema 迁移、混合模块责任或让模型结果直接成为业务决定。新增结构需要说明数据量增长后的读取范围、版本失效条件、隐私边界和失败行为；尚未出现的并发、云部署和多用户需求仍不提前建设。
@@ -36,24 +50,12 @@
 ├── web.py                        # 网页用：FastAPI 薄层与本机访问保护
 ├── web/                          # 网页前端（HTML、原生 JS、CSS）
 ├── requirements.txt              # 仅网页需要的依赖（固定版本）
-├── test_job_search.py
-├── test_listings.py
-├── test_facts.py
-├── test_requirement_flow.py
-├── test_matching.py
-├── test_typesafe_classifier.py
-├── test_review.py
-├── test_cv.py
-├── test_claims.py
-├── test_deepseek_client.py
-├── test_workspace.py
-├── test_cv_import.py             # 读 PDF 的一项在未安装 pypdf 时跳过
-├── test_web.py                   # 未安装 FastAPI 时自动跳过
-├── test_end_to_end.py            # 粘贴 JD 到审核结果的离线全流程
+├── tests/                        # 离线测试与合成测试工具
 ├── examples/                     # 合成输入样例（含中文 JD 与事实导入文件）
 ├── README.md                     # 运行入口和当前限制（英文）
 ├── README.zh-CN.md               # 同一内容的中文版
-├── development.md                # 开发方向与已确认设计
+├── docs/                        # 开发记录与部署说明
+│   └── development.md           # 开发方向与已确认设计
 └── .local/
     ├── workbench.db              # 本机候选人事实库，不提交 Git
     └── *.json                    # 审核流程快照，不提交 Git
