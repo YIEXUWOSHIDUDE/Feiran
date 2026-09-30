@@ -249,15 +249,21 @@ Resources:
             cat > /usr/local/sbin/workbench-release <<'EOF'
             #!/bin/bash
             # Install the workbench release in an image, given by digest: pull it, take install.sh
-            # from that same image and run it.
+            # from that same image and run it. Each release's installer is a file of its own,
+            # renamed into place whole, so a release started meanwhile never changes the one running.
             set -euo pipefail
             image=${!1:?usage: workbench-release <repository@sha256:digest>}
+            [[ "$image" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "refused: give the image by its digest" >&2; exit 1; }
+            digest=${!image##*@sha256:}
+            installer=/usr/local/lib/workbench/install-${!digest:0:12}.sh
             docker pull "$image"
             container=$(docker create "$image")
             trap 'docker rm -f "$container" > /dev/null' EXIT
-            docker cp "$container:/app/deploy/aws/host/install.sh" /usr/local/sbin/workbench-install
-            chmod 0755 /usr/local/sbin/workbench-install
-            /usr/local/sbin/workbench-install "$image"
+            install -d -m 0755 /usr/local/lib/workbench
+            docker cp "$container:/app/deploy/aws/host/install.sh" "$installer.$$"
+            chmod 0755 "$installer.$$"
+            mv -f "$installer.$$" "$installer"
+            "$installer" "$image"
             EOF
             chmod 0755 /usr/local/sbin/workbench-release
           - ComposeVersion: !FindInMap [Compose, Pinned, Version]
