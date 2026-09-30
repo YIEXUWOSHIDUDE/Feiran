@@ -1489,6 +1489,18 @@ class ServerSettingsTests(unittest.TestCase):
         self.assertEqual((line["event"], line["error"]), ("failed_to_start", "RuntimeError"))
         self.assertNotIn("Alex", json.dumps(line))
 
+    def test_data_a_newer_release_has_used_is_refused_wherever_the_options_put_it(self):
+        from workspace import DATA_FORMAT, DATA_FORMAT_FILE
+        with tempfile.TemporaryDirectory() as newer, tempfile.TemporaryDirectory() as other, \
+                patch.object(web_module.Workspace, "recover") as recover:
+            (Path(newer) / DATA_FORMAT_FILE).write_text(f"{DATA_FORMAT + 1}\n", encoding="utf-8")
+            for facts_db, jobs in ((Path(newer) / "workbench.db", Path(other) / "jobs"),
+                                   (Path(other) / "workbench.db", Path(newer) / "jobs")):
+                with self.assertRaisesRegex(Exception, f"format {DATA_FORMAT + 1}"):
+                    create_app(facts_db=facts_db, jobs_root=jobs, profile_path=Path(other) / "cv-profile.json")
+            recover.assert_not_called()  # no change a crash cut short was touched
+            self.assertEqual(sorted(path.name for path in Path(other).iterdir()), [])  # nothing written either
+
     def test_data_a_newer_release_has_used_is_never_opened(self):
         from workspace import DATA_FORMAT, DATA_FORMAT_FILE
         with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("web.run_log.configure"), \

@@ -30,10 +30,14 @@ cat > "$work/bin/systemctl" <<'EOF'
 # Keeps the workbench unit's state in a file, as systemd would. Starting it starts the release the
 # release file names (a, b or c: its digest's first letter), which records its data format in the
 # data folder as the app does: FAKE_FORMAT_b=2. FAKE_RESTART_FAILS=b: release b does not start.
+# FAKE_STOP_FAILS=1: the workbench does not stop.
 echo "systemctl $*" >> "$CALLS"
 case "$1" in
     is-active) cat "$UNIT_STATE"; [ "$(cat "$UNIT_STATE")" = active ] ;;
-    stop) [ "$2" != workbench.service ] || echo inactive > "$UNIT_STATE" ;;
+    stop)
+        [ "$2" = workbench.service ] || exit 0
+        [ -z "${FAKE_STOP_FAILS:-}" ] || exit 1
+        echo inactive > "$UNIT_STATE" ;;
     start | restart)
         [ "$2" = workbench.service ] || exit 0
         running=$(sed -n 's/.*@sha256:\(.\).*/\1/p' "$WORKBENCH_RELEASE_ENV" 2> /dev/null)
@@ -289,18 +293,43 @@ called "systemctl restart" && fail "a release refused by its check of the data w
 [ "$(unit_state)" = active ] || fail "the workbench was not started again after a release was refused"
 FAKE_PROBLEMS_a='"jobs/x/gaps.json: not readable"' FAKE_PROBLEMS_b='"jobs/x/gaps.json: not readable"' \
     "$host/install.sh" "$image_b" > /dev/null || fail "a problem both releases find blocked the release"
-[ "$(cat "$work/state/good-release")" = "$image_b" ] || fail "a release that passed is not the last good one"
-[ "$(cat "$work/state/good-release-before")" = "$image" ] || fail "the good release before it was not kept"
+[ "$(sed -n 1p "$work/state/good-releases")" = "$image_b" ] || fail "a release that passed is not the last good one"
+[ "$(sed -n 2p "$work/state/good-releases")" = "$image" ] || fail "the good release before it was not kept"
 : > "$calls"
-FAKE_IMAGES="$image"$'\n'"$image_b"$'\n'"$image_c"$'\n''<none>@<none>' "$host/install.sh" "$image_b" > /dev/null
+FAKE_PROBLEMS_b='"jobs/x/gaps.json: not readable"' FAKE_IMAGES="$image"$'\n'"$image_b"$'\n'"$image_c"$'\n''<none>@<none>' \
+    "$host/install.sh" "$image_b" > /dev/null \
+    || fail "installing the good release again tripped over a problem it had already passed with"
 removed=$(sed -n 's/^docker image rm //p' "$calls")
 [ "$removed" = "$image_c" ] || fail "installing the good release again kept or removed the wrong images: $removed"
 echo "ok   install: checked against unchanging data before switching; the last good release put back when one does not start or answer; its image kept"
+
+# install.sh never looks at data that is not on the mounted volume, never checks data that could
+# change, and leaves the workbench as it was when it stops before switching
+: > "$calls"
+if FAKE_UNMOUNTED=1 "$host/install.sh" "$image" > /dev/null 2>&1; then fail "installed without the data volume mounted"; fi
+if called "systemctl stop" || called "verify by"; then fail "stopped or checked before finding the volume unmounted"; fi
+: > "$calls"
+if FAKE_STOP_FAILS=1 "$host/install.sh" "$image" > /dev/null 2>&1; then fail "installed while the workbench would not stop"; fi
+called "verify by" && fail "checked data the running workbench could change"
+[ "$(unit_state)" = active ] || fail "a workbench that would not stop was left in another state"
+chmod a-w "$work/units"
+if "$host/install.sh" "$image" > /dev/null 2>&1; then fail "reported installed when the units could not be written"; fi
+chmod u+w "$work/units"
+[ "$(unit_state)" = active ] || fail "a workbench stopped for the checks stayed stopped when the install failed"
+[ "$(running)" = "$image_b" ] || fail "an install that failed before switching switched"
+echo "ok   install: only on the mounted volume; only with the workbench stopped; started again if it fails before switching"
 
 # install.sh and the data's format: recorded by the app in the data folder, so it goes with the
 # data; never goes back; a release that raises it needs a fresh backup and is never undone
 [ "$(cat "$work/volume/data/.workbench-format")" = 1 ] || fail "the data's format is not recorded with the data"
 touch -d '2 hours ago' "$work/state/last-backup"
+mv "$work/volume/data/.workbench-format" "$work/format-record"  # data from before the record existed
+touch "$work/volume/data/workbench.db"
+if FAKE_FORMAT_c=2 "$host/install.sh" "$image_c" > /dev/null 2>&1; then
+    fail "data without a record was taken for no data, and its format changed without a fresh backup"
+fi
+rm "$work/volume/data/workbench.db"
+mv "$work/format-record" "$work/volume/data/.workbench-format"
 : > "$calls"
 if FAKE_FORMAT_c=2 "$host/install.sh" "$image_c" > /dev/null 2>&1; then
     fail "a release that changes the data's format was installed without a fresh backup"

@@ -16,7 +16,7 @@ import secrets
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 DEFAULT_ROOT = Path(".local/jobs")
@@ -122,23 +122,30 @@ class DataFormatError(WorkspaceError):
     """The data folder is in a format this release may not read, or its record of it is unreadable."""
 
 
-def claim_data_format(folder: Path) -> None:
-    """Refuse data a newer release has stored in a format this one may not read; otherwise
-    record this release's format in the data folder before anything uses the data. A release that
-    changes how data is stored must raise DATA_FORMAT, and so be recorded before it changes anything."""
-    record = Path(folder) / DATA_FORMAT_FILE
+def recorded_data_format(folder: Path) -> int:
+    """The format ``folder``'s record names; 0 when there is none."""
     try:
-        recorded = int(record.read_text(encoding="utf-8").strip())
+        return int((Path(folder) / DATA_FORMAT_FILE).read_text(encoding="utf-8").strip())
     except FileNotFoundError:
-        recorded = 0
+        return 0
     except (OSError, ValueError) as exc:
         raise DataFormatError(f"{DATA_FORMAT_FILE} cannot be read, so the data's format is unknown") from exc
-    if recorded > DATA_FORMAT:
-        raise DataFormatError(f"the data is in format {recorded}, newer than this release's format {DATA_FORMAT}; "
-                              "install a release that can read it")
-    if recorded < DATA_FORMAT:
+
+
+def claim_data_format(folder: Path, also: Iterable[Path] = ()) -> None:
+    """Refuse data a newer release has stored in a format this one may not read, in the data
+    folder or any other folder the data is in (``also``: the older per-file options can put the
+    facts or the jobs elsewhere); otherwise record this release's format in the data folder,
+    before anything uses the data. A release that changes how data is stored must raise
+    DATA_FORMAT, and so be recorded before it changes anything."""
+    for place in dict.fromkeys([Path(folder), *map(Path, also)]):
+        recorded = recorded_data_format(place)
+        if recorded > DATA_FORMAT:
+            raise DataFormatError(f"the data is in format {recorded}, newer than this release's format {DATA_FORMAT}; "
+                                  "install a release that can read it")
+    if recorded_data_format(folder) < DATA_FORMAT:
         make_folder(Path(folder))
-        write_atomically(record, f"{DATA_FORMAT}\n".encode("utf-8"))
+        write_atomically(Path(folder) / DATA_FORMAT_FILE, f"{DATA_FORMAT}\n".encode("utf-8"))
 
 
 def _file_name(step: str) -> str:
