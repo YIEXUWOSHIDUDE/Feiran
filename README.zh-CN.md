@@ -18,7 +18,11 @@
 
 *还是你，表达更出彩。*
 
-## 当前状态
+## 云端使用
+
+**已有云端访问权限：直接打开你的 Feiran HTTPS 地址并登录，无需在电脑上安装 Python、下载代码或配置本地密钥。** 当前实例仅供所有者登录，不开放注册。登录后按下方“如何使用”操作即可。
+
+希望在自己的电脑上运行？本页保留完整的[本地部署（可选）](#本地部署可选)说明；这不是使用云端工作台的前置步骤。
 
 Feiran 的单用户云端工作台已部署到 AWS，提供公网 HTTPS 地址，登录后可用。**目前仅供所有者使用，不提供公开演示或开放注册。** 本地运行仍是可选方式。已在 AWS 验证登录保护、合成中英文简历 PDF 导出、测试容器重建后的数据保留和备份恢复。云端 DeepSeek 密钥已接通，一次受限真实 API 调用已通过；完整简历的生成质量仍需本人审核。参见 [AWS 公网部署](docs/aws-public.md)与[验收记录](docs/aws-acceptance.md)，其中列明已验证范围和剩余检查。
 
@@ -51,6 +55,42 @@ AI 可能误解岗位要求，也可能改变一句话的含义。自动检查�
 岗位排序依据技能词重合，不代表申请资格或录取概率。缺少证据不等于你不具备某项能力；保存的岗位描述也不能证明岗位目前仍开放。
 
 Feiran 用于准备和审核材料，不会提交申请、跟踪投递或预测录用结果。可选语义复核仍处于未经效果验证的实验阶段，不属于常规网页流程。
+
+## 本地部署（可选）
+
+仅在希望自行运行 Feiran 时执行以下步骤。云端用户可以跳过本节。本地与云端的数据各自独立，不会自动同步。
+
+以下命令适用于 macOS / Linux。先安装 Python 3.14（与项目 CI 和容器使用的版本一致），以及用于导出 PDF 的 Google Chrome 或 Chromium。
+
+1. 下载代码并安装依赖：
+
+   ```sh
+   git clone https://github.com/YIEXUWOSHIDUDE/Feiran.git
+   cd Feiran
+   python3 -m venv .venv
+   .venv/bin/python -m pip install -r requirements.txt
+   ```
+
+2. 使用 AI 功能时，配置自己的 DeepSeek API key。创建 `.local/` 目录，用文本编辑器将 key 单独保存到 `.local/deepseek_api_key`（只保存 key），然后设置文件路径：
+
+   ```sh
+   mkdir -p .local
+   # 保存密钥文件后执行：
+   chmod 600 .local/deepseek_api_key
+   export DEEPSEEK_API_KEY_FILE="$PWD/.local/deepseek_api_key"
+   ```
+
+   `.local/` 已被 Git 忽略。不要提交密钥或简历资料；本地运行的 AI 功能同样会向 DeepSeek 发送相关文字。已有 `DEEPSEEK_API_KEY` 环境变量或已配置 macOS 钥匙串时，也可沿用现有方式。
+
+3. 在同一个终端启动工作台：
+
+   ```sh
+   .venv/bin/python web.py
+   ```
+
+   浏览器打开 <http://127.0.0.1:8765/>，按上方流程上传简历并使用。数据默认保存在 `.local/`，停止服务按 `Ctrl+C`。若无法自动找到 Chrome / Chromium，可设置 `CHROME_PATH` 为浏览器可执行文件的完整路径。中文 PDF 导出需要系统安装支持中文的字体。
+
+自行部署到 AWS 的说明见 [AWS 公网部署](docs/aws-public.md)。
 
 ## 开发
 
