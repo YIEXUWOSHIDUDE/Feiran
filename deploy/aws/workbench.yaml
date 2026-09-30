@@ -50,11 +50,35 @@ Parameters:
     Type: Number
     Default: 30
     AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+  GitHubRepository:
+    Type: String
+    Default: YIEXUWOSHIDUDE/job-fit-materials-workbench
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    Description: The repository whose release workflow may push images and install them (owner/name, exactly as GitHub writes it).
+  GitHubEnvironment:
+    Type: String
+    Default: aws
+    AllowedPattern: "^[A-Za-z0-9_.-]+$"
+    Description: The GitHub environment the release job runs in; its protection rules decide who may release, and from which branch.
+  GitHubOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >-
+      The account's IAM OIDC provider for token.actions.githubusercontent.com, if the account has
+      one already (it can have only one). Empty to create it here.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 40
+    MinValue: 1
+    Description: >-
+      An email at 80% of this spent in a month, and when the month's forecast passes it (for the
+      whole account; needs AlertEmail). It only notifies; it stops nothing.
 
 Conditions:
   CreateDataVolume: !Equals [!Ref DataVolumeId, ""]
   HasDeepSeekSecret: !Not [!Equals [!Ref DeepSeekSecretArn, ""]]
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  CreateGitHubOidcProvider: !Equals [!Ref GitHubOidcProviderArn, ""]
 
 Mappings:
   # Amazon Linux 2023 has no Compose plugin; this release is checked against its published SHA-256.
@@ -434,7 +458,113 @@ Resources:
       AlarmActions: [!Ref Alerts]
       OKActions: [!Ref Alerts]
 
+  # Releases come from GitHub by hand (.github/workflows/release.yml). The release role is trusted
+  # only by this repository's jobs in one GitHub environment, and separate from the host's: it can
+  # push images to this registry and send this host one command, the release document, which runs
+  # nothing but workbench-release with an image of this registry given by digest.
+  # Kept when the stack is deleted or stops managing it (GitHubOidcProviderArn given later):
+  # other workflows in the account may use it. It costs nothing.
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateGitHubOidcProvider
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+  ReleaseDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: "2.2"
+        description: Install a workbench release by digest; nothing else can be run through this document.
+        parameters:
+          Image:
+            type: String
+            description: This stack's registry, @sha256 and the digest.
+            allowedPattern: !Join
+              - ""
+              - - "^"
+                - !Join ["\\.", !Split [".", !GetAtt Repository.RepositoryUri]]
+                - "@sha256:[0-9a-f]{64}$"
+        mainSteps:
+          - action: aws:runShellScript
+            name: install
+            inputs:
+              timeoutSeconds: "1800"
+              runCommand: ["/usr/local/sbin/workbench-release {{ Image }}"]
+  ReleaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Assumed only by the GitHub release workflow of one repository and environment.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateGitHubOidcProvider, !Ref GitHubOidcProvider, !Ref GitHubOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !Sub repo:${GitHubRepository}:environment:${GitHubEnvironment}
+      Policies:
+        - PolicyName: release
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SignInToTheRegistry
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushAndReadReleases
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: !GetAtt Repository.Arn
+              - Sid: SendTheReleaseCommandToTheHost
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${Host}
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${ReleaseDocument}
+              # GetCommandInvocation cannot be limited to a host or a document; the role can list no
+              # commands, so it reads only the ones it sent, by their IDs.
+              - Sid: ReadWhatItDid
+                Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: "*"
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+
 Outputs:
+  ReleaseRoleArn:
+    Description: For the GitHub environment variable AWS_RELEASE_ROLE_ARN.
+    Value: !GetAtt ReleaseRole.Arn
+  ReleaseDocumentName:
+    Description: For the GitHub environment variable AWS_RELEASE_DOCUMENT.
+    Value: !Ref ReleaseDocument
   HostId:
     Value: !Ref Host
   OpenTheWorkbench:

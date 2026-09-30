@@ -27,18 +27,37 @@ esac
 EOF
 cat > "$work/bin/systemctl" <<'EOF'
 #!/bin/bash
-# Keeps the workbench unit's state in a file, as systemd would.
+# Keeps the workbench unit's state in a file, as systemd would. Starting it starts the release the
+# release file names (a, b or c: its digest's first letter), which records its data format in the
+# data folder as the app does: FAKE_FORMAT_b=2. FAKE_RESTART_FAILS=b: release b does not start.
 echo "systemctl $*" >> "$CALLS"
 case "$1" in
     is-active) cat "$UNIT_STATE"; [ "$(cat "$UNIT_STATE")" = active ] ;;
     stop) [ "$2" != workbench.service ] || echo inactive > "$UNIT_STATE" ;;
-    start | restart) [ "$2" != workbench.service ] || echo active > "$UNIT_STATE" ;;
+    start | restart)
+        [ "$2" = workbench.service ] || exit 0
+        running=$(sed -n 's/.*@sha256:\(.\).*/\1/p' "$WORKBENCH_RELEASE_ENV" 2> /dev/null)
+        if [ -n "$running" ] && [ "$running" = "${FAKE_RESTART_FAILS:-}" ]; then exit 1; fi
+        echo active > "$UNIT_STATE"
+        format=FAKE_FORMAT_$running record=${WORKBENCH_DATA_DIR:-/nonexistent}/.workbench-format
+        recorded=$(cat "$record" 2> /dev/null || echo 0)
+        if [ -n "$running" ] && [ -d "${WORKBENCH_DATA_DIR:-/nonexistent}" ] && [ "${!format:-1}" -gt "$recorded" ]; then
+            echo "${!format:-1}" > "$record"
+        fi ;;
 esac
 EOF
 cat > "$work/bin/curl" <<'EOF'
 #!/bin/bash
+# FAKE_UNHEALTHY=b: the release whose digest starts with b never answers. A release never answers
+# on data in a newer format than its own either: the app refuses to start on it.
 echo "curl $*" >> "$CALLS"
-[ "${FAKE_HEALTHY:-1}" = 1 ] || exit 7
+running=$(sed -n 's/.*@sha256:\(.\).*/\1/p' "$WORKBENCH_RELEASE_ENV" 2> /dev/null)
+format=FAKE_FORMAT_$running
+recorded=$(cat "${WORKBENCH_DATA_DIR:-/nonexistent}/.workbench-format" 2> /dev/null || echo 0)
+if [ "${FAKE_HEALTHY:-1}" = 1 ] && [ "$running" != "${FAKE_UNHEALTHY:-}" ] && [ "${!format:-1}" -ge "$recorded" ]; then
+    exit 0
+fi
+exit 7
 EOF
 cat > "$work/bin/df" <<'EOF'
 #!/bin/bash
@@ -58,7 +77,15 @@ case "$1" in
         spool=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/backups$|\1|p')
         volume=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/volume$|\1|p')
         check=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/check$|\1|p')
+        # Per release (a or b, the digest's first letter): FAKE_FORMAT_b=2, FAKE_PROBLEMS_b='"x"'.
+        release=$(printf '%s\n' "$@" | sed -n 's/.*@sha256:\(.\).*/\1/p' | head -1)
+        format=FAKE_FORMAT_$release problems=FAKE_PROBLEMS_$release
         case " $* " in
+            *" --entrypoint python "*) echo "${!format:-1}" ;;
+            *" backup.py verify --data /data "*)
+                echo "verify by $release while $(cat "$UNIT_STATE")" >> "$CALLS"
+                printf '{"counts": {}, "problems": [%s], "notes": []}\n' "${!problems:-}"
+                [ -z "${!problems:-}" ] || exit 1 ;;
             *" backup.py create "*)
                 [ "${FAKE_CREATE_FAILS:-0}" = 0 ] || exit 1
                 touch "$spool/$(basename "${!#}")"
@@ -69,6 +96,10 @@ case "$1" in
                 mkdir -p "$into" && echo restored > "$into/facts" ;;
             *" backup.py verify "*) [ "${FAKE_VERIFY_FAILS:-0}" = 0 ] || exit 1 ;;
         esac ;;
+    image)
+        if [ "$2" = ls ] && [ -n "${FAKE_IMAGES:-}" ]; then
+            printf '%s\n' "$FAKE_IMAGES"
+        fi ;;
     create) echo container-1 ;;
     cp) cp -R "$REPO/${2#container-1:/app/}" "$3" ;;
     inspect) echo rev-abc123 ;;
@@ -81,6 +112,9 @@ export WORKBENCH_HOME=$work/home SYSTEMD_DIR=$work/units WORKBENCH_UID WORKBENCH
 WORKBENCH_UID=$(id -u)
 WORKBENCH_GID=$(id -g)
 image="123456789012.dkr.ecr.us-east-1.amazonaws.com/job-fit-workbench@sha256:$(printf 'a%.0s' {1..64})"
+image_b="123456789012.dkr.ecr.us-east-1.amazonaws.com/job-fit-workbench@sha256:$(printf 'b%.0s' {1..64})"
+image_c="123456789012.dkr.ecr.us-east-1.amazonaws.com/job-fit-workbench@sha256:$(printf 'c%.0s' {1..64})"
+running() { sed -n 's/^WORKBENCH_IMAGE=//p' "$WORKBENCH_RELEASE_ENV"; }
 host_env() {  # the host's settings; the workbench's state (active, activating, inactive)
     printf 'AWS_REGION=us-east-1\nBACKUP_BUCKET=test-bucket\nLOG_GROUP=test-logs\nDEEPSEEK_KEY_FILE=%s\nDATA_DEVICE=/dev/fake-data\nDATA_MOUNT=%s\nWORKBENCH_DATA_DIR=%s\nDEEPSEEK_SECRET_ARN=%s\n' \
         "$work/run/workbench/key" "$work/volume" "$work/volume/data" "${2-}" > "$WORKBENCH_ENV"
@@ -223,4 +257,66 @@ if (flock -n 9 && LOCK_WAIT_SECONDS=0 "$host/install.sh" "$image" > /dev/null 2>
     fail "an install ran beside a backup or a restore"
 fi
 echo "ok   install: by digest only; host files from the image, never changed once installed; one at a time; the first install makes the first backup"
+
+# install.sh, later releases: checked against the data with the workbench stopped, before
+# anything is switched; the last good release put back when one does not start or answer
+host_env active
+"$host/install.sh" "$image" > /dev/null
+: > "$calls"
+if FAKE_UNHEALTHY=b HEALTH_WAIT_ATTEMPTS=2 HEALTH_WAIT_SECONDS=0 "$host/install.sh" "$image_b" > /dev/null 2>&1; then
+    fail "a release that did not answer was installed"
+fi
+[ "$(running)" = "$image" ] || fail "the last good release was not put back after one that did not answer"
+[ "$(readlink -f "$work/home/current")" = "$work/home/releases/aaaaaaaaaaaa" ] || fail "current points at the refused release"
+[ "$(unit_state)" = active ] || fail "the release put back is not running"
+called "verify by b while inactive" || fail "the new release did not check the data"
+called "verify by a while inactive" || fail "the last good release did not check the same data"
+called "while active" && fail "the data was checked while the workbench could change it"
+ln -sfn "$work/home/releases/bbbbbbbbbbbb" "$work/home/current"  # an install cut short after switching
+if FAKE_UNHEALTHY=b HEALTH_WAIT_ATTEMPTS=2 HEALTH_WAIT_SECONDS=0 "$host/install.sh" "$image_b" > /dev/null 2>&1; then
+    fail "a release that did not answer was installed"
+fi
+[ "$(running)" = "$image" ] || fail "an install cut short made its own release the one to go back to"
+if FAKE_RESTART_FAILS=b "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail "a release that did not start was installed"; fi
+[ "$(running)" = "$image" ] || fail "the last good release was not put back after one that did not start"
+[ "$(unit_state)" = active ] || fail "the release put back after a failed start is not running"
+: > "$calls"
+if FAKE_PROBLEMS_b='"jobs/x/gaps.json: not readable"' "$host/install.sh" "$image_b" > /dev/null 2>&1; then
+    fail "a release that finds new problems in the data was installed"
+fi
+[ "$(running)" = "$image" ] || fail "a release that found new problems was switched to"
+called "systemctl restart" && fail "a release refused by its check of the data was started"
+[ "$(unit_state)" = active ] || fail "the workbench was not started again after a release was refused"
+FAKE_PROBLEMS_a='"jobs/x/gaps.json: not readable"' FAKE_PROBLEMS_b='"jobs/x/gaps.json: not readable"' \
+    "$host/install.sh" "$image_b" > /dev/null || fail "a problem both releases find blocked the release"
+[ "$(cat "$work/state/good-release")" = "$image_b" ] || fail "a release that passed is not the last good one"
+[ "$(cat "$work/state/good-release-before")" = "$image" ] || fail "the good release before it was not kept"
+: > "$calls"
+FAKE_IMAGES="$image"$'\n'"$image_b"$'\n'"$image_c"$'\n''<none>@<none>' "$host/install.sh" "$image_b" > /dev/null
+removed=$(sed -n 's/^docker image rm //p' "$calls")
+[ "$removed" = "$image_c" ] || fail "installing the good release again kept or removed the wrong images: $removed"
+echo "ok   install: checked against unchanging data before switching; the last good release put back when one does not start or answer; its image kept"
+
+# install.sh and the data's format: recorded by the app in the data folder, so it goes with the
+# data; never goes back; a release that raises it needs a fresh backup and is never undone
+[ "$(cat "$work/volume/data/.workbench-format")" = 1 ] || fail "the data's format is not recorded with the data"
+touch -d '2 hours ago' "$work/state/last-backup"
+: > "$calls"
+if FAKE_FORMAT_c=2 "$host/install.sh" "$image_c" > /dev/null 2>&1; then
+    fail "a release that changes the data's format was installed without a fresh backup"
+fi
+called "systemctl stop" && fail "the workbench was stopped for a release refused for want of a backup"
+touch "$work/state/last-backup"
+if FAKE_FORMAT_c=2 FAKE_UNHEALTHY=c HEALTH_WAIT_ATTEMPTS=2 HEALTH_WAIT_SECONDS=0 \
+        "$host/install.sh" "$image_c" > "$work/out" 2>&1; then
+    fail "a release that did not answer was installed"
+fi
+grep -q "not going back automatically" "$work/out" || fail "a release that may have changed the data's format was undone"
+[ "$(running)" = "$image_c" ] || fail "a release that may have changed the data's format was switched away from"
+FAKE_FORMAT_c=2 "$host/install.sh" "$image_c" > /dev/null || fail "a release in the data's own format was refused"
+: > "$calls"
+if "$host/install.sh" "$image" > /dev/null 2>&1; then fail "a release older than the data's format was installed"; fi
+[ "$(running)" = "$image_c" ] || fail "refusing an older release changed the running one"
+called "systemctl stop" && fail "the workbench was stopped for a release that was refused"
+echo "ok   install: the data's format only goes forward; raising it needs a fresh backup and is never undone automatically"
 echo "host scripts: all checks passed"

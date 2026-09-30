@@ -37,6 +37,7 @@ from gaps import EVIDENCE_RULES, SUGGEST_RULES  # noqa: E402
 from requirement_flow import FIND_RULES  # noqa: E402
 from test_cv_import import minimal_pdf  # noqa: E402
 from web import create_app  # noqa: E402
+from workspace import DATA_FORMAT_FILE  # noqa: E402
 
 TOKEN = "smoke-test-token"
 HEADERS = {"X-Workbench-Token": TOKEN}
@@ -131,8 +132,8 @@ def check(condition: bool, what: str) -> None:
 
 def _left_by_an_empty_start(item: Path) -> bool:
     """What the workbench makes when it starts on no data: the list of companies to follow (no
-    facts, CV or jobs) and an empty folder for notices."""
-    if item.name == "listings.db":
+    facts, CV or jobs), the record of its data format, and an empty folder for notices."""
+    if item.name in ("listings.db", DATA_FORMAT_FILE):
         return item.is_file()
     return item.name == "unfinished" and item.is_dir() and not any(item.iterdir())
 
