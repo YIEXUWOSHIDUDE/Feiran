@@ -18,7 +18,11 @@ An AI-powered workspace that helps you turn real experience into clearer, job-sp
 
 *Same you. A stronger story.*
 
-## Availability
+## Use the cloud workspace
+
+**Already have cloud access? Open your Feiran HTTPS address and sign in. You do not need to install Python, download the code or configure a local API key.** The current instance is restricted to its owner; registration is not open. Continue with “Using Feiran” below after signing in.
+
+Prefer running it on your computer? Complete [local setup instructions](#local-deployment-optional) remain on this page. Local deployment is optional and is not required to use the cloud workspace.
 
 A single-owner Feiran workspace is now deployed on AWS with a public HTTPS address and private login. **There is no public demo or open registration.** The owner can open the workspace in a browser; local operation remains optional. Login protection, synthetic English/Chinese PDF export, persistence across test containers, and backup restoration have been verified on AWS. The cloud DeepSeek secret is connected, and a bounded live API check passed. Full resume quality still requires your review. See [AWS public deployment](docs/aws-public.md) and the [acceptance record](docs/aws-acceptance.md) for the tested scope and remaining checks.
 
@@ -51,6 +55,42 @@ AI can misunderstand a requirement or change the meaning of a sentence. Automate
 Job ordering is based on skill-word overlap, not eligibility or the probability of an offer. Missing evidence does not mean you lack a qualification, and a saved job description does not prove a role is still open.
 
 Feiran prepares and reviews materials. It does not submit applications, track applications or predict hiring outcomes. Optional semantic review remains an unvalidated experiment and is not part of the normal web workflow.
+
+## Local deployment (optional)
+
+Follow these steps only if you want to run your own copy of Feiran. Cloud users can skip this section. Local and cloud data are separate and do not sync automatically.
+
+The commands below are for macOS / Linux. Install Python 3.14 (the version used by CI and the container) and Google Chrome or Chromium for PDF export.
+
+1. Download the code and install dependencies:
+
+   ```sh
+   git clone https://github.com/YIEXUWOSHIDUDE/Feiran.git
+   cd Feiran
+   python3 -m venv .venv
+   .venv/bin/python -m pip install -r requirements.txt
+   ```
+
+2. For AI features, configure your own DeepSeek API key. Create `.local/`, then use a text editor to save only the key in `.local/deepseek_api_key`. Point the app to that file:
+
+   ```sh
+   mkdir -p .local
+   # After saving the key file:
+   chmod 600 .local/deepseek_api_key
+   export DEEPSEEK_API_KEY_FILE="$PWD/.local/deepseek_api_key"
+   ```
+
+   Git ignores `.local/`. Do not commit keys or resume data. AI features also send relevant text to DeepSeek when running locally. An existing `DEEPSEEK_API_KEY` environment variable or configured macOS Keychain entry can be used instead.
+
+3. Start the workspace in the same terminal:
+
+   ```sh
+   .venv/bin/python web.py
+   ```
+
+   Open <http://127.0.0.1:8765/> in your browser and follow the workflow above. Data is stored in `.local/` by default. Press `Ctrl+C` to stop the server. If Chrome / Chromium is not detected, set `CHROME_PATH` to the browser executable's full path. Chinese PDF export requires a font with Chinese character support on your system.
+
+For your own AWS deployment, see [AWS public deployment](docs/aws-public.md).
 
 ## Development
 
