@@ -25,8 +25,9 @@ from typing import Callable, Iterable, Iterator, Mapping, NamedTuple
 import anyio
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.routing import Match
 from pydantic import BaseModel
 
 from cv import (
@@ -87,8 +88,10 @@ from requirement_flow import (
     propose_requirements,
 )
 from review import build_report
+import run_log
 from workspace import (
     DEFAULT_ROOT,
+    JOB_ID,
     Workspace,
     WorkspaceError,
     make_folder,
@@ -105,10 +108,13 @@ ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 # on a folder holding it, so a volume that failed to mount never becomes an empty new workspace.
 DATA_MARKER = ".workbench-data"
 access_log = logging.getLogger("workbench.access")
+stage_log = logging.getLogger("workbench.stages")
 CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by", "extraction_method")
 CV_LANGUAGES = ("en", "zh")
 QUERY_TOKEN_PATHS = ("/preview/", "/download/")
 READ_ONLY_METHODS = ("GET", "HEAD", "OPTIONS")
+# HTTP's own methods: a request's method is logged only if it is one of these.
+HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"})
 # Changes to their own store only, so they neither wait for nor hold up the others: the followed
 # companies and their postings (a SQLite database of their own, with its own transactions) and a
 # new CV upload (its own new file; saving it, which changes facts and the profile, does wait).
@@ -154,8 +160,9 @@ FIELD_NAMES = {"title": "name", "subtitle": "role or degree", "location": "locat
 # What each kind of failure means and what to do about it. The page never quotes DeepSeek's raw
 # error, so neither a key nor response text can reach it.
 REASONS = {
-    "missing_key": "No DeepSeek API key was found. Add it to the Keychain (service deepseek-api-key) "
-                   "or set DEEPSEEK_API_KEY, then try again.",
+    "missing_key": "No DeepSeek API key was found. Add it to the Keychain (service deepseek-api-key), "
+                   "set DEEPSEEK_API_KEY, or on a server put it in the file DEEPSEEK_API_KEY_FILE names "
+                   "(on AWS: the Secrets Manager secret the stack names), then try again.",
     "key_rejected": "DeepSeek refused the API key. Check or replace the key, then try again.",
     "rate_limited": "DeepSeek is busy right now. Try again in a minute.",
     "unreachable": "DeepSeek could not be reached. Check the internet connection, then try again.",
@@ -344,6 +351,7 @@ class ServerSettings(NamedTuple):
     profile: Path
     data: Path
     require_data: bool
+    json_logs: bool = False
 
 
 def server_settings(argv: list[str] | None, environ: Mapping[str, str]) -> ServerSettings:
@@ -359,9 +367,11 @@ def server_settings(argv: list[str] | None, environ: Mapping[str, str]) -> Serve
     parser.add_argument("--profile", type=Path, help="简历 profile JSON")
     parser.add_argument("--require-data", action="store_true", default=environ.get("WORKBENCH_REQUIRE_DATA") == "1",
                         help=f"数据目录必须是含 {DATA_MARKER} 的数据卷，否则不启动")
+    parser.add_argument("--json-logs", action="store_true", default=environ.get("WORKBENCH_LOG_FORMAT") == "json",
+                        help="日志每行一个 JSON 对象（容器里用；错误只记类型和位置）")
     args = parser.parse_args(argv)
     return ServerSettings(
-        host=args.host, port=args.port, data=args.data, require_data=args.require_data,
+        host=args.host, port=args.port, data=args.data, require_data=args.require_data, json_logs=args.json_logs,
         facts_db=args.facts_db or args.data / DEFAULT_DATABASE.name,
         jobs=args.jobs or args.data / DEFAULT_ROOT.name,
         profile=args.profile or args.data / DEFAULT_PROFILE.name,
@@ -384,8 +394,7 @@ def create_app(
     workspace = Workspace(jobs_root)
     # A change the last run was making when it stopped is finished or undone before anything is served.
     for change in workspace.recover():
-        logging.getLogger("workbench").warning("undid a change cut short by a stop: job %s, step %s",
-                                               change["job_id"], change["step"])
+        run_log.event(logging.getLogger("workbench"), "change_undone", level=logging.WARNING, **change)
     uploads = Path(profile_path).parent / "cv-uploads"
     unfinished = Path(profile_path).parent / UNFINISHED
     make_folder(unfinished)
@@ -504,15 +513,51 @@ def create_app(
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
+    def route_of(request: Request) -> dict[str, str]:
+        """What a request was for, in the app's own words: its route (/api/jobs/{job_id}) and a job
+        ID of the app's own form, never the path it was sent to, which the sender chose (and whose
+        query carries the page token for previews and downloads)."""
+        route = request.scope.get("route")
+        if route is None:  # refused before routing: found without running anything
+            route = next((item for item in app.router.routes if item.matches(request.scope)[0] == Match.FULL), None)
+        seen = {"route": getattr(route, "path", None) or "(no route)"}
+        job_id = request.path_params.get("job_id") or (request.scope.get("path_params") or {}).get("job_id")
+        if isinstance(job_id, str) and JOB_ID.fullmatch(job_id):
+            seen["job_id"] = job_id
+        return seen
+
+    def method_of(request: Request) -> str:
+        """The request's method, if it is one of HTTP's own; any other word the sender chose."""
+        return request.method if request.method in HTTP_METHODS else "(other)"
+
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
-        """One line per request, with the path only: preview and download links carry the page
-        token in their query string, so it never reaches a log."""
-        started = time.monotonic()
-        response = await call_next(request)
-        access_log.info("%s %s %s %dms", request.method, request.url.path, response.status_code,
-                        (time.monotonic() - started) * 1000)
+        """One line per request: its route, status and time. A passing health check is left out
+        (the container asks every 30 seconds). The request's id goes on every line logged while
+        it runs, the server's own line about a failure included, and back to the browser."""
+        started, current = time.monotonic(), secrets.token_hex(8)
+        run_log.request_id.set(current)  # this request's task only; the server logs a failure in it too
+        try:
+            response = await call_next(request)
+        except Exception:
+            run_log.event(access_log, "request", level=logging.ERROR, error=True, method=method_of(request),
+                          **route_of(request), status=500, duration_ms=run_log.elapsed_ms(started))
+            raise
+        seen = route_of(request)
+        if not (seen["route"] == "/healthz" and response.status_code == 200):
+            run_log.event(access_log, "request", level=logging.ERROR if response.status_code >= 500 else logging.INFO,
+                          method=method_of(request), **seen, status=response.status_code,
+                          duration_ms=run_log.elapsed_ms(started))
+        response.headers["X-Request-Id"] = current
         return response
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception) -> PlainTextResponse:
+        """An error nobody expected: a bare 500, with the request's id so the page can quote it
+        (the log line about it carries the same id); never the error's words."""
+        current = run_log.request_id.get()
+        return PlainTextResponse("Internal Server Error", status_code=500,
+                                 headers={"X-Request-Id": current} if current else None)
 
     @app.get("/healthz")
     def health() -> JSONResponse:
@@ -687,6 +732,13 @@ def create_app(
                 raise error from exc
         return sorted(terms, key=len, reverse=True)
 
+    def log_stage(job_id: str, language: str, stage: dict, started: float) -> dict:
+        """One line for a stage that ran: how it went and why, never its message or the CV."""
+        run_log.event(stage_log, "stage", level=logging.INFO if stage["status"] == "done" else logging.WARNING,
+                      job_id=job_id, language=language, stage=stage["stage"], status=stage["status"],
+                      reason=stage["reason_code"], duration_ms=run_log.elapsed_ms(started))
+        return stage
+
     def record_stages(job_id: str, language: str, stages: list[dict]) -> None:
         """How the latest preparation went, tied to the draft it produced (None if none)."""
         draft = workspace.read(job_id, f"cv-draft-{language}")
@@ -712,6 +764,7 @@ def create_app(
         went. When DeepSeek cannot reword or adjust, the CV stays at the last stage that worked
         and the page says why, so a usable CV is never mistaken for a tailored one."""
         job = require(job_id, "decided")
+        started = time.monotonic()
         try:
             if not Path(facts_db).exists():
                 raise CVError("还没有事实库", reason="no_facts")
@@ -719,7 +772,7 @@ def create_app(
         except (CVError, FactStoreError) as exc:
             # An earlier CV, if any, stays as it was; the page says it is not up to date.
             earlier = workspace.read(job_id, f"cv-draft-{language}") is not None
-            failure = _stage_failure("draft", exc)
+            failure = log_stage(job_id, language, _stage_failure("draft", exc), started)
             if earlier:
                 failure.update(output_available=True, message=failure["message"] + " The CV below is from the last "
                                "time it could be prepared.")
@@ -728,21 +781,23 @@ def create_app(
                 for name in ("rewording", "layout"))])
             raise
         workspace.write(job_id, f"cv-draft-{language}", head)
-        stages = [_stage("draft", "done", "Built from your confirmed facts.")]
+        stages = [log_stage(job_id, language, _stage("draft", "done", "Built from your confirmed facts."), started)]
         private = known_private_terms()
+        started = time.monotonic()
         try:
             # Thinking off: on a real CV it gave the same result in 2 s instead of 8 s (2026-09).
             head = tailor_draft(head, facts_db, job=job, chat=chat, effort="none", private=private)
             workspace.write(job_id, f"cv-tailored-{language}", head)
-            stages.append(_reworded(head))
+            stages.append(log_stage(job_id, language, _reworded(head), started))
         except CVError as exc:
-            stages.append(_stage_failure("rewording", exc))
+            stages.append(log_stage(job_id, language, _stage_failure("rewording", exc), started))
+        started = time.monotonic()
         try:
             planned = plan_draft(head, job, chat=chat, private=private)
             workspace.write(job_id, f"cv-planned-{language}", planned)
-            stages.append(_adjusted(planned))
+            stages.append(log_stage(job_id, language, _adjusted(planned), started))
         except CVError as exc:
-            stages.append(_stage_failure("layout", exc))
+            stages.append(log_stage(job_id, language, _stage_failure("layout", exc), started))
         record_stages(job_id, language, stages)
 
     def prepare_again(job_id: str, language: str) -> None:
@@ -1017,15 +1072,16 @@ def create_app(
     @app.post("/api/jobs/{job_id}/cv/{language}/tailor")
     def cv_tailor(job_id: str, language: str) -> dict:
         draft = require(job_id, f"cv-draft-{check_language(language)}")
+        started = time.monotonic()
         try:
             tailored = tailor_draft(draft, facts_db, job=workspace.read(job_id, "decided"), chat=chat,
                                     private=known_private_terms())
         except CVError as exc:
             earlier = workspace.read(job_id, f"cv-tailored-{language}") is not None
-            update_stage(job_id, language, _stage_failure("rewording", exc, earlier))
+            update_stage(job_id, language, log_stage(job_id, language, _stage_failure("rewording", exc, earlier), started))
             raise
         workspace.write(job_id, f"cv-tailored-{language}", tailored)
-        update_stage(job_id, language, _reworded(tailored), not_run=("layout",))
+        update_stage(job_id, language, log_stage(job_id, language, _reworded(tailored), started), not_run=("layout",))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps")
@@ -1083,14 +1139,15 @@ def create_app(
     def cv_plan(job_id: str, language: str) -> dict:
         """Adjust (again) for this job, starting from the reworded CV, or the draft if none."""
         base = workspace.read(job_id, f"cv-tailored-{check_language(language)}") or require(job_id, f"cv-draft-{language}")
+        started = time.monotonic()
         try:
             planned = plan_draft(base, require(job_id, "decided"), chat=chat, private=known_private_terms())
         except CVError as exc:
             earlier = workspace.read(job_id, f"cv-planned-{language}") is not None
-            update_stage(job_id, language, _stage_failure("layout", exc, earlier))
+            update_stage(job_id, language, log_stage(job_id, language, _stage_failure("layout", exc, earlier), started))
             raise
         workspace.write(job_id, f"cv-planned-{language}", planned)
-        update_stage(job_id, language, _adjusted(planned))
+        update_stage(job_id, language, log_stage(job_id, language, _adjusted(planned), started))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/cv/{language}/change")
@@ -1153,18 +1210,35 @@ def create_app(
 
 def main(argv: list[str] | None = None) -> int:
     settings = server_settings(argv, os.environ)
+    log = logging.getLogger("workbench")
+    if settings.json_logs:
+        run_log.configure(sys.stderr)
     if settings.require_data:
         problem = data_problem(settings.data)
         if problem:
-            print(f"不启动：{problem}", file=sys.stderr)
+            if settings.json_logs:
+                run_log.event(log, "refused_to_start", level=logging.ERROR, reason=problem)
+            else:
+                print(f"不启动：{problem}", file=sys.stderr)
             return 2
     import uvicorn
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    print(f"打开 http://127.0.0.1:{settings.port}/ （只在本机可用；按 Ctrl+C 停止）")
-    app = create_app(settings.facts_db, settings.jobs, profile_path=settings.profile)
-    # Uvicorn's own access log would print the query string, and with it the page token.
-    uvicorn.run(app, host=settings.host, port=settings.port, access_log=False)
+    if settings.json_logs:
+        run_log.event(log, "listening", port=settings.port)
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+        print(f"打开 http://127.0.0.1:{settings.port}/ （只在本机可用；按 Ctrl+C 停止）")
+    try:
+        app = create_app(settings.facts_db, settings.jobs, profile_path=settings.profile)
+    except Exception:
+        if not settings.json_logs:
+            raise  # on a terminal, the whole traceback
+        run_log.event(log, "failed_to_start", level=logging.ERROR, error=True)  # its type and place only
+        return 1
+    # Uvicorn's own access log would print the query string, and with it the page token. With
+    # JSON logs, its own lines go through the same JSON formatter (no log_config of its own).
+    uvicorn.run(app, host=settings.host, port=settings.port, access_log=False,
+                **({"log_config": None} if settings.json_logs else {}))
     return 0
 
 

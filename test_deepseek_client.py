@@ -7,6 +7,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 from deepseek_client import API_URL, DeepSeekError, _post, chat_json, load_api_key
+import run_log
 
 
 MESSAGES = [
@@ -122,6 +123,31 @@ class DeepSeekClientTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "key_rejected")
         self.assertNotIn("sk-secret-test-key", str(raised.exception))
         self.assertEqual(urlopen.call_count, 2)
+
+    @patch("deepseek_client.time.sleep")
+    @patch("deepseek_client.urllib.request.urlopen")
+    def test_each_retry_is_logged_with_its_reason_never_the_key_or_the_request(self, urlopen, _sleep):
+        urlopen.side_effect = [HTTPError(API_URL, 429, "busy", None, None), URLError("offline"), URLError("offline")]
+        request = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "Alex Example"}]}
+        with self.assertLogs("workbench.deepseek", level="WARNING") as logs, self.assertRaises(DeepSeekError):
+            _post(request, "sk-secret-test-key")
+        lines = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
+        self.assertEqual([(line["event"], line["attempt"], line["reason"]) for line in lines],
+                         [("deepseek_retry", 1, "http_429"), ("deepseek_retry", 2, "unreachable")])
+        self.assertNotIn("sk-secret", json.dumps(lines))
+        self.assertNotIn("Alex", json.dumps(lines))
+
+    def test_a_call_is_logged_with_its_time_and_tokens_and_a_failure_with_its_kind(self):
+        with self.assertLogs("workbench.deepseek", level="INFO") as logs:
+            chat_json(MESSAGES, api_key="k", post=RecordingPost(reply(""), {**reply('{"ok": true}'), "model": "Alex Example"}))
+            with self.assertRaises(DeepSeekError):
+                chat_json(MESSAGES, api_key="k", post=RecordingPost(reply("not json")))
+        lines = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
+        self.assertEqual([(line["event"], line.get("reason")) for line in lines],
+                         [("deepseek_retry", "empty_content"), ("deepseek_call", None), ("deepseek_failed", "bad_response")])
+        self.assertEqual((lines[1]["prompt_tokens"], lines[1]["completion_tokens"], lines[1]["model"]), (120, 30, "deepseek-flash"))
+        self.assertNotIn("Alex", json.dumps(lines))  # the model asked for, never what the answer calls itself
+        self.assertTrue(all(isinstance(line["duration_ms"], int) for line in lines[1:]))
 
 
 if __name__ == "__main__":

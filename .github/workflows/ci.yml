@@ -29,6 +29,26 @@ jobs:
           # Web and PDF tests skip themselves when a package is missing; here everything is installed.
           if grep -E "\.\.\. skipped" test-output.txt; then echo "::error::Tests were skipped (listed above)"; exit 1; fi
 
+  host:
+    name: EC2 host files (scripts, CloudFormation)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: The shell scripts pass shellcheck
+        run: shellcheck deploy/aws/host/*.sh deploy/aws/*.sh
+      - name: The host scripts do what they say (aws, docker, systemctl and curl stubbed)
+        run: deploy/aws/test-host-scripts.sh
+      - name: The data volume is formatted only on purpose and mounted only when it holds the data (loop devices)
+        run: deploy/aws/test-mount-data.sh
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: The CloudFormation template passes cfn-lint and keeps its guarantees
+        run: |
+          python -m pip install cfn-lint==1.57.1
+          cfn-lint deploy/aws/workbench.yaml
+          python deploy/aws/check-template.py deploy/aws/workbench.yaml
+
   container:
     name: Container (linux/amd64)
     runs-on: ubuntu-24.04
@@ -46,8 +66,9 @@ jobs:
           sysctl user.max_user_namespaces kernel.apparmor_restrict_unprivileged_userns || true
       - name: Build the image for linux/amd64
         run: |
-          docker build --platform linux/amd64 -t "$WORKBENCH_IMAGE" .
+          docker build --platform linux/amd64 --build-arg REVISION="$GITHUB_SHA" -t "$WORKBENCH_IMAGE" .
           test "$(docker image inspect -f '{{.Os}}/{{.Architecture}}' "$WORKBENCH_IMAGE")" = linux/amd64
+          test "$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$WORKBENCH_IMAGE")" = "$GITHUB_SHA"
       - name: Nothing personal or local is in the image, and it runs as its own user
         run: |
           docker run --rm --entrypoint sh "$WORKBENCH_IMAGE" -c 'ls -A /app'
@@ -80,6 +101,16 @@ jobs:
         run: docker compose run --rm --no-deps workbench python deploy/smoke.py create --data /data --out /data/smoke
       - name: A new container finds everything the last one left
         run: docker compose run --rm --no-deps workbench python deploy/smoke.py verify --data /data
+      - name: A backup restores into an empty folder that the workbench can use
+        run: |
+          mkdir -p backups restored
+          sudo chown 10001:10001 backups restored
+          docker compose run --rm --no-deps -v "$PWD/backups:/backups" workbench \
+            python backup.py create --data /data --out /backups/ci.tar.gz --revision "$GITHUB_SHA"
+          docker compose run --rm --no-deps -v "$PWD/backups:/backups" -v "$PWD/restored:/restored" workbench \
+            python backup.py restore --archive /backups/ci.tar.gz --into /restored/data
+          docker compose run --rm --no-deps -v "$PWD/restored:/restored" workbench python backup.py verify --data /restored/data
+          WORKBENCH_DATA_DIR="$PWD/restored/data" docker compose run --rm --no-deps workbench python deploy/smoke.py verify --data /data
       - name: Served on the loopback only, behind the host and token checks; recreated, the data stays
         run: |
           healthy() {
@@ -107,6 +138,13 @@ jobs:
           if grep -v '127.0.0.1:8765' listening.txt; then echo "::error::listening beyond the loopback"; exit 1; fi
           docker compose logs > compose.log
           if grep -q -- "$token" compose.log; then echo "::error::the page token reached the logs"; exit 1; fi
+          # One JSON object per line, as CloudWatch will hold it, startup lines too; routes, not the paths sent.
+          docker compose logs --no-log-prefix workbench > app.log
+          jq -e -s 'length > 0 and all(type == "object")' app.log > /dev/null \
+            || { echo "::error::a log line is not JSON"; cat app.log; exit 1; }
+          jq -e -s 'any(.event == "request" and .route == "/api/jobs" and .status == 200 and (.request_id | length) == 16)
+                    and any(.event == "request" and .route == "/preview/{job_id}/{language}")
+                    and all(has("path") | not)' app.log > /dev/null
           docker compose down
           docker compose up -d --no-build
           healthy

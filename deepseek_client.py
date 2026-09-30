@@ -1,6 +1,7 @@
 """Minimal DeepSeek chat client for JSON answers; the key comes from env or macOS Keychain."""
 
 import json
+import logging
 import os
 import re
 import socket
@@ -11,6 +12,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+
+import run_log
 
 
 API_URL = "https://api.deepseek.com/chat/completions"
@@ -23,6 +26,7 @@ MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 TIMEOUT_SECONDS = 120
 HTTP_ATTEMPTS = 3
 RETRY_HTTP_CODES = {429, 500, 502, 503}
+log = logging.getLogger("workbench.deepseek")
 
 
 class DeepSeekError(Exception):
@@ -94,12 +98,14 @@ def _post(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
         except urllib.error.HTTPError as exc:
             exc.close()
             if exc.code in RETRY_HTTP_CODES and attempt < HTTP_ATTEMPTS:
+                run_log.event(log, "deepseek_retry", level=logging.WARNING, attempt=attempt, reason=f"http_{exc.code}")
                 time.sleep(2 ** attempt)
                 continue
             reason = {401: "key_rejected", 403: "key_rejected", 429: "rate_limited"}.get(exc.code, "request_failed")
             raise DeepSeekError(f"DeepSeek API 返回 HTTP {exc.code}", reason=reason) from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError) as exc:
             if attempt < HTTP_ATTEMPTS:
+                run_log.event(log, "deepseek_retry", level=logging.WARNING, attempt=attempt, reason="unreachable")
                 time.sleep(2 ** attempt)
                 continue
             raise DeepSeekError("无法连接 DeepSeek API", reason="unreachable") from exc
@@ -134,12 +140,34 @@ def chat_json(
     post: Callable[[dict[str, Any], str], dict[str, Any]] = _post,
     temperature: float = 0,
 ) -> dict[str, Any]:
-    """Ask for one JSON object; retry once on the documented empty-content case.
+    """Ask for one JSON object; retry once on the documented empty-content case. Each call is
+    logged with its time and token counts, or with the kind of failure; never what was asked
+    or answered.
 
     Temperature 0 by default: every use here is a structured task (picking lines, matching,
     planning, checked rewording), and the same question should get the same answer. At the
     API default the same job gave 11 gaps in one run and 4 in the next (2026-09).
     """
+    started = time.monotonic()
+    try:
+        result = _ask(messages, model, effort, api_key, post, temperature)
+    except DeepSeekError as exc:
+        run_log.event(log, "deepseek_failed", level=logging.WARNING, reason=exc.reason,
+                      duration_ms=run_log.elapsed_ms(started))
+        raise
+    run_log.event(log, "deepseek_call", model=model, effort=effort,  # the model asked for, not the answer's word
+                  duration_ms=run_log.elapsed_ms(started), **result["usage"])
+    return result
+
+
+def _ask(
+    messages: list[dict[str, str]],
+    model: str,
+    effort: str,
+    api_key: str | None,
+    post: Callable[[dict[str, Any], str], dict[str, Any]],
+    temperature: float,
+) -> dict[str, Any]:
     if effort not in EFFORTS:
         raise DeepSeekError(f"reasoning effort 必须是：{', '.join(EFFORTS)}")
     payload = {
@@ -166,6 +194,7 @@ def chat_json(
             break
         if attempt == 1:
             raise DeepSeekError("DeepSeek 连续返回空内容")
+        run_log.event(log, "deepseek_retry", level=logging.WARNING, attempt=1, reason="empty_content")
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:

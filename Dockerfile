@@ -17,11 +17,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Only what .dockerignore lets through: the code, the page, synthetic examples and the tests.
 COPY . .
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+# The Git commit it was built from (CI passes it): a label for the host, and in backups' manifests.
+ARG REVISION=unknown
+LABEL org.opencontainers.image.revision=$REVISION
+ENV WORKBENCH_REVISION=$REVISION \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     WORKBENCH_HOST=0.0.0.0 \
     WORKBENCH_PORT=8765 \
     WORKBENCH_DATA=/data \
+    WORKBENCH_LOG_FORMAT=json \
     CHROME_PATH=/usr/bin/chromium
 
 USER workbench

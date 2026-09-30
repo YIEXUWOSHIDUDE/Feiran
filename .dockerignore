@@ -1,9 +1,11 @@
 # Only what the app needs goes into the image, named one by one. Everything else stays out,
-# above all .local/ (personal data), keys and local notes such as AGENTS.override.md.
+# above all .local/ (personal data), keys and local notes such as AGENTS.override.md. deploy/
+# and compose.yaml come along so the EC2 host takes its files from the release it installs.
 *
 !*.py
 !web/
 !examples/
-!deploy/smoke.py
+!deploy/
+!compose.yaml
 !starter_boards.json
 !requirements.txt

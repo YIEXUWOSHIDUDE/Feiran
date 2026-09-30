@@ -1,0 +1,10 @@
+[Unit]
+Description=Report the workbench's health every five minutes (the alarms fire when reports stop)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
