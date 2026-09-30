@@ -24,7 +24,7 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Run every test; none may be skipped
         run: |
-          if ! python -m unittest discover -p "test_*.py" -v 2> test-output.txt; then tail -80 test-output.txt; exit 1; fi
+          if ! python -m unittest discover -s tests -t . -p "test_*.py" -v 2> test-output.txt; then tail -80 test-output.txt; exit 1; fi
           tail -3 test-output.txt
           # Web and PDF tests skip themselves when a package is missing; here everything is installed.
           if grep -E "\.\.\. skipped" test-output.txt; then echo "::error::Tests were skipped (listed above)"; exit 1; fi
@@ -80,7 +80,7 @@ jobs:
             'for name in .local .venv .git .jj .claude AGENTS.override.md .env; do test ! -e "/app/$name" || { echo "found $name"; exit 1; }; done'
           test "$(docker run --rm --entrypoint id "$WORKBENCH_IMAGE" -u)" = 10001
       - name: The tests pass inside the image too
-        run: docker run --rm "$WORKBENCH_IMAGE" python -m unittest discover -p "test_*.py"
+        run: docker run --rm "$WORKBENCH_IMAGE" python -m unittest discover -s tests -t . -p "test_*.py"
       - name: Prepare a data folder the way the data volume is prepared
         run: |
           mkdir -p ci-data empty

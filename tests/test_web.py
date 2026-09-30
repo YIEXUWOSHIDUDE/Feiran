@@ -25,10 +25,10 @@ from gaps import EVIDENCE_RULES, SUGGEST_RULES
 from matching import MATCH_RULES
 from requirement_flow import FIND_RULES
 import run_log
-from test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
-from test_gaps import resume_ids, sent_lines
-from test_listings import FakeBoards, posting
-from test_workspace import PROCESS_DIES, REPO, dies_after_renaming_into, dies_before_renaming_into
+from tests.test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
+from tests.test_gaps import resume_ids, sent_lines
+from tests.test_listings import FakeBoards, posting
+from tests.test_workspace import PROCESS_DIES, REPO, dies_after_renaming_into, dies_before_renaming_into
 
 HAS_FASTAPI = importlib.util.find_spec("fastapi") is not None
 HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
@@ -261,7 +261,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("只能确认当前版本", stale.json()["error"])
 
     def create_job(self):
-        text = (Path(__file__).parent / "examples" / "synthetic_jd_zh.txt").read_text(encoding="utf-8")
+        text = (Path(__file__).resolve().parent.parent / "examples" / "synthetic_jd_zh.txt").read_text(encoding="utf-8")
         response = self.client.post(
             "/api/jobs",
             json={"title": "后端开发实习生", "company": "示例公司", "text": text},
@@ -379,7 +379,7 @@ class WebTests(unittest.TestCase):
 
     @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
     def test_a_cancelled_or_forgotten_upload_leaves_no_personal_data_behind(self):
-        from test_cv_import import minimal_pdf
+        from tests.test_cv_import import minimal_pdf
 
         uploads = self.profile_path.parent / "cv-uploads"
         uploads.mkdir()
@@ -395,7 +395,7 @@ class WebTests(unittest.TestCase):
 
     @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
     def test_an_upload_still_works_when_another_one_removed_an_old_upload_first(self):
-        from test_cv_import import minimal_pdf
+        from tests.test_cv_import import minimal_pdf
 
         uploads = self.profile_path.parent / "cv-uploads"
         uploads.mkdir()
@@ -499,7 +499,7 @@ class WebTests(unittest.TestCase):
     @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
     def test_uploading_a_cv_again_repairs_an_unreadable_layout(self):
         # Found in review by Codex: the broken file went into the backups and kept blocking.
-        from test_cv_import import minimal_pdf
+        from tests.test_cv_import import minimal_pdf
 
         import_facts(self.database, CV_FACTS)
         confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
@@ -749,7 +749,7 @@ class WebTests(unittest.TestCase):
 
     def test_generic_url_import_uses_html_and_preserves_retry_identity(self):
         from job_url import extract_job
-        from test_job_url import HTML, URL
+        from tests.test_job_url import HTML, URL
         calls = []
         def read_page(url):
             calls.append(url)
@@ -1070,8 +1070,8 @@ class WebTests(unittest.TestCase):
         except, no temporary file removed."""
         code = "\n".join([
             "import os, sys, json", "from pathlib import Path", f"sys.path.insert(0, {str(REPO)!r})",
-            "from fastapi.testclient import TestClient", "from test_web import FakeDeepSeek, TOKEN",
-            "from test_cv import FakePrinter", "from test_cv_import import minimal_pdf", "from web import create_app",
+            "from fastapi.testclient import TestClient", "from tests.test_web import FakeDeepSeek, TOKEN",
+            "from tests.test_cv import FakePrinter", "from tests.test_cv_import import minimal_pdf", "from web import create_app",
             "chat = FakeDeepSeek({'fact-intern-api': 'For an internal tool, built REST APIs.'})",
             f"app = create_app(facts_db=Path({str(self.database)!r}), jobs_root=Path({str(Path(self.directory.name) / 'jobs')!r}),"
             f" token=TOKEN, profile_path=Path({str(self.profile_path)!r}), chat=chat, printer=FakePrinter(), starter=[])",
@@ -1490,7 +1490,7 @@ FakeDeepSeek.__call__ = dying
 
     @unittest.skipUnless(HAS_PYPDF, "reading PDFs needs pypdf from requirements.txt")
     def test_an_uploaded_cv_becomes_pending_facts_and_the_cv_after_the_user_checks_the_contact(self):
-        from test_cv_import import minimal_pdf
+        from tests.test_cv_import import minimal_pdf
 
         self.profile_path.unlink()  # a new user: no CV yet
         pdf = minimal_pdf([
@@ -1621,7 +1621,7 @@ class SmokeRunTests(unittest.TestCase):
     """deploy/smoke.py uploads a CV and confirms facts, so it must never run on real data."""
 
     def setUp(self):
-        spec = importlib.util.spec_from_file_location("smoke", Path(__file__).parent / "deploy" / "smoke.py")
+        spec = importlib.util.spec_from_file_location("smoke", Path(__file__).resolve().parent.parent / "deploy" / "smoke.py")
         self.smoke = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.smoke)
 

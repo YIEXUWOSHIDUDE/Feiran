@@ -8,7 +8,7 @@ from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError
 from facts import confirm_facts, import_facts
 from requirement_flow import apply_requirement_decisions, propose_requirements
-from test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
+from tests.test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
 
 
 def decided_job():

@@ -12,7 +12,7 @@ import workspace as workspace_module
 from workspace import DATA_FORMAT, DATA_FORMAT_FILE, DataFormatError, Workspace, WorkspaceError, claim_data_format
 
 
-REPO = Path(__file__).resolve().parent
+REPO = Path(__file__).resolve().parent.parent
 PROCESS_DIES = 9
 
 
