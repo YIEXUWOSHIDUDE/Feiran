@@ -2,8 +2,10 @@
 # Linux CI: real Docker bind permissions, SQLite and release files. Only EC2/systemd/network
 # services are stubbed. Two local digest aliases use the already-built image (no registry).
 set -euo pipefail
-[ "$(uname -s)" = Linux ] && [ "$(id -u)" = 0 ] \
-    || { echo 'run this Linux-only check with sudo and WORKBENCH_IMAGE set' >&2; exit 1; }
+if [ "$(uname -s)" != Linux ] || [ "$(id -u)" != 0 ]; then
+    echo 'run this Linux-only check with sudo and WORKBENCH_IMAGE set' >&2
+    exit 1
+fi
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 image=${WORKBENCH_IMAGE:?give the image built from this checkout}
 export REAL_DOCKER LOCAL_IMAGE
