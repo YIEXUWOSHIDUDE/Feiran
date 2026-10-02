@@ -573,7 +573,10 @@ async function renderFind() {
         await drawList();
       }, true))
       : null;
-    listBox.replaceChildren(...notes, body, data.listings.length >= 200 && more ? el("p", { class: "muted" }, t("Showing the top 200. Use the filters to narrow the list.")) : more);
+    const footer = data.listings.length >= 200 && more
+      ? el("p", { class: "muted" }, t("Showing the top 200. Use the filters to narrow the list."))
+      : more;
+    listBox.replaceChildren(...notes, body, ...(footer ? [footer] : []));
   }
 
   async function drawCompanies() {

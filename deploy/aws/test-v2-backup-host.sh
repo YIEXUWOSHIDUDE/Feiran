@@ -5,7 +5,7 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 host=$repo/deploy/aws/host
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'chmod -R u+w "$work"; rm -rf "$work"' EXIT
 export PYTHON
 PYTHON=$(command -v "${PYTHON:-python3}")
 export PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=$repo
@@ -82,6 +82,14 @@ elif name == 'docker':
     position = args.index('python')
     script, operation, *values = args[position + 1:]
     assert script == 'v2_backup.py', script
+    if operation == 'create':
+        assert state.read_text().strip() == 'inactive', 'copied the source before the service stopped'
+        assert mounts['/live'][1] == ['ro'], 'live data must stay read-only'
+        source = Path(mounts['/data'][0])
+        assert source.parent == work / 'state', 'temporary source must be on the root disk'
+        assert source.stat().st_mode & 0o777 == 0o700
+        assert {p.name for p in source.iterdir()} <= {'v2.db', 'v2.db-wal', 'v2.db-journal', 'deleted-accounts.jsonl'}
+        assert all(p.stat().st_mode & 0o777 == 0o600 for p in source.iterdir())
     if flag('FAKE_' + operation.upper() + '_FAILS'):
         sys.exit(1)
     if operation == 'restore':
@@ -100,7 +108,7 @@ elif name == 'mount-data':
     sys.exit(1 if flag('FAKE_UNMOUNTED') else 0)
 elif name == 'df':
     print('Filesystem 1024-blocks Used Available Capacity Mounted on')
-    print('/dev/fake 100000000 0 99999999 0% /')
+    print('/dev/fake 100000000 0 ' + os.environ.get('FAKE_FREE_KB', '99999999') + ' 0% /')
 elif name == 'flock':
     # The calling shell holds the descriptor too, so the lock survives this child process.
     try:
@@ -152,6 +160,7 @@ tenant_store.delete_account(database, b, data / 'deleted-accounts.jsonl')
 tenant_store.provision_user(database, issuer='https://synthetic.invalid/pool', subject='current-only')
 PY
 reset_case() {
+    if [ -d "$work/volume/data" ]; then chmod -R u+w "$work/volume/data"; fi
     "$PYTHON" "$work/fixture.py"
     printf '%s\n' "${1:-active}" > "$work/unit-state"
     printf 'DATA_DEVICE=/dev/fake\nDATA_MOUNT=%s/volume\nWORKBENCH_DATA_DIR=%s/volume/data\nBACKUP_BUCKET=synthetic\nAWS_REGION=us-east-1\n' \
@@ -231,13 +240,18 @@ for failure in missing_ledger malformed_ledger FAKE_RESTORE_FAILS FAKE_VERIFY_FA
 done
 echo 'ok   V2 restore failures: missing/broken ledger, bad archive, failed checks/stop/swap keep original data and service'
 
-for failure in FAKE_CREATE_FAILS FAKE_RESTORE_FAILS FAKE_VERIFY_FAILS FAKE_S3_FAILS FAKE_UNMOUNTED missing_ledger; do
+for failure in FAKE_CREATE_FAILS FAKE_RESTORE_FAILS FAKE_VERIFY_FAILS FAKE_S3_FAILS FAKE_UNMOUNTED FAKE_FREE_KB FAKE_STOP_STILL_RUNNING FAKE_STOP_DEACTIVATING missing_ledger; do
     reset_case
     if [ "$failure" = missing_ledger ]; then rm "$work/volume/data/deleted-accounts.jsonl"; fi
     if env "$failure=1" "$host/backup.sh" > /dev/null 2>&1; then fail "$failure: backup claimed success"; fi
     [ ! -e "$work/state/last-backup" ] || fail "$failure: failed backup recorded as successful"
     [ "$(cat "$work/unit-state")" = active ] || fail "$failure: backup left service stopped"
     assert_original_data
+    [ -z "$(find "$work/state" -maxdepth 1 -name 'backup-source-*')" ] || fail "$failure: private source copy left behind"
+    case "$failure" in
+        FAKE_FREE_KB | FAKE_STOP_STILL_RUNNING | FAKE_STOP_DEACTIVATING)
+            called 'docker' && fail "$failure: read/copied data without space or a stopped service" ;;
+    esac
 done
 reset_case
 printf 'unknown\n' > "$work/volume/data/.workbench-format"
@@ -296,3 +310,65 @@ for mismatch in 'v1 2' 'v2 1' 'unknown 2'; do
     called 'systemctl stop' && fail "conflicting mode/format stopped the service"
 done
 echo 'ok   replacement volumes: explicit V2 mode, current ledger required, conflicting mode/format refused'
+
+
+# Docker stubs above do not enforce bind-mount permissions. Remove source write permission
+# for real here: a closed WAL DB has no sidecars, but reading it still needs to create them.
+for wal in clean uncheckpointed; do
+    reset_case
+    export WAL_CASE=$wal
+    "$PYTHON" - <<'PYREADONLY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+work = Path(os.environ['TEST_WORK'])
+data = work / 'volume/data'
+assert os.geteuid() != 0, 'run the real read-only permission regression as a non-root user'
+assert not (data / 'v2.db-wal').exists()
+if os.environ['WAL_CASE'] == 'uncheckpointed':
+    subprocess.run([sys.executable, '-c', """
+import os, sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+connection.execute('PRAGMA wal_autocheckpoint=0')
+connection.execute("UPDATE settings SET value = '7' WHERE key = 'queue_limit'")
+connection.commit()
+os._exit(0)
+""", str(data / 'v2.db')], check=True)
+    assert (data / 'v2.db-wal').stat().st_size > 0
+# An unrelated private file must not be copied just because it shares the data directory.
+(data / 'not-part-of-v2.txt').write_text('synthetic private file outside the V2 backup')
+for path in data.iterdir():
+    path.chmod(0o444)
+data.chmod(0o555)
+state = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in data.iterdir()}
+(work / 'source-before.json').write_text(json.dumps(state))
+PYREADONLY
+    "$host/backup.sh" > /dev/null
+    "$PYTHON" - <<'PYREADONLY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import tarfile
+work = Path(os.environ['TEST_WORK'])
+data = work / 'volume/data'
+after = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in data.iterdir()}
+assert after == json.loads((work / 'source-before.json').read_text()), 'live source changed'
+assert data.stat().st_mode & 0o777 == 0o555
+assert all(p.stat().st_mode & 0o777 == 0o444 for p in data.iterdir())
+with tarfile.open(work / 'uploaded.tar.gz') as archive:
+    extracted = work / 'copied.db'
+    extracted.write_bytes(archive.extractfile('data/v2.db').read())
+with sqlite3.connect(extracted) as connection:
+    limit = connection.execute("SELECT value FROM settings WHERE key = 'queue_limit'").fetchone()[0]
+    assert limit == ('7' if os.environ['WAL_CASE'] == 'uncheckpointed' else '20'), 'committed WAL data lost'
+assert not list((work / 'state').glob('backup-source-*')), 'temporary source copy left behind'
+PYREADONLY
+    [ "$(cat "$work/unit-state")" = active ] || fail "$wal: service did not restart"
+done
+unset WAL_CASE
+echo 'ok   read-only live WAL databases: clean close and uncheckpointed commits both back up without changing the source'

@@ -79,6 +79,15 @@ cat > "$work/bin/mount-data" <<'EOF'
 echo "mount-data $*" >> "$CALLS"
 [ "${FAKE_UNMOUNTED:-0}" = 0 ] || { echo "refused: not mounted" >&2; exit 1; }
 EOF
+cat > "$work/bin/rm" <<'EOF'
+#!/bin/bash
+if [ "${FAKE_CLEANUP_FAILS:-0}" = 1 ]; then
+    for argument in "$@"; do
+        case "$argument" in */install-check-*) [ ! -d "$argument" ] || exit 1 ;; esac
+    done
+fi
+exec /bin/rm "$@"
+EOF
 cat > "$work/bin/docker" <<'EOF'
 #!/bin/bash
 echo "docker $*" >> "$CALLS"
@@ -97,6 +106,21 @@ case "$1" in
                 echo "${!format:-1}" ;;
             *" backup.py verify --data /data "* | *" v2_backup.py verify --data /data "*)
                 echo "verify by $release while $(cat "$UNIT_STATE")" >> "$CALLS"
+                if [[ "$*" == *"v2_backup.py verify"* ]]; then
+                    source_copy=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/data$|\1|p')
+                    [ -n "$source_copy" ] && [ "$source_copy" != "$WORKBENCH_DATA_DIR" ] || exit 2
+                    [ "$(stat -c %a "$source_copy")" = 700 ] || exit 2
+                    [ "$(stat -c %a "$source_copy/v2.db")" = 600 ] || exit 2
+                    cmp "$source_copy/v2.db" "$WORKBENCH_DATA_DIR/v2.db" || exit 2
+                    cmp "$source_copy/deleted-accounts.jsonl" "$WORKBENCH_DATA_DIR/deleted-accounts.jsonl" || exit 2
+                    [ ! -e "$source_copy/v2.db-shm" ] || exit 2
+                    for journal in v2.db-wal v2.db-journal; do
+                        if [ -f "$WORKBENCH_DATA_DIR/$journal" ]; then
+                            cmp "$source_copy/$journal" "$WORKBENCH_DATA_DIR/$journal" || exit 2
+                        fi
+                    done
+                    echo 'V2 verify uses a private writable copy' >> "$CALLS"
+                fi
                 printf '{"counts": {}, "problems": [%s], "notes": []}\n' "${!problems:-}"
                 [ -z "${!problems:-}" ] || exit 1 ;;
             *" backup.py create "*)
@@ -206,11 +230,42 @@ called 'python v2_backup.py verify' && fail 'fresh V2 volume was treated as corr
 called 'http://127.0.0.1:8765/api/me' || fail 'install did not check API auth'
 [ "$(running)" = "$image" ] || fail 'fresh V2 was not installed'
 [ "$(unit_state)" = active ] || fail 'fresh V2 not running'
-touch "$work/state/last-backup" "$work/volume/data/v2.db"
+touch "$work/state/last-backup" "$work/volume/data/v2.db" "$work/volume/data/deleted-accounts.jsonl"
+printf 'synthetic journal' > "$work/volume/data/v2.db-wal"
+printf 'stale wal index' > "$work/volume/data/v2.db-shm"
 : > "$calls"
 "$host/install.sh" "$image" > /dev/null
 called 'python v2_backup.py verify --data /data' || fail 'existing V2 data not verified with V2 tool'
 called 'python backup.py verify' && fail 'V2 data checked by V1 tool'
+called 'V2 verify uses a private writable copy' || fail 'verification did not use a private writable copy'
+[ -z "$(find "$work/state" -name 'install-check-*')" ] || fail 'successful install left a data copy'
+: > "$calls"
+if FAKE_FREE_KB=1 "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail 'verified with no staging space'; fi
+called 'python v2_backup.py verify' && fail 'verified before checking staging space'
+[ "$(unit_state)" = active ] || fail 'low space left the old service stopped'
+[ "$(running)" = "$image" ] || fail 'low space switched the release'
+[ -z "$(find "$work/state" -name 'install-check-*')" ] || fail 'low space left a data copy'
+: > "$calls"
+if FAKE_PROBLEMS_b='"synthetic new problem"' "$host/install.sh" "$image_b" > /dev/null 2>&1; then
+    fail 'new data problem accepted'
+fi
+[ "$(unit_state)" = active ] || fail 'failed verifier left the old service stopped'
+[ "$(running)" = "$image" ] || fail 'failed verifier switched the release'
+[ -z "$(find "$work/state" -name 'install-check-*')" ] || fail 'failed verifier left a data copy'
+: > "$calls"
+if FAKE_CLEANUP_FAILS=1 "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail 'ignored copy cleanup failure'; fi
+[ "$(unit_state)" = active ] || fail 'copy cleanup failure skipped old service restart'
+[ "$(running)" = "$image" ] || fail 'copy cleanup failure switched the release'
+rm -rf "$work/state"/install-check-*
+# The copied source must not follow a symlink outside the data directory.
+mv "$work/volume/data/v2.db-wal" "$work/wal"
+ln -s "$work/wal" "$work/volume/data/v2.db-wal"
+: > "$calls"
+if "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail 'followed a journal symlink'; fi
+called 'python v2_backup.py verify' && fail 'verified an unsafe source'
+[ "$(unit_state)" = active ] || fail 'unsafe source left the old service stopped'
+rm "$work/volume/data/v2.db-wal"
+mv "$work/wal" "$work/volume/data/v2.db-wal"
 : > "$calls"
 if FAKE_NO_V2=1 "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail 'image without V2 accepted'; fi
 called 'systemctl stop' && fail 'unsupported image stopped existing service'
@@ -237,9 +292,11 @@ if FAKE_FORMAT_a=1 "$host/install.sh" "$image" > /dev/null 2>&1; then fail 'V1 i
 called 'systemctl stop' && fail 'V1 rollback stopped V2 before rejection'
 # The first-start exception never applies to a used V2 directory with a missing database.
 v2_env
+rm "$work/volume/data/v2.db"
 if FAKE_PROBLEMS_b='"database cannot be opened"' "$host/install.sh" "$image_b" > /dev/null 2>&1; then
     fail 'missing database on used V2 volume accepted'
 fi
-called 'python v2_backup.py verify' || fail 'used V2 directory took fresh-volume shortcut'
+[ "$(running)" = "$image" ] || fail 'missing database switched the release'
+[ -z "$(find "$work/state" -name 'install-check-*')" ] || fail 'missing database left a data copy'
 echo 'ok   V2 install: fresh/existing data paths, image capabilities, format rejection, health plus login/API gates'
 echo 'V2 host scripts: all checks passed'
