@@ -40,9 +40,12 @@ release=$home/releases/${digest:0:12}
 
 # What to do if this install ends early: before the workbench is stopped, nothing; once it is
 # stopped for the checks, start it again as it was; once switched, say what to do.
-phase=preparing container="" was_running=0
+phase=preparing container="" was_running=0 check_copy=""
 start_as_it_was() { if [ "$was_running" = 1 ]; then systemctl start workbench.service || true; fi; }
 on_exit() {
+    local result=$?
+    trap - EXIT
+    if [ -n "$check_copy" ]; then rm -rf "$check_copy" || result=$?; fi
     if [ -n "$container" ]; then docker rm -f "$container" > /dev/null 2>&1 || true; fi
     case "$phase" in
         stopped) start_as_it_was ;;
@@ -53,6 +56,7 @@ on_exit() {
             echo "interrupted after switching to $image, before it was seen to work: install it again," \
             "or install the last good release (${good:-none yet})" >&2 ;;
     esac
+    exit "$result"
 }
 trap on_exit EXIT
 trap 'exit 1' HUP INT TERM
@@ -139,10 +143,43 @@ if [ "$format" -gt "$recorded" ] && [ "$recorded" -gt 0 ]; then
     fi
 fi
 
-problems_found_by() {  # what release $1 finds wrong with the data (read-only), one per line, sorted
+check_mounts=(-v "$WORKBENCH_DATA_DIR:/data:ro")
+prepare_v2_check() {
+    # WAL-mode databases can require new -wal/-shm files even for read-only SQL. Check a
+    # private stopped copy, keeping uncheckpointed commits; never grant write access to live data.
+    local file source_bytes=0 need_kb free_kb
+    local files=(v2.db deleted-accounts.jsonl)
+    for file in v2.db-wal v2.db-journal; do
+        if [ -e "$WORKBENCH_DATA_DIR/$file" ] || [ -L "$WORKBENCH_DATA_DIR/$file" ]; then files+=("$file"); fi
+    done
+    for file in "${files[@]}"; do
+        if [ ! -f "$WORKBENCH_DATA_DIR/$file" ] || [ -L "$WORKBENCH_DATA_DIR/$file" ]; then
+            echo "refused: V2 check source $file is not a regular file" >&2; return 1
+        fi
+        source_bytes=$(( source_bytes + $(wc -c < "$WORKBENCH_DATA_DIR/$file") ))
+    done
+    # The shared data lock excludes other installs; discard only copies abandoned by a crash.
+    rm -rf "${state:?}"/install-check-*
+    # The source copy, recovery space, and 1 GiB spare belong on the root disk, not the data volume.
+    need_kb=$(( 2 * ((source_bytes + 1023) / 1024) + 1048576 ))
+    free_kb=$(df -Pk "$state" | awk 'NR == 2 { print $4 }')
+    if [ "$free_kb" -lt "$need_kb" ]; then
+        echo "refused: V2 checks need about $need_kb KiB on the root disk, which has $free_kb" >&2; return 1
+    fi
+    check_copy=$(mktemp -d "$state/install-check-XXXXXXXX")
+    chmod 0700 "$check_copy"
+    chown "${WORKBENCH_UID:-10001}:${WORKBENCH_GID:-10001}" "$check_copy"
+    for file in "${files[@]}"; do
+        install -m 0600 -o "${WORKBENCH_UID:-10001}" -g "${WORKBENCH_GID:-10001}" \
+            "$WORKBENCH_DATA_DIR/$file" "$check_copy/$file"
+    done
+    # The shared-memory WAL index is disposable: SQLite rebuilds it beside this writable copy.
+    check_mounts=(-v "$WORKBENCH_DATA_DIR:/live:ro" -v "$check_copy:/data")
+}
+problems_found_by() {  # what release $1 finds wrong, using read-only SQL, one per line, sorted
     local report
     report=$(docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
-        -v "$WORKBENCH_DATA_DIR:/data:ro" "$1" python "$backup_tool" verify --data /data) || [ $? = 1 ]
+        "${check_mounts[@]}" "$1" python "$backup_tool" verify --data /data) || [ $? = 1 ]
     printf '%s' "$report" | python3 -c 'import json, sys; print("\n".join(sorted(json.load(sys.stdin)["problems"])))'
 }
 refuse_and_go_back() {  # once switched: install the last good release again, when that is safe
@@ -172,6 +209,7 @@ if [ "$rolling_back" = 0 ]; then
             echo "refused: the workbench did not stop, so the data could change during the checks" >&2
             exit 1 ;;
     esac
+    if [ "${WORKBENCH_MODE:-v1}" = v2 ] && [ "$fresh_v2" = 0 ]; then prepare_v2_check; fi
     # Both releases read the same, unchanging data; the last good one's findings are the baseline.
     known=""
     if [ -n "$good" ]; then known=$(problems_found_by "$good" 2> /dev/null || true); fi
@@ -184,6 +222,7 @@ if [ "$rolling_back" = 0 ]; then
         echo "refused: $image finds problems in the data that the last good release does not: $new; nothing was changed" >&2
         exit 1
     fi
+    if [ -n "$check_copy" ]; then rm -rf "$check_copy"; check_copy=""; fi
 fi
 
 install -m 0644 "$release"/deploy/aws/host/*.service "$release"/deploy/aws/host/*.timer "$units/"

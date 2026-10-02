@@ -83,6 +83,9 @@ jobs:
           docker run --rm --entrypoint sh "$WORKBENCH_IMAGE" -c \
             'for name in .local .venv .git .jj .claude AGENTS.override.md .env; do test ! -e "/app/$name" || { echo "found $name"; exit 1; }; done'
           test "$(docker run --rm --entrypoint id "$WORKBENCH_IMAGE" -u)" = 10001
+      - name: V2 first backup and upgrade verification preserve WAL through real read-only Docker binds
+        timeout-minutes: 5
+        run: sudo env WORKBENCH_IMAGE="$WORKBENCH_IMAGE" deploy/aws/test-v2-docker-backup.sh
       - name: The tests pass inside the image too
         run: docker run --rm "$WORKBENCH_IMAGE" python -m unittest discover -s tests -t . -p "test_*.py"
       - name: V2 acceptance with 100 synthetic accounts and real Linux Chromium PDFs
