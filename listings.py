@@ -352,9 +352,31 @@ def ranked_listings(
             ).fetchall()
     finally:
         connection.close()
+    postings = [{**dict(row), "matched": json.loads(row["matched_tags"])} for row in rows]
+    return group_postings(postings, len({tag.casefold() for tag in tags}), title, location, limit, offset,
+                          hide_senior, region)
+
+
+def group_postings(
+    postings: list[dict[str, Any]],
+    skill_count: int,
+    title: str = "",
+    location: str = "",
+    limit: int = PAGE_SIZE,
+    offset: int = 0,
+    hide_senior: bool = False,
+    region: str = "all",
+) -> dict[str, Any]:
+    """Filter and rank postings (each with its ``matched`` skill words), most skills mentioned
+    first. The same role posted in several cities (same title and text) is one row; ties go to
+    the newest posting; a location filter keeps postings whose location is unknown."""
+    if isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE or offset < 0:
+        raise ListingsError(f"每页岗位数必须在 1 到 {MAX_PAGE_SIZE} 之间")
+    if region not in {"all", "cn", "other", "unknown"}:
+        raise ListingsError("地区筛选无效")
     title_key, location_key = title.strip().casefold(), location.strip().casefold()
     groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-    for row in rows:
+    for row in postings:
         if region != "all" and region not in location_regions(row["location"]):
             continue
         if title_key not in row["title"].casefold() or (hide_senior and is_senior_title(row["title"])):
@@ -368,7 +390,7 @@ def ranked_listings(
                 "board": row["board"],
                 "company": row["company"],
                 "title": row["title"],
-                "matched": json.loads(row["matched_tags"]),
+                "matched": row["matched"],
                 "postings": [],
             }
         groups[role]["postings"].append({
@@ -382,6 +404,6 @@ def ranked_listings(
     ranked.sort(key=lambda group: _matched_count(group["matched"]), reverse=True)
     return {
         "total": len(ranked),
-        "skill_count": len({tag.casefold() for tag in tags}),
+        "skill_count": skill_count,
         "listings": ranked[offset:offset + limit],
     }

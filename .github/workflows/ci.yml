@@ -46,7 +46,7 @@ jobs:
       - name: The CloudFormation template passes cfn-lint and keeps its guarantees
         run: |
           python -m pip install cfn-lint==1.57.1
-          cfn-lint deploy/aws/workbench.yaml deploy/aws/public.yaml
+          cfn-lint deploy/aws/workbench.yaml deploy/aws/public.yaml deploy/aws/cognito.yaml
           python deploy/aws/check-template.py deploy/aws/workbench.yaml
       - name: The workflows pass actionlint (the release workflow cannot run before there is an AWS account)
         run: |
