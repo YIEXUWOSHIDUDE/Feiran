@@ -21,6 +21,25 @@ state=${WORKBENCH_STATE:-/var/lib/workbench}
 exec 9> "$state/data.lock"
 flock -n 9 || { echo "refused: a backup, a restore or an install is running" >&2; exit 1; }
 "${MOUNT_DATA:-$here/mount-data.sh}" "$DATA_DEVICE" "$DATA_MOUNT" > /dev/null
+# An explicit V2 mode also selects V2 on a replacement volume before it has a format
+# marker. Restoring there still needs a trustworthy live deletion ledger placed by the operator.
+mode=${WORKBENCH_MODE:-}
+case "$mode" in
+    '' | v1) format=1 ;;
+    v2) format=2 ;;
+    *) echo "refused: unknown workbench mode $mode" >&2; exit 1 ;;
+esac
+if [ -e "$WORKBENCH_DATA_DIR/.workbench-format" ]; then
+    format=$(cat "$WORKBENCH_DATA_DIR/.workbench-format")
+    if [ -n "$mode" ] && [ "$format" != "${mode#v}" ]; then
+        echo "refused: mode $mode cannot use data in format $format" >&2; exit 1
+    fi
+fi
+case "$format" in
+    1) backup_tool=backup.py ;;
+    2) backup_tool=v2_backup.py ;;
+    *) echo "refused: unknown data format $format" >&2; exit 1 ;;
+esac
 spool=$state/backups
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 name="workbench-$stamp.tar.gz"
@@ -42,7 +61,7 @@ systemctl stop workbench.service
 created=0
 docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
     -e WORKBENCH_REVISION -v "$WORKBENCH_DATA_DIR:/data:ro" -v "$spool:/backups" \
-    "$WORKBENCH_IMAGE" python backup.py create --data /data --out "/backups/$name" || created=$?
+    "$WORKBENCH_IMAGE" python "$backup_tool" create --data /data --out "/backups/$name" || created=$?
 trap - EXIT
 start_again
 [ -f "$spool/$name" ] || { echo "refused: no archive was made" >&2; exit 1; }
@@ -51,8 +70,14 @@ check=$state/backup-check-$stamp
 trap 'rm -rf "$check"' EXIT
 in_image() {
     docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
-        -v "$spool:/backups:ro" -v "$check:/check" "$WORKBENCH_IMAGE" python backup.py "$@"
+        -v "$spool:/backups:ro" -v "$check:/check" -v "$WORKBENCH_DATA_DIR:/data:ro" \
+        "$WORKBENCH_IMAGE" python "$backup_tool" "$@"
 }
+restore_args=(restore --archive "/backups/$name" --into /check/data)
+if [ "$format" = 2 ]; then
+    # The real source stays read-only even though a disposable copy is being restored.
+    restore_args+=(--ledger /data/deleted-accounts.jsonl)
+fi
 checked=1
 need_kb=$(( $(du -sk "$WORKBENCH_DATA_DIR" | cut -f1) + 1048576 ))  # the data again, and 1 GiB to spare
 free_kb=$(df -Pk "$state" | awk 'NR == 2 { print $4 }')
@@ -60,7 +85,7 @@ if [ "$free_kb" -lt "$need_kb" ]; then
     echo "not checked: restoring this backup needs about $need_kb KiB on the root disk, which has $free_kb" >&2
 else
     install -d -m 0700 -o "${WORKBENCH_UID:-10001}" -g "${WORKBENCH_GID:-10001}" "$check"
-    if in_image restore --archive "/backups/$name" --into /check/data > /dev/null \
+    if in_image "${restore_args[@]}" > /dev/null \
             && in_image verify --data /check/data > /dev/null; then
         checked=0
     fi

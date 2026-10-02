@@ -535,3 +535,16 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t . -p
 - 请求记录暂不清理、同正文新键复用任务等已说明的行为不阻塞此本地增量；前端真实断网重发体验仍待浏览器实测，不能用服务端测试替代该结论。
 
 本轮只追加验收记录，没有修改业务代码或新增自动化。当前本地代码验收收尾，按用户授权进入 PR 与 CI 阶段；部署尚未执行。
+
+
+## 17. 隔离云端试运行准备（2026-10-02）
+
+PR #21 已合并到 main `ed50087`，原有三组 CI 全部通过。用户授权推进隔离环境试运行，当前新增主机配套和发布隔离；原所有者服务保持原样，未迁移真实资料、未调用收费模型。
+
+- `WORKBENCH_MODE=v2` 选择主机启动方式、安装格式校验和 Cognito 客户端密钥；新增 `configure-v2.sh` 在首次启动前配置空的试运行数据卷，拒绝直接接管运行中的服务或未迁移的 V1 数据。安装同时验证健康、登录跳转和未登录 API 拒绝。
+- V2 主机备份恢复使用现行删除账本；恢复在读账本前停止写入，防止恢复过程中完成的账号删除丢失。失败保留原数据，并按原状态重启服务。
+- 发布工作流新增 `aws-v2-pilot` 选项，与现有 `aws` 的主机、角色、仓库和发布队列分开。新增环境的实际云资源与 GitHub secrets 尚未配置。
+- 本机原主机回归、新 V2 主机测试、真实合成 SQLite 备份恢复测试通过；Mac 上以临时 GNU 命令兼容层运行 Linux 主机脚本，不能作为真实 systemd/Docker 证据。独立复核用真实本机 HTTP 和 curl 验证登录跳转包含 `?return_to=/`，修正了安装门禁与测试桩。
+- 新 CI 将在 Linux 容器运行完整 V2 合成负载、中断恢复、迁移和真实 Chromium 中英文 PDF，并对报告逐项断言；不会把仅生成报告或 exit 0 当作验收成功。真实 Cognito/AWS 演练仍待执行。
+
+只读核对的现有栈为 `job-fit-workbench` 和 `feiran-public`，位于 `us-east-2`；试运行拟另建 `feiran-v2-pilot` / `feiran-v2-pilot-public` / `feiran-v2-pilot-auth`，不覆盖现有栈。机型沿用 t3.small，初始仅两个合成账号、无模型密钥。详细执行顺序见 [v2-operations.md](v2-operations.md)。

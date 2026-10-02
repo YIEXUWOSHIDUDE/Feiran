@@ -46,7 +46,11 @@ on_exit() {
     if [ -n "$container" ]; then docker rm -f "$container" > /dev/null 2>&1 || true; fi
     case "$phase" in
         stopped) start_as_it_was ;;
-        switched) echo "interrupted after switching to $image, before it was seen to work: install it again," \
+        switched)
+            if [ "${WORKBENCH_MODE:-v1}" = v2 ]; then
+                systemctl stop workbench.service || echo "could not stop the unverified V2 release" >&2
+            fi
+            echo "interrupted after switching to $image, before it was seen to work: install it again," \
             "or install the last good release (${good:-none yet})" >&2 ;;
     esac
 }
@@ -62,8 +66,22 @@ good=$(sed -n 1p "$state/good-releases" 2> /dev/null || true)
 previous=$good
 [ "$previous" != "$image" ] || previous=""  # the good release again: nothing to go back to
 
-# Public mode may never silently roll back to an image without the owner login gate.
-if [ -n "${WORKBENCH_PUBLIC_HOST:-}" ]; then
+# A V2 host must never roll back into the single-owner application in the same image.
+case "${WORKBENCH_MODE:-v1}" in
+    v1) format_query='import workspace; print(workspace.DATA_FORMAT)'; backup_tool=backup.py ;;
+    v2)
+        format_query='import web_v2, identity; print(web_v2.V2_DATA_FORMAT)'
+        backup_tool=v2_backup.py
+        for setting in WORKBENCH_OIDC_ISSUER WORKBENCH_OIDC_CLIENT_ID WORKBENCH_OIDC_DOMAIN \
+                WORKBENCH_OIDC_USER_POOL_ID WORKBENCH_OIDC_SECRET_FILE WORKBENCH_PUBLIC_ORIGIN WORKBENCH_PUBLIC_HOST; do
+            [ -n "${!setting:-}" ] || { echo "refused: V2 is missing $setting" >&2; exit 1; }
+        done
+        docker run --rm --network none --entrypoint python "$image" -c 'import web_v2, identity, v2_backup' \
+            || { echo "refused: this release has no V2 support" >&2; exit 1; } ;;
+    *) echo "refused: unknown WORKBENCH_MODE" >&2; exit 1 ;;
+esac
+# V1 public mode may never silently roll back to an image without its login gate.
+if [ "${WORKBENCH_MODE:-v1}" = v1 ] && [ -n "${WORKBENCH_PUBLIC_HOST:-}" ]; then
     docker run --rm --network none --entrypoint python "$image" -c 'from public_access import OwnerAccess' \
         || { echo "refused: this release has no owner login support" >&2; exit 1; }
 fi
@@ -81,9 +99,11 @@ if [ ! -d "$release" ]; then
 fi
 "${MOUNT_DATA:-$release/deploy/aws/host/mount-data.sh}" "$DATA_DEVICE" "$DATA_MOUNT" > /dev/null
 
-format=$(docker run --rm --network none --entrypoint python "$image" -c 'import workspace; print(workspace.DATA_FORMAT)')
+format=$(docker run --rm --network none --entrypoint python "$image" -c "$format_query")
 if [ -e "$WORKBENCH_DATA_DIR/.workbench-format" ]; then
     recorded=$(cat "$WORKBENCH_DATA_DIR/.workbench-format")
+elif [ -e "$WORKBENCH_DATA_DIR/v2.db" ]; then
+    recorded=2
 elif [ -e "$WORKBENCH_DATA_DIR/workbench.db" ] || [ -e "$WORKBENCH_DATA_DIR/cv-profile.json" ] \
         || [ -d "$WORKBENCH_DATA_DIR/jobs" ]; then
     recorded=1  # data from before the app recorded its format is in the first one
@@ -96,6 +116,18 @@ if [ "$format" -lt "$recorded" ]; then
     echo "refused: $image stores data in format $format, but the data is in format $recorded;" \
         "to go back before that change, restore a backup made before it" >&2
     exit 1
+fi
+if [ "${WORKBENCH_MODE:-v1}" = v2 ] && [ "$recorded" = 1 ]; then
+    echo "refused: migrate V1 data explicitly before installing in V2 mode" >&2
+    exit 1
+fi
+# First V2 startup is allowed only on a genuinely empty, prepared volume. The normal verifier
+# must still reject a missing database on a previously used V2 volume.
+fresh_v2=0
+if [ "${WORKBENCH_MODE:-v1}" = v2 ] && [ "$recorded" = 0 ]; then
+    [ -z "$(find "$WORKBENCH_DATA_DIR" -mindepth 1 -maxdepth 1 ! -name .workbench-data -print -quit)" ] \
+        || { echo "refused: the uninitialized V2 data folder is not empty" >&2; exit 1; }
+    fresh_v2=1
 fi
 raises_format=0
 if [ "$format" -gt "$recorded" ] && [ "$recorded" -gt 0 ]; then
@@ -110,11 +142,12 @@ fi
 problems_found_by() {  # what release $1 finds wrong with the data (read-only), one per line, sorted
     local report
     report=$(docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
-        -v "$WORKBENCH_DATA_DIR:/data:ro" "$1" python backup.py verify --data /data) || [ $? = 1 ]
+        -v "$WORKBENCH_DATA_DIR:/data:ro" "$1" python "$backup_tool" verify --data /data) || [ $? = 1 ]
     printf '%s' "$report" | python3 -c 'import json, sys; print("\n".join(sorted(json.load(sys.stdin)["problems"])))'
 }
 refuse_and_go_back() {  # once switched: install the last good release again, when that is safe
     phase=handled
+    if [ "${WORKBENCH_MODE:-v1}" = v2 ]; then systemctl stop workbench.service; fi
     echo "refused: $image $1" >&2
     if [ "$rolling_back" = 0 ] && [ "$raises_format" = 1 ]; then
         echo "not going back automatically: $image may already hold the data in format $format, which the" \
@@ -142,7 +175,10 @@ if [ "$rolling_back" = 0 ]; then
     # Both releases read the same, unchanging data; the last good one's findings are the baseline.
     known=""
     if [ -n "$good" ]; then known=$(problems_found_by "$good" 2> /dev/null || true); fi
-    found=$(problems_found_by "$image") || { echo "refused: $image could not check the data; nothing was changed" >&2; exit 1; }
+    found=""
+    if [ "$fresh_v2" = 0 ]; then
+        found=$(problems_found_by "$image") || { echo "refused: $image could not check the data; nothing was changed" >&2; exit 1; }
+    fi
     new=$(LC_ALL=C comm -13 <(printf '%s\n' "$known" | sed '/^$/d') <(printf '%s\n' "$found" | sed '/^$/d'))
     if [ -n "$new" ]; then
         echo "refused: $image finds problems in the data that the last good release does not: $new; nothing was changed" >&2
@@ -161,7 +197,15 @@ phase=switched
     && systemctl restart workbench.service; } || refuse_and_go_back "could not be started; see: journalctl -u workbench"
 healthy=0
 for _ in $(seq "${HEALTH_WAIT_ATTEMPTS:-60}"); do
-    if curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:8765/healthz; then healthy=1; break; fi
+    if curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:8765/healthz; then
+        if [ "${WORKBENCH_MODE:-v1}" = v2 ]; then
+            page=$(curl -s --max-time 5 -o /dev/null -w '%{http_code} %{redirect_url}' http://127.0.0.1:8765/ || true)
+            api=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/api/me || true)
+            if [ "$page" = '303 http://127.0.0.1:8765/login?return_to=/' ] && [ "$api" = 401 ]; then healthy=1; break; fi
+        else
+            healthy=1; break
+        fi
+    fi
     sleep "${HEALTH_WAIT_SECONDS:-2}"
 done
 [ "$healthy" = 1 ] || refuse_and_go_back "did not become healthy; see: journalctl -u workbench"
