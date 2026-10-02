@@ -22,6 +22,8 @@ jobs:
           python-version: "3.14"
       - name: Install the app's packages
         run: python -m pip install -r requirements.txt
+      - name: The V2 host backup and restore use real synthetic databases
+        run: PYTHON=python deploy/aws/test-v2-backup-host.sh
       - name: Run every test; none may be skipped
         run: |
           if ! python -m unittest discover -s tests -t . -p "test_*.py" -v 2> test-output.txt; then tail -80 test-output.txt; exit 1; fi
@@ -38,6 +40,8 @@ jobs:
         run: shellcheck deploy/aws/host/*.sh deploy/aws/*.sh
       - name: The host scripts do what they say (aws, docker, systemctl and curl stubbed)
         run: deploy/aws/test-host-scripts.sh
+      - name: The V2 host starts with Cognito and never falls back to the owner login (commands stubbed)
+        run: deploy/aws/test-v2-host.sh
       - name: The data volume is formatted only on purpose and mounted only when it holds the data (loop devices)
         run: deploy/aws/test-mount-data.sh
       - uses: actions/setup-python@v7
@@ -81,6 +85,102 @@ jobs:
           test "$(docker run --rm --entrypoint id "$WORKBENCH_IMAGE" -u)" = 10001
       - name: The tests pass inside the image too
         run: docker run --rm "$WORKBENCH_IMAGE" python -m unittest discover -s tests -t . -p "test_*.py"
+      - name: V2 acceptance with 100 synthetic accounts and real Linux Chromium PDFs
+        timeout-minutes: 10
+        run: |
+          mkdir v2-acceptance
+          sudo chown 10001:10001 v2-acceptance
+          # The harness creates private work directories as uid 10001; let the artifact uploader
+          # traverse those synthetic directories, including when a later assertion fails.
+          trap 'sudo find v2-acceptance -mindepth 1 -maxdepth 1 -type d -name "work-*" -exec chmod 0755 {} +' EXIT
+          # Loopback HTTP works inside this network-isolated container. Cognito and model answers
+          # are test doubles; Chromium uses the same sandbox, user and read-only image as the app.
+          docker run --rm --network none --read-only --tmpfs /tmp --shm-size 256m \
+            --security-opt no-new-privileges:true --security-opt "seccomp=$PWD/deploy/seccomp-chromium.json" \
+            -e HOME=/tmp -v "$PWD/v2-acceptance:/acceptance" "$WORKBENCH_IMAGE" \
+            python -m tests.acceptance_v2 --out /acceptance --chrome
+          # The harness reports some failures as measurements, so a successful exit alone is
+          # insufficient. Missing sections/fields and any failed contract must fail CI.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("v2-acceptance/report.json").read_text())
+          assert report["platform"] == "linux", report
+          load = report["load"]
+          assert (load["accounts"], load["facts_each"], load["jobs_each"], load["browsers"]) == (100, 20, 5, 10), load
+          assert load["reads"]["n"] == 1200 and load["edits_checked"] == 100, load
+          assert all(load[key] == 0 for key in ("foreign_data", "errors", "lost_updates")), load
+          assert load["read_p95_met"], load
+          burst = report["burst"]
+          assert burst["users"] == burst["submit"]["n"] == 10, burst
+          assert burst["submit_statuses"] == [202] and burst["submit_p95_met"], burst
+          assert burst["all_drained"] and burst["final_statuses"] == ["succeeded"], burst
+          assert burst["model_calls"] > 0 and 1 <= burst["model_most_at_once"] <= 2, burst
+          assert burst["cv_versions_per_job"] == [3] and burst["editing_during_burst"]["n"] > 0, burst
+          assert burst["over_capacity_statuses"] == {"202": 3, "429": 7}, burst
+          assert burst["second_waiting_task_status"] == burst["quota_exhausted_status"] == 429, burst
+          assert burst["quota_exhausted_code"] == "quota_exhausted", burst
+          restart = report["restart"]
+          assert restart["child_said"] == "holding" and restart["status_before_kill"] == "running", restart
+          assert restart["status_after_restart"] == "interrupted" and restart["resubmitted_same_task"], restart
+          assert restart["final_status"] == "succeeded", restart
+          assert (restart["attempts"], restart["cv_versions"], restart["quota_used"]) == (2, 3, 4), restart
+          pdfs = report["pdf"]
+          assert set(pdfs) == {"en", "zh"}, pdfs
+          for language, pdf in pdfs.items():
+              assert pdf["pages"] == pdf["task_pages"] == 1, (language, pdf)
+              assert pdf["has_text"] and all(pdf["has_text"].values()), (language, pdf)
+              assert not pdf["watermark"] and pdf["bytes"] > 0, (language, pdf)
+              assert "mailto:alex@example.com" in pdf["links"], (language, pdf)
+          assert "https://github.com/alex-example" in pdfs["en"]["links"], pdfs["en"]
+          migration = report["migrate"]
+          assert migration["dry_run_exit"] == 0 and not migration["dry_run_wrote_v2_db"], migration
+          for key in ("v1_files_changed", "backup_problems", "archive_problems", "verify_problems"):
+              assert migration[key] == [], (key, migration[key])
+          downloads = migration["owner_downloads"]
+          # The migration fixture has one approved English CV; its Chinese smoke PDF is a
+          # separate draft. Both final export languages are checked by the V2 PDF section above.
+          assert downloads == {"en": {"same_bytes_as_v1": True, "pages": 1}}, downloads
+          migrated = migration["migrated"]
+          assert migrated["skipped"] == migrated["approvals_not_carried"] == [], migrated
+          assert (migrated["facts"], migrated["jobs"], migrated["materials"], migrated["approvals_carried"],
+                  migrated["final_pdfs"]) == (2, 1, 3, 1, 1), migrated
+          assert migrated["verified"]["foreign_key_problems"] == 0, migrated
+          assert migration["new_identity_while_closed"] == 403, migration
+          assert migration["other_account_download_statuses"] == [404], migration
+          print("V2 load, queue, restart, bilingual PDFs and migration passed")
+          PY
+      - name: The V2 Compose entry point starts on an empty prepared volume with its login gate
+        timeout-minutes: 3
+        run: |
+          mkdir ci-v2-data
+          touch ci-v2-data/.workbench-data
+          printf 'synthetic-ci-client-secret-never-used-for-a-callback\n' > ci-v2-secret
+          sudo chown -R 10001:10001 ci-v2-data ci-v2-secret
+          sudo chmod 0400 ci-v2-secret
+          export WORKBENCH_DATA_DIR="$PWD/ci-v2-data"
+          export WORKBENCH_BIND_ADDRESS=127.0.0.1 WORKBENCH_PUBLIC_HOST=localhost
+          export WORKBENCH_PUBLIC_ORIGIN=https://pilot.invalid
+          export WORKBENCH_OIDC_ISSUER=https://issuer.invalid
+          export WORKBENCH_OIDC_CLIENT_ID=synthetic-client WORKBENCH_OIDC_DOMAIN=https://login.invalid
+          export WORKBENCH_OIDC_SECRET_FILE="$PWD/ci-v2-secret"
+          # No callback or model task is sent. This exercises the actual CLI, secret mount and
+          # Compose overlay, independently of the acceptance harness's injected app object.
+          v2_compose() { docker compose --project-name feiran-v2-ci -f compose.yaml -f deploy/aws/compose.v2.yaml "$@"; }
+          trap 'v2_compose down --remove-orphans' EXIT
+          v2_compose up -d --no-build --pull never
+          health=000
+          for _ in $(seq 40); do
+            health=$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/healthz || true)
+            [ "$health" = 200 ] && break
+            sleep 2
+          done
+          test "$health" = 200
+          test "$(curl -s --max-time 5 -o /dev/null -w '%{http_code} %{redirect_url}' http://127.0.0.1:8765/)" \
+            = '303 http://127.0.0.1:8765/login?return_to=/'
+          test "$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/api/me)" = 401
+          v2_compose exec -T workbench python -c \
+            'from pathlib import Path; assert Path("/data/.workbench-format").read_text().strip() == "2"; assert Path("/data/v2.db").is_file()'
       - name: Prepare a data folder the way the data volume is prepared
         run: |
           mkdir -p ci-data empty
@@ -160,4 +260,14 @@ jobs:
         with:
           name: smoke-pdfs
           path: ci-data/smoke/*.pdf
+          if-no-files-found: ignore
+      - name: Keep the V2 acceptance report and synthetic PDFs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: v2-acceptance
+          path: |
+            v2-acceptance/report.json
+            v2-acceptance/work-*/*.pdf
+            v2-acceptance/work-*/migrate/smoke/*.pdf
           if-no-files-found: ignore

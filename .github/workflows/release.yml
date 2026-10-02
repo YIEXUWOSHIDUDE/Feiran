@@ -1,13 +1,19 @@
 # Build, test and push a release, then install it on the EC2 host. Only by hand ("Run workflow"),
-# never on a merge: the host holds real data. The job runs in the GitHub environment "aws": its
-# protection rules decide who may release and from which branch, and AWS trusts only this
-# repository's jobs in that environment (the stack's ReleaseRole). Account and host identifiers
+# never on a merge: the host holds real data. Each selected GitHub environment keeps its own
+# host, registry and release role; its protection rules decide who may release and from which
+# branch. AWS trusts only this repository in that environment. Account and host identifiers
 # are environment secrets so this public repository's logs mask them. See docs/aws-deployment.md.
 name: Release to AWS
 
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: The isolated AWS destination; each has its own protected environment and secrets.
+        type: choice
+        required: true
+        default: aws
+        options: [aws, aws-v2-pilot]
       install:
         description: >-
           Install it on the host. Turn off only for the very first release, which is pushed so the
@@ -20,14 +26,15 @@ permissions:
   id-token: write  # the OIDC token the release role trusts
 
 concurrency:
-  group: release-aws
+  group: release-${{ inputs.environment }}
   cancel-in-progress: false
 
 jobs:
   release:
     name: Build, test, push and install
+    if: inputs.environment == 'aws' || inputs.environment == 'aws-v2-pilot'
     runs-on: ubuntu-24.04
-    environment: aws
+    environment: ${{ inputs.environment }}
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       RELEASE_ROLE: ${{ secrets.AWS_RELEASE_ROLE_ARN }}

@@ -1,6 +1,6 @@
 # Feiran V2 运维与云端演练清单
 
-> 本文只列可审阅的操作步骤，不记录进度；结果、未验证项和阻塞只写在 [v2-plan.md](v2-plan.md)。截至 2026-09-30，**下面没有任何一步在 AWS 上执行过**，`deploy/aws/cognito.yaml` 与 `deploy/aws/compose.v2.yaml` 均未部署、未启用。凡新建或修改云资源、改变运行中服务、发信、迁移真实资料、调用收费模型、提交/推送/发布，都要先取得用户对**该步骤**的明确授权；一步的授权不延伸到下一步。不要把本文或旧部署文档当成操作授权。
+> 本文只列可审阅的操作步骤，不记录进度；结果、未验证项和阻塞只写在 [v2-plan.md](v2-plan.md)。截至 2026-10-02，已只读核对现有 AWS 栈，**V2 尚未创建云资源或部署**。用户已授权推进隔离试运行；新增费用、IAM 授权、邀请邮件、真实资料迁移和收费模型调用按实际授权范围执行。本文本身不扩大用户授权。
 
 ## 1. 执行前要拿到的授权与费用决定
 
@@ -14,28 +14,38 @@
 | G6 | 真实 DeepSeek 演练与 B6 有限评估 | 付费模型调用 | 预算与调用上限（`eval_v2.py live --max-calls`） |
 | G7 | 提交、推送、PR、CI、合并 | 远端仓库 | 用户 / Codex 决定 |
 
-## 2. 现有主机文件还需要的改动（尚未修改）
+## 2. V2 主机流程
 
-`deploy/aws/host/*.sh` 是当前单用户线上部署及其 CI 测试（`deploy/aws/test-host-scripts.sh`）的一部分。这一轮没有改它们，以免下一次 V1 发布路径悄悄变化。V2 上主机前需要另做一个可审阅增量：
+主机通过 `/etc/workbench/env` 中的 `WORKBENCH_MODE=v2` 明确选择 V2；省略时仍为 V1。`workbench.service` 调用 `host/compose.sh`，只有 V2 模式才叠加 `compose.v2.yaml`。V2 绝不接受旧所有者口令。
 
-1. **`fetch-secret.sh`**：V2 模式（设置了 `WORKBENCH_OIDC_CLIENT_ID`）下，用主机角色读取应用客户端密钥写入 `/run/workbench/oidc_client_secret`（0400，uid 10001，沿用现有临时文件 + `mv` 写法，不打印、不进日志、不进命令行参数）：
-   `aws cognito-idp describe-user-pool-client --region "$AWS_REGION" --user-pool-id "$WORKBENCH_OIDC_USER_POOL_ID" --client-id "$WORKBENCH_OIDC_CLIENT_ID" --query UserPoolClient.ClientSecret --output text`
-   CloudFormation 不能输出客户端密钥（`GetAtt` 只有 `ClientId`），所以由主机在启动时读取。V2 模式跳过所有者 Basic 登录密钥：V2 绝不同时接受旧所有者口令。
-2. **`/etc/workbench/env`**（V2 模式）：
-   - `WORKBENCH_OIDC_ISSUER` / `WORKBENCH_OIDC_CLIENT_ID` / `WORKBENCH_OIDC_DOMAIN`：Cognito 栈输出 `Issuer`、`ClientId`、`ManagedLoginDomain`；另加 `WORKBENCH_OIDC_USER_POOL_ID`（输出 `UserPoolId`）。
-   - `WORKBENCH_PUBLIC_ORIGIN`：用户打开的 CloudFront 地址，`https://…`，无结尾斜杠，必须与 Cognito 回调/退出地址的前缀完全一致。
-   - `WORKBENCH_PUBLIC_HOST`：**源站私有 DNS**（`public.yaml` 输出 `OriginHost`）。`public.yaml` 用 `AllViewerExceptHostHeader`，源站收到的 Host 是私有 DNS；应用只接受这个 Host 和 localhost。CSRF 的 Origin 检查用的是 `WORKBENCH_PUBLIC_ORIGIN`。
-   - `WORKBENCH_OIDC_SECRET_FILE=/run/workbench/oidc_client_secret`；删除 `WORKBENCH_LOGIN_*`。
-3. **`workbench.service`**：V2 模式的 `ExecStart`/`ExecStop` 多加 `-f deploy/aws/compose.v2.yaml`（drop-in 或在 env 中给出 compose 文件列表）。V2 仍是一个容器、一个 Uvicorn worker，任务执行器在进程内。
-4. **`backup.sh` / `restore.sh`**：数据目录的 `.workbench-format` 为 2 时改用 V2 工具：
-   - 备份：`python v2_backup.py create --data /data --out /backups/NAME.tar.gz`（SQLite 在线备份，一致性不要求停服务；沿用停服务的现有流程也可以）。
-   - 校验：`python v2_backup.py restore --archive … --into /check/data --ledger /data/deleted-accounts.jsonl`，再 `python v2_backup.py verify --data /check/data`。
-   - 恢复：`--ledger` 必须指向**现行**删除账本。V2 数据目录始终有 `deleted-accounts.jsonl`：应用启动、迁移和恢复时都会确保它存在（从未删除过账户时是空文件；文件丢失而数据库还在时，按数据库里的墓碑重建）。因此给出的账本不存在、不是文件或读不出时，恢复会拒绝，且不写入目标目录——通常是路径写错或数据卷已丢失。只有确认现行账本确实丢失时才改用 `--without-live-ledger`，此时最后一次备份之后删除的账户会回来，需要按账户删除记录（见 §7）补删。
-   - 建议另加：每次删除账户后把 `deleted-accounts.jsonl` 也复制到 S3（几 KB），避免数据卷整体丢失时只能用旧备份里的账本。这是待评审的建议，尚未实现。
-5. **`enable-public.sh` 的 V2 版本**：先确认镜像含 V2（`python -c 'import web_v2, identity'`），写入上面的 env，取到密钥后重启；只有同时满足 `GET /healthz` = 200、`GET /` = 303 跳到 `/login`、`GET /api/me` = 401 才算接通，否则停止服务（与现有“401 才算接通”同理）。
-6. **`test-host-scripts.sh`**：为以上 V2 分支补测试。
+### 隔离试运行的第一次安装
 
-`compose.v2.yaml` 已准备好（不在使用中）：`command: python web_v2.py`，`WORKBENCH_OIDC_*` 环境变量，客户端密钥以 compose secret 挂载。V2 启动时会拒绝：缺 Cognito 设置、数据卷未挂载（`WORKBENCH_REQUIRE_DATA=1` 且无 `.workbench-data`）、未迁移的 V1 数据目录、非 https 的公开地址（localhost 除外）。
+1. 新建独立基础栈、CloudFront 栈和 Cognito 栈。基础栈的 `GitHubEnvironment` 使用 `aws-v2-pilot`，复用账户已有 GitHub OIDC provider；不覆盖现有 `aws` 环境或生产栈。
+2. 在 GitHub 新环境 `aws-v2-pilot` 配置它自己的 Region、release role、repository、host 和 SSM document；发布工作流选择该环境，第一次令 `install=false`，只构建和推送经过测试的镜像。
+3. 按既有数据卷流程初始化**新隔离卷**，挂载后只有 `.workbench-data`。不要先运行 V1：它会建立旧格式数据库，V2 将拒绝直接接管。
+4. 从选定镜像取出随镜像发布的 `deploy` 文件，以同一版本的脚本配置尚未启动的主机：
+
+   ```sh
+   sudo deploy/aws/host/configure-v2.sh \
+     <CloudFront栈的OriginHost> <https://CloudFront域名> \
+     <Cognito的UserPoolId> <ClientId> <https://登录域名>
+   ```
+
+   脚本检查卷已挂载、服务已停止、数据为空或已是 V2，写入 V2 模式和 OIDC 设置，删除 V1 登录设置，设置 `WORKBENCH_BIND_ADDRESS=0.0.0.0`。`WORKBENCH_PUBLIC_HOST` 是源站私有 DNS；浏览器 CSRF 的 Origin 是 CloudFront HTTPS 地址。主机的入站仍由独立 CloudFront 栈限制。
+5. `fetch-secret.sh` 用主机角色向 Cognito 读取该应用客户端密钥，保存到 `/run/workbench/oidc_client_secret`（0400，容器 uid 10001）。不打印密钥、不把密钥作为参数，V2 不读取所有者 Basic 登录密钥；取不到密钥则配置失败。
+6. 使用现有 `workbench-release` 按镜像 digest 安装。安装器在 V2 模式读取 `web_v2.V2_DATA_FORMAT`，检查 V2 模块和配置。只有真正空的初始数据卷可跳过数据库完整性检查；已使用的 V2 卷必须通过 `v2_backup.py verify`。V1 数据必须先显式迁移。
+7. 安装成功需要同时满足：`GET /healthz` = 200；未登录 `GET /` = 303，跳往 `/login?return_to=/`；`GET /api/me` = 401。鉴权检查不通过则停止 V2，只有能安全读取当前数据的上一个发行版才可恢复；不会回到 V1 登录。
+8. 再按 §4 配置**最多两个**合成试运行账号，完成 §5 的真实登录及隔离检查后才扩大人数。初始不配置 DeepSeek secret，不迁移真实资料。
+
+### 备份与恢复
+
+- `.workbench-format=2` 时，主机 `backup.sh` / `restore.sh` 使用 `v2_backup.py`。新空卷以显式 V2 模式选择 V2 恢复；已有格式与显式模式不一致时拒绝。
+- 备份沿用短暂停服流程，归档后恢复原服务状态；只有临时恢复副本和校验均通过才更新“备份成功”时间。现行数据和删除账本只读挂载到检查容器。
+- V2 恢复在读取现行删除账本**之前**停止服务，覆盖停服过程中完成的删除，并一直保持停止直到目录交换结束；失败时保留原数据并恢复原服务状态。主机维护锁不能替代这个停服步骤，因为应用内删除账号不持有主机锁。
+- 恢复始终要求 `/data/deleted-accounts.jsonl`，不会自动使用 `--without-live-ledger`。新隔离恢复环境必须先从可信现行来源取得账本副本；缺失或损坏时停止恢复。
+- 每次删除后把账本另存 S3 尚未实现；数据卷整体丢失且拿不到备份后的现行账本时，仍需要人工对照删除记录，不能承诺自动避免账号恢复。
+
+`test-host-scripts.sh` 保留 V1 回归；`test-v2-host.sh` 检查 V2 配置、密钥、安装和鉴权失败；`test-v2-backup-host.sh` 用真实合成 SQLite 归档验证恢复，包括停服期间的删除与各类失败。CI 另外在 Linux 容器运行 V2 负载、中断、迁移和真实 Chromium 中英文 PDF 检查。这些证据不替代 AWS 上的演练。
 
 ## 3. Cognito 栈（G1）
 

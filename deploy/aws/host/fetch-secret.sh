@@ -30,7 +30,35 @@ mv -f "$temporary" "$target"
 trap - EXIT
 echo "$done_message"
 
-# In public mode a missing or unreadable login secret stops startup (never opens the app).
+# V2 has its own identity provider and never fetches the V1 owner password.
+case "${WORKBENCH_MODE:-v1}" in
+v2)
+    target=${WORKBENCH_OIDC_SECRET_FILE:?WORKBENCH_OIDC_SECRET_FILE is not set}
+    install -d -m 0700 "$(dirname "$target")"
+    temporary=$(mktemp "$(dirname "$target")/.oidc.XXXXXX")
+    trap 'rm -f "$temporary"' EXIT
+    aws cognito-idp describe-user-pool-client --region "$AWS_REGION" \
+        --user-pool-id "${WORKBENCH_OIDC_USER_POOL_ID:?WORKBENCH_OIDC_USER_POOL_ID is not set}" \
+        --client-id "${WORKBENCH_OIDC_CLIENT_ID:?WORKBENCH_OIDC_CLIENT_ID is not set}" \
+        --query UserPoolClient.ClientSecret --output text > "$temporary"
+    python3 - "$temporary" <<'PYSECRET'
+from pathlib import Path
+import sys
+value = Path(sys.argv[1]).read_text().strip()
+if not 16 <= len(value) <= 4096 or not value.isascii() or any(c.isspace() for c in value):
+    sys.exit("refused: invalid Cognito client secret")
+PYSECRET
+    chown "$owner" "$temporary"
+    chmod 0400 "$temporary"
+    mv -f "$temporary" "$target"
+    trap - EXIT
+    echo "the Cognito client secret is in place for the container"
+    exit 0 ;;
+v1) ;;
+*) echo "refused: unknown WORKBENCH_MODE" >&2; exit 1 ;;
+esac
+
+# In V1 public mode a missing or unreadable login secret stops startup.
 if [ -n "${WORKBENCH_PUBLIC_HOST:-}" ]; then
     target=${WORKBENCH_LOGIN_FILE:?WORKBENCH_LOGIN_FILE is not set}
     temporary=$(mktemp "$(dirname "$target")/.login.XXXXXX")
