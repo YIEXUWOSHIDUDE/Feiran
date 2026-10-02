@@ -140,7 +140,7 @@ unit_state() { cat "$UNIT_STATE"; }
 
 # All credentials below are synthetic. AWS, Docker and systemd are command-recording stubs.
 v2_env() {
-    host_env "${1:-inactive}"
+    host_env inactive
     cat >> "$WORKBENCH_ENV" <<EOF
 WORKBENCH_MODE=v2
 WORKBENCH_PUBLIC_HOST=ip-10-0-0-1.ec2.internal
