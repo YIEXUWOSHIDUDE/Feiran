@@ -19,7 +19,7 @@ from typing import Any, Callable, Iterable
 from claims import check_rewrite
 from cv_layout import shown_sections
 from deepseek_client import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, DeepSeekError, chat_json
-from facts import DEFAULT_DATABASE, FactStoreError, load_current_facts
+from facts import DEFAULT_DATABASE, FactStoreError, fact_source
 from privacy import mask, private_terms, stand_ins
 from review import build_report
 
@@ -233,25 +233,9 @@ def requirement_briefs(job: dict[str, Any]) -> list[dict[str, str]]:
     return [{"text": item["text"], "strength": item.get("strength") or "unclear"} for item in job["selected_requirements"]]
 
 
-def build_draft(
-    profile: Any,
-    facts_db: Path,
-    language: str = "en",
-    paper: str | None = None,
-    job: Any = None,
-) -> dict[str, Any]:
-    """Resolve the profile for one language and quote the current confirmed facts it lists.
-
-    With a matching.py decide output as ``job``, facts linked to that job's
-    requirements are listed first inside their entry; nothing else changes.
-    """
-    job_summary = _job_summary(job)
-    matched = set(job_summary["matched_fact_ids"]) if job_summary else set()
+def _profile_layout(profile: Any, language: str) -> tuple:
     if language not in LANGUAGES:
         raise CVError(f"语言必须是：{', '.join(LANGUAGES)}")
-    paper = paper or DEFAULT_PAPER[language]
-    if paper not in PAPERS:
-        raise CVError(f"纸张必须是：{', '.join(PAPERS)}")
     _check_keys(profile, PROFILE_KEYS, "profile")
     if profile.get("profile_version") != PROFILE_VERSION:
         raise CVError(f"profile_version 必须是 {PROFILE_VERSION}")
@@ -297,7 +281,64 @@ def build_draft(
             "entries": entries,
         })
 
-    facts = load_current_facts(facts_db, referenced)
+    return header, sections, referenced, fallbacks
+
+
+def profile_fact_ids(profile: Any, language: str) -> list[str]:
+    """Validate profile structure and return its references, without accessing facts."""
+    return _profile_layout(profile, language)[2]
+
+
+def build_draft(
+    profile: Any,
+    facts_db: Path,
+    language: str = "en",
+    paper: str | None = None,
+    job: Any = None,
+) -> dict[str, Any]:
+    """Build a draft from the facts in ``facts_db``: the single-user database, or any fact
+    source (facts.fact_source), such as one user's snapshot from the multi-user store."""
+    return _build_draft(profile, fact_source(facts_db).current, language, paper, job)
+
+
+def build_draft_from_facts(
+    profile: Any,
+    facts: dict[str, dict[str, Any]],
+    language: str = "en",
+    paper: str | None = None,
+    job: Any = None,
+) -> dict[str, Any]:
+    """Pure rendering input: the caller supplies a scoped snapshot from its fact store.
+
+    This checks confirmation just like build_draft; it does not authenticate a caller,
+    confirm facts or approve output. The V2 store supplies the snapshot in one transaction.
+    """
+    return _build_draft(profile, lambda ids: {key: facts[key] for key in ids if key in facts},
+                        language, paper, job)
+
+
+def _build_draft(
+    profile: Any,
+    read_facts: Callable[[list[str]], dict[str, dict[str, Any]]],
+    language: str = "en",
+    paper: str | None = None,
+    job: Any = None,
+) -> dict[str, Any]:
+    """Resolve the profile for one language and quote the current confirmed facts it lists.
+
+    With a matching.py decide output as ``job``, facts linked to that job's
+    requirements are listed first inside their entry; nothing else changes.
+    """
+    job_summary = _job_summary(job)
+    matched = set(job_summary["matched_fact_ids"]) if job_summary else set()
+    if language not in LANGUAGES:
+        raise CVError(f"语言必须是：{', '.join(LANGUAGES)}")
+    paper = paper or DEFAULT_PAPER[language]
+    if paper not in PAPERS:
+        raise CVError(f"纸张必须是：{', '.join(PAPERS)}")
+    header, sections, referenced, fallbacks = _profile_layout(profile, language)
+
+    facts = read_facts(referenced)
     missing = [fact_id for fact_id in referenced if fact_id not in facts]
     if missing:
         raise CVError(f"简历引用的事实不存在：{', '.join(missing)}", reason="facts_missing")
@@ -533,7 +574,8 @@ def _line_supported(line: dict[str, Any], fact: dict[str, Any], vocabulary: list
 def verify_draft(draft: Any, facts_db: Path) -> dict[str, dict[str, Any]]:
     """Every line must still rest on the current confirmed version of its fact.
 
-    Returns those current facts, keyed by ID, for callers that need their tags.
+    Returns those current facts, keyed by ID, for callers that need their tags. ``facts_db``
+    is the single-user database or a fact source (facts.fact_source).
     """
     if not isinstance(draft, dict) or draft.get("cv_draft_version") != DRAFT_VERSION:
         raise CVError("草稿文件版本无效")
@@ -546,7 +588,7 @@ def verify_draft(draft: Any, facts_db: Path) -> dict[str, dict[str, Any]]:
     ):
         raise CVError("草稿 facts 结构无效")
     versions = {item["id"]: item["version"] for item in used}
-    current = load_current_facts(facts_db, versions)
+    current = fact_source(facts_db).current(versions)
     problems = [
         fact_id for fact_id, version in versions.items()
         if fact_id not in current or current[fact_id]["status"] != "confirmed"

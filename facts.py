@@ -162,6 +162,8 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
 
 
 def _ensure_schema(connection: sqlite3.Connection) -> None:
+    if connection.execute("PRAGMA application_id").fetchone()[0] != 0:
+        raise FactStoreError("这不是单用户事实数据库，不能自动迁移")
     version = _schema_version(connection)
     if version == 0:
         existing = connection.execute(
@@ -330,8 +332,8 @@ def add_fact(
         connection.close()
 
 
-def import_facts(path: Path, items: Any) -> list[tuple[dict[str, Any], bool]]:
-    """Validate every item first, then add all as pending facts in one transaction."""
+def normalize_fact_import(items: Any) -> list[tuple]:
+    """Validate an import without reading or changing any store. Never accepts confirmation."""
     if not isinstance(items, list) or not items:
         raise FactStoreError("导入文件必须包含非空 facts 数组")
     if len(items) > MAX_IMPORT_FACTS:
@@ -357,6 +359,12 @@ def import_facts(path: Path, items: Any) -> list[tuple[dict[str, Any], bool]]:
                 raise FactStoreError(f"facts[{index}] 的 ID 重复：{fact_id}")
             seen_ids.add(fact_id)
         normalized.append((fact_id, *values))
+    return normalized
+
+
+def import_facts(path: Path, items: Any) -> list[tuple[dict[str, Any], bool]]:
+    """Validate every item first, then add all as pending facts in one transaction."""
+    normalized = normalize_fact_import(items)
     initialize_database(path)
     connection = _open_store(path)
     try:
@@ -799,6 +807,45 @@ def load_confirmed_fact_texts(
         raise FactStoreError("无法读取已匹配的事实原文") from exc
     finally:
         connection.close()
+
+
+class FactFile:
+    """The single-user fact database seen as one user's fact source.
+
+    The CV, gap and import rules read facts through this small interface, so the multi-user
+    store (tenant_store) can hand them one user's facts instead: a snapshot read in one short
+    transaction, or its open transaction when a user's decision writes. Nothing here decides
+    who the user is. ``revise_confirmed`` and ``add_confirmed`` exist only for wording the user
+    has just accepted as true (a gap they said is true for them); no model output reaches them
+    without that decision.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def available(self) -> bool:
+        """Whether any fact store exists yet; a missing file means no facts, not an error."""
+        return self.path.exists()
+
+    def current(self, fact_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+        return load_current_facts(self.path, fact_ids)
+
+    def listed(self) -> list[dict[str, Any]]:
+        """Every current fact, confirmed or pending, oldest first."""
+        return list_facts(self.path)
+
+    def revise_confirmed(self, fact_id: str, text: str, tags: Iterable[str]) -> dict[str, Any]:
+        revised, _ = revise_fact(self.path, fact_id, text=text, tags=list(tags))
+        return confirm_fact(self.path, fact_id, revised["version"])[0]
+
+    def add_confirmed(self, text: str, fact_type: str, tags: Iterable[str]) -> dict[str, Any]:
+        fact, _ = add_fact(self.path, text, fact_type, tags)
+        return confirm_fact(self.path, fact["id"], fact["version"])[0]
+
+
+def fact_source(value: Any) -> Any:
+    """A path is the single-user database; anything else is already a fact source."""
+    return FactFile(value) if isinstance(value, (str, Path)) else value
 
 
 def main(argv: list[str] | None = None) -> int:

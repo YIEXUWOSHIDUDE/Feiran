@@ -5,19 +5,111 @@ const I18n = window.WorkbenchI18n;
 const t = I18n.text;
 
 const TOKEN = document.querySelector('meta[name="workbench-token"]').content;
+// "v2": signed-in users on a shared server; heavy work runs as tasks the page follows.
+const MODE = (document.querySelector('meta[name="workbench-mode"]') || {}).content || "local";
 const app = document.getElementById("app");
 const message = document.getElementById("message");
+const TERMINAL = new Set(["succeeded", "failed", "interrupted", "superseded", "cancelled"]);
+let pendingWarning = null; // shown once the current action has finished, over its success message
+
+// A request that names the user's action (an Idempotency-Key) can safely be sent again when its
+// answer was lost: the server finds the same task instead of starting the work twice.
+const RESEND_AFTER_MS = [1000, 3000];
+
+async function request(path, options = {}) {
+  const resendable = Boolean(options.headers && options.headers["Idempotency-Key"]);
+  for (let attempt = 0; ; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(path, {
+        ...options,
+        headers: { "Content-Type": "application/json", ...options.headers, "X-Workbench-Token": TOKEN },
+      });
+    } catch (error) {
+      if (!resendable || attempt >= RESEND_AFTER_MS.length) throw error;
+      await new Promise((resolve) => setTimeout(resolve, RESEND_AFTER_MS[attempt]));
+      continue;
+    }
+    if (resendable && attempt < RESEND_AFTER_MS.length && (response.status === 502 || response.status === 504)) {
+      await new Promise((resolve) => setTimeout(resolve, RESEND_AFTER_MS[attempt]));
+      continue;
+    }
+    return { response, body: await response.json().catch(() => ({})) };
+  }
+}
+
+function actionKey() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...options.headers, "X-Workbench-Token": TOKEN },
-  });
-  const body = await response.json().catch(() => ({}));
+  // V2: each call is one action of the user, named once; resending it (after agreeing to a data
+  // flow below, or when the answer was lost) keeps the name, a new click gets a new one.
+  if (MODE === "v2" && options.method && options.method !== "GET" && !(options.headers && options.headers["Idempotency-Key"])) {
+    options = { ...options, headers: { ...options.headers, "Idempotency-Key": actionKey() } };
+  }
+  const { response, body } = await request(path, options);
+  if (MODE === "v2" && response.status === 401) {
+    location.href = `/login?return_to=${encodeURIComponent("/" + location.hash)}`;
+    throw new Error(t("Your session ended. Sign in again."));
+  }
+  if (MODE === "v2" && response.status === 403 && body.code === "consent_required") {
+    if (await askConsent(body.stage)) return api(path, options);
+    throw new Error(t("Nothing was sent. You can agree whenever you want to use this."));
+  }
   if (!response.ok) {
     throw new Error(body.error || body.detail || `HTTP ${response.status}`);
   }
+  if (body.task_error) pendingWarning = t`Saved. The CV could not be prepared again now: ${I18n.serverText(body.task_error.error)}`;
+  if (body.task) return { ...body, ...(await followTask(body.task)) };
   return body;
+}
+
+// Waits for a task the server queued (V2): the page keeps working, and a reload does not start it again.
+async function followTask(task) {
+  let current = task;
+  while (!TERMINAL.has(current.status)) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const { response, body } = await request(`/api/tasks/${encodeURIComponent(task.task_id)}`);
+    if (response.status === 401) return api(`/api/tasks/${encodeURIComponent(task.task_id)}`);
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    current = body.task;
+  }
+  if (current.status !== "succeeded") throw new Error(taskMessage(current));
+  return current.result || {};
+}
+
+function taskMessage(task) {
+  const status = { failed: t("It did not work"), interrupted: t("The service restarted while it ran"),
+    superseded: t("A newer version was made meanwhile"), cancelled: t("It was cancelled") }[task.status] || task.status;
+  return task.message ? I18n.join([status, ": ", I18n.serverText(task.message)]) : status;
+}
+
+// What a model feature sends and to whom, shown before its first use; nothing is sent until the user agrees.
+async function askConsent(stage) {
+  const { notices } = await api("/api/me");
+  const notice = notices[stage];
+  if (!notice) return false;
+  return new Promise((resolve) => {
+    const finish = (agreed) => { box.remove(); resolve(agreed); };
+    const agree = el("button", {}, t("I agree"));
+    agree.addEventListener("click", async () => {
+      agree.disabled = true;
+      try {
+        await api("/api/consent", { method: "POST", body: JSON.stringify({ stage, version: notice.version }) });
+        finish(true);
+      } catch (error) {
+        show(I18n.serverText(error.message));
+        finish(false);
+      }
+    });
+    const box = el("section", { class: "panel consent-panel", role: "dialog", "aria-modal": "true" },
+      el("h2", {}, t("Before this is sent to a model")), el("p", {}, I18n.serverText(notice.text)),
+      el("div", { class: "toolbar" }, agree, el("button", { class: "secondary", onclick: () => finish(false) }, t("Not now"))));
+    app.prepend(box);
+    agree.focus();
+  });
 }
 
 function el(tag, attributes = {}, ...children) {
@@ -52,6 +144,10 @@ async function run(action) {
     await action();
   } catch (error) {
     show(I18n.serverText(error.message));
+  }
+  if (pendingWarning) {
+    show(pendingWarning, "warning");
+    pendingWarning = null;
   }
 }
 
@@ -98,7 +194,9 @@ function uploadReview(proposal, onSaved, onCancel) {
   }));
   return el("div", { class: "upload-review" },
     el("h3", {}, t("1. Check your name and contact details")),
-    el("p", { class: "muted" }, t("Read from the top of your CV on this computer and never sent to DeepSeek. They go on the header of every CV.")),
+    el("p", { class: "muted" }, MODE === "v2"
+      ? t("Read from the top of your CV on the Feiran server and never sent to DeepSeek. They go on the header of every CV.")
+      : t("Read from the top of your CV on this computer and never sent to DeepSeek. They go on the header of every CV.")),
     el("div", { class: "grid" }, field(t("Name *"), inputs.name), field(t("Location"), inputs.location), field(t("Phone"), inputs.phone), field(t("Email"), inputs.email)),
     el("div", { class: "field" }, el("span", {}, t("Links")), linkRows,
       el("div", {}, el("button", { class: "secondary", type: "button", onclick: () => addLink() }, t("Add link")))),
@@ -133,7 +231,9 @@ function uploadPanel(languages) {
     if (!file) return;
     box.replaceChildren(el("p", { class: "muted" }, t`Reading ${file.name}…`));
     try {
-      const proposal = await api(`/api/cv/upload?language=${encodeURIComponent(language.value)}`, { method: "POST", body: file, headers: { "Content-Type": "application/pdf" } });
+      let proposal = await api(`/api/cv/upload?language=${encodeURIComponent(language.value)}`, { method: "POST", body: file, headers: { "Content-Type": "application/pdf" } });
+      // V2 reads the CV in a task; its result names the proposal waiting to be checked.
+      if (MODE === "v2") proposal = await api(`/api/cv/uploads/${encodeURIComponent(proposal.upload_id)}`);
       const cancel = () => run(async () => {
         await api(`/api/cv/uploads/${proposal.upload_id}`, { method: "DELETE" });
         reset();
@@ -148,7 +248,9 @@ function uploadPanel(languages) {
     el("h2", {}, t("Your CV")),
     el("p", { class: "muted" },
       t("Upload your CV as a PDF: each line becomes a fact for you to confirm, and its layout is the base of every job's CV. "),
-      t("Your name, email, phone and links stay on this computer; DeepSeek sees the other lines to tell sections, entries and bullets apart.")),
+      MODE === "v2"
+        ? t("Your name, email, phone and links stay on the Feiran server; DeepSeek sees the other lines to tell sections, entries and bullets apart.")
+        : t("Your name, email, phone and links stay on this computer; DeepSeek sees the other lines to tell sections, entries and bullets apart.")),
     el("p", { class: "muted" }, languages.length ? I18n.join([t("Available CVs: "),
       I18n.join(languages.map((lang) => t(lang === "zh" ? "Chinese CV (A4)" : "English CV (US Letter)")), " / ")], "") : t("Upload a Chinese or English PDF to begin.")),
     el("div", { class: "toolbar" }, field(t("CV upload language"), language),
@@ -240,6 +342,7 @@ async function renderFacts() {
             el("thead", {}, el("tr", {}, el("th", {}, pending.length ? selectAll : ""), el("th", {}, t("Fact")), el("th", {}, t("Text and tags")), el("th", {}, t("Status")))),
             el("tbody", {}, rows))),
     ),
+    accountPanel(),
   );
 }
 
@@ -573,19 +676,19 @@ function requirementsPanel(view, refresh) {
   });
   const missed = el("input", { type: "text", placeholder: t("Copy a line or phrase exactly from the job description") });
   const add = actionButton(t("Add missed requirement"), async () => {
-    await api(`/api/jobs/${view.job_id}/requirements/add`, { method: "POST", body: JSON.stringify({ text: missed.value }) });
+    await api(`/api/jobs/${view.job_id}/requirements/add`, { method: "POST", body: JSON.stringify({ text: missed.value, expected_version: view.requirements_version }) });
     await refresh();
     show(t("Added. It counts, and the CV was prepared again."), "ok");
   }, true);
   const save = actionButton(t("Save"), async () => {
     const confirm = [...choices].filter(([, status]) => status === "confirmed").map(([id]) => id);
     const exclude = [...choices].filter(([, status]) => status === "excluded").map(([id]) => id);
-    await api(`/api/jobs/${view.job_id}/requirements/decide`, { method: "POST", body: JSON.stringify({ confirm, exclude }) });
+    await api(`/api/jobs/${view.job_id}/requirements/decide`, { method: "POST", body: JSON.stringify({ confirm, exclude, expected_version: view.requirements_version }) });
     await refresh();
     show(t`Saved: ${confirm.length} requirement(s). The CV was prepared again for them.`, "ok");
   });
   const findAgain = actionButton(t("Find again with DeepSeek"), async () => {
-    await api(`/api/jobs/${view.job_id}/requirements/find`, { method: "POST" });
+    await api(`/api/jobs/${view.job_id}/requirements/find`, { method: "POST", body: JSON.stringify({ expected_version: view.requirements_version }) });
     await refresh();
   }, true);
   const extraction = view.extraction || {};
@@ -679,7 +782,7 @@ function cvBlock(view, language, refresh) {
   tools.push(actionButton(t("Start over"), post("prepare"), true));
   if (approved && !cv.final_pdf) tools.push(actionButton(t("Create final PDF"), post("export")));
   if (cv.final_pdf) {
-    tools.push(el("a", { class: "button", href: `/download/${view.job_id}/${language}.pdf?token=${encodeURIComponent(TOKEN)}` }, t("Download final PDF")));
+    tools.push(el("a", { class: "button", href: `/download/${view.job_id}/${language}.pdf${tokenQuery("?")}` }, t("Download final PDF")));
   }
   const notes = [];
   if (cv.stale) notes.push(el("p", { class: "warning" }, t("Your profile or facts changed. This is an old draft. Start over and review the new version.")));
@@ -724,7 +827,7 @@ function cvBlock(view, language, refresh) {
   }
   const preview = el("iframe", {
     class: "preview", sandbox: "", title: t`${title} preview`,
-    src: `/preview/${view.job_id}/${language}?token=${encodeURIComponent(TOKEN)}&v=${encodeURIComponent(cv.content_sha256)}`,
+    src: `/preview/${view.job_id}/${language}?v=${encodeURIComponent(cv.content_sha256)}${tokenQuery("&")}`,
   });
   return el("div", { class: "cv-block" }, el("h3", {}, title), el("div", { class: "toolbar" }, tools), notes, approval, preview);
 }
@@ -963,11 +1066,17 @@ async function renderJob(jobId) {
         el("details", {}, el("summary", {}, t("Job description")), el("pre", { class: "jd" }, jd.text)),
         interruptedNote(view.interrupted),
         (view.interrupted_operations || []).map((notice) => unfinishedNote(notice, refresh)),
+        (view.tasks || []).map((task) => taskNote(task, refresh)),
       ),
       requirementsPanel(view, refresh),
       cvPanel(view, refresh),
       gapsPanel(view, refresh),
     );
+    // V2: while this job's work runs on the server, look again shortly; the page stays usable.
+    if ((view.tasks || []).some((task) => !TERMINAL.has(task.status))) {
+      setTimeout(() => { if (location.hash === `#job/${jobId}`) run(() => refresh(true)); }, 2000);
+      return view;
+    }
     const due = !view.gaps || view.gaps.outdated || view.gaps.stale;
     if (!checked && due && (view.selected_requirements || []).length && view.cv[view.language].head) {
       await api(`/api/jobs/${jobId}/gaps`, { method: "POST" });
@@ -976,6 +1085,64 @@ async function renderJob(jobId) {
     return view;
   };
   await refresh();
+}
+
+// V2: work on this job that is waiting, running, or ended without a result.
+const TASK_NAMES = {
+  prepare_job: t("finding requirements and preparing the CV"), job_from_url: t("reading the job and preparing the CV"),
+  start_listing: t("reading the job and preparing the CV"), prepare_cv: t("preparing your CV"),
+  tailor_cv: t("rewording your CV"), plan_cv: t("adjusting your CV"), check_gaps: t("checking what your CV shows"),
+  export_pdf: t("creating the final PDF"), upload_cv: t("reading your CV"),
+};
+
+function taskNote(task, refresh) {
+  const name = TASK_NAMES[task.operation] || task.operation;
+  if (task.status === "queued" || task.status === "running") {
+    const cancel = actionButton(t("Cancel"), async () => {
+      await api(`/api/tasks/${task.task_id}/cancel`, { method: "POST" });
+      await refresh(true);
+    }, true);
+    return el("p", { class: "muted" }, task.status === "queued" ? t`Waiting to start: ${name}.` : t`Working on it: ${name}.`, " ", cancel);
+  }
+  if (task.status === "succeeded" || task.status === "superseded") return null;
+  const dismiss = actionButton(t("Dismiss"), async () => {
+    await api("/api/notices/dismiss", { method: "POST", body: JSON.stringify({ id: task.task_id }) });
+    await refresh(true);
+  }, true);
+  const cost = task.cost === "unknown" ? t(" A model call may have been charged; it is not repeated by itself.") : "";
+  return el("p", { class: "warning" }, t`Not finished: ${name}. `, taskMessage(task), ".", cost, " ",
+    t("Use the button for it below to try again."), " ", dismiss);
+}
+
+// Frames and download links cannot send headers: the single-user page puts its token in their
+// address. V2 pages are signed in with a cookie, so the token never goes into an address there.
+function tokenQuery(separator) {
+  return MODE === "v2" ? "" : `${separator}token=${encodeURIComponent(TOKEN)}`;
+}
+
+// V2: sign out (this server's session first, then Cognito's) and delete the account.
+function accountTools() {
+  if (MODE !== "v2") return;
+  const signOut = el("button", { class: "secondary", type: "button" }, t("Sign out"));
+  signOut.addEventListener("click", () => run(async () => {
+    const { logout_url: next } = await api("/logout", { method: "POST" });
+    location.href = next;
+  }));
+  document.querySelector(".header-actions").append(signOut);
+}
+
+function accountPanel() {
+  if (MODE !== "v2") return null;
+  const remove = el("button", { class: "secondary", type: "button" }, t("Delete my account and data"));
+  remove.addEventListener("click", () => run(async () => {
+    const typed = window.prompt(t("This deletes your facts, CVs, jobs and PDFs now and cannot be undone. Backups are deleted when they expire. Type DELETE to continue."));
+    if (typed === null) return;
+    const { logout_url: next } = await api("/api/account/delete", { method: "POST", body: JSON.stringify({ confirm: typed }) });
+    location.href = next;
+  }));
+  return el("section", { class: "panel account-panel" }, el("h2", {}, t("Your account")),
+    el("p", { class: "muted" }, t("Only you can see your facts, CVs and jobs. Deleting the account removes them from this server at once.")),
+    el("div", { class: "toolbar" }, remove));
 }
 
 const routes = { facts: renderFacts, find: renderFind, jobs: renderJobs };
@@ -1000,5 +1167,6 @@ function route() {
 }
 
 I18n.mount();
+accountTools();
 window.addEventListener("hashchange", route);
 route();

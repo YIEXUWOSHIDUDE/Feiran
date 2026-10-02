@@ -27,7 +27,7 @@ from claims import LINK, NUMBER, _leadership
 from cv import CVError, _localized
 from cv_layout import original_layout, shown_sections
 from deepseek_client import DEFAULT_MODEL, DeepSeekError
-from facts import add_fact, confirm_fact, list_facts, load_current_facts, revise_fact, tag_pattern
+from facts import fact_source, tag_pattern
 from privacy import mask, private_terms, stand_ins
 
 
@@ -381,9 +381,10 @@ def find_gaps(
     """Every requirement with DeepSeek's verdict on the lines behind it, and for those nothing
     shows, at most one checked suggestion. ``cv`` is this job's CV at any stage; ``private``
     adds words requests must mask to those of the CV itself. A suggestion declined in the
-    ``previous`` check stays declined."""
+    ``previous`` check stays declined. ``facts_db`` is the single-user database or a fact
+    source (facts.fact_source)."""
     private = sorted({*private_terms(cv), *(private or ())}, key=len, reverse=True)
-    confirmed = [fact for fact in list_facts(facts_db) if fact["status"] == "confirmed"]
+    confirmed = [fact for fact in fact_source(facts_db).listed() if fact["status"] == "confirmed"]
     items, resume, other = _evidence(cv, confirmed, private)
     requirements = [
         {"requirement_id": item["id"], "text": item["text"], "strength": item.get("strength") or "unclear",
@@ -567,8 +568,10 @@ def accept_gap(
     can be repeated, so if saving stops before the caller records the gap as added, accepting
     it again finishes the job without adding anything twice; accepting a suggestion recorded as
     added writes nothing and succeeds, so a retry after a stop can finish (the caller then
-    prepares the CV again).
+    prepares the CV again). ``facts_db`` is the single-user database or a fact source whose
+    writes the caller commits together with the returned gaps and profile.
     """
+    facts = fact_source(facts_db)
     updated = copy.deepcopy(gaps)
     gap = _gap(updated, requirement_id)
     if gap["status"] == "declined":
@@ -581,16 +584,14 @@ def accept_gap(
     new_profile = None
     if suggestion["kind"] == "skill":
         fact_id = suggestion["fact_id"]
-        current = load_current_facts(facts_db, [fact_id]).get(fact_id)
+        current = facts.current([fact_id]).get(fact_id)
         if current is not None and current["text"] == suggestion["new_text"]:
             # Added before. A pending version with this text may carry other tags nobody has
             # reviewed, so it is confirmed on the Facts page, never here.
             if current["status"] != "confirmed":
                 raise ValueError("这行技能有一个尚未确认的新版本，请先在 Facts 页面核对确认，再重新检查缺口")
         elif current is not None and current["status"] == "confirmed" and current["text"] == suggestion["where"]:
-            revised, _ = revise_fact(facts_db, fact_id, text=suggestion["new_text"],
-                                     tags=[*current["tags"], *suggestion["items"]])
-            confirm_fact(facts_db, fact_id, revised["version"])
+            facts.revise_confirmed(fact_id, suggestion["new_text"], [*current["tags"], *suggestion["items"]])
         else:
             raise ValueError("这行技能已经改变，请重新检查缺口")
     else:
@@ -605,7 +606,7 @@ def accept_gap(
         # Added before, whatever skill words it was stored with (a retry after a save that
         # stopped halfway may no longer have them): nothing more to write.
         listed = profile["sections"][section]["entries"][entry].get("facts") or []
-        there = load_current_facts(facts_db, listed)
+        there = facts.current(listed)
         before = next((fact_id for fact_id in listed if (there.get(fact_id) or {}).get("text") == suggestion["text"]), None)
         if before is not None:
             if there[before]["status"] != "confirmed":
@@ -619,13 +620,11 @@ def accept_gap(
         # The fact add_fact would return for this line, if it exists already: checked before
         # anything is written, so a refused acceptance changes nothing.
         tags = sorted({tag.casefold() for tag in suggestion["tags"]})
-        same = {fact["id"] for fact in list_facts(facts_db) if fact["text"] == suggestion["text"]
+        same = {fact["id"] for fact in facts.listed() if fact["text"] == suggestion["text"]
                 and fact["fact_type"] == suggestion["fact_type"] and sorted({tag.casefold() for tag in fact["tags"]}) == tags}
         if same & elsewhere:
             raise ValueError(f"这一行已在简历的其他条目下，不在 {suggestion['where']}；请重新检查缺口")
-        fact, _ = add_fact(facts_db, suggestion["text"], suggestion["fact_type"], suggestion["tags"])
-        confirm_fact(facts_db, fact["id"], fact["version"])
-        fact_id = fact["id"]
+        fact_id = facts.add_confirmed(suggestion["text"], suggestion["fact_type"], suggestion["tags"])["id"]
         if fact_id not in (profile["sections"][section]["entries"][entry].get("facts") or []):
             new_profile = copy.deepcopy(profile)
             new_profile["sections"][section]["entries"][entry].setdefault("facts", []).append(fact_id)

@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Feiran V2 sign-in: one Cognito user pool with its managed login domain and one app client
+  for the authorization code grant with PKCE. Self sign-up is off (the pilot invites users), and
+  the app keeps its own registration switch and account limit. NOT DEPLOYED: review the change
+  set, the user pool tier's price and the email limits first (docs/v2-operations.md).
+Parameters:
+  PublicOrigin:
+    Type: String
+    AllowedPattern: '^https://[a-z0-9.-]+$'
+    Description: The address users open, e.g. https://d1234example.cloudfront.net (no trailing slash).
+  DomainPrefix:
+    Type: String
+    AllowedPattern: '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+    Description: The managed login prefix; sign-in lives at https://PREFIX.auth.REGION.amazoncognito.com.
+  HostRoleName:
+    Type: String
+    Description: The EC2 host role from the base stack; it may read this app client's secret, nothing else.
+  UserPoolTier:
+    Type: String
+    Default: LITE
+    AllowedValues: [LITE, ESSENTIALS, PLUS]
+    Description: Confirm the tier's features and price before creating (the classic hosted UI is version 1).
+  ManagedLoginVersion:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 2]
+    Description: 1 is the classic hosted UI; 2 is managed login with branding (needs ESSENTIALS or PLUS).
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UserPoolTier: !Ref UserPoolTier
+      DeletionProtection: ACTIVE
+      UsernameAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      MfaConfiguration: 'OFF'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+  Domain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref DomainPrefix
+      ManagedLoginVersion: !Ref ManagedLoginVersion
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: feiran-v2-web
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub '${PublicOrigin}/auth/callback']
+      LogoutURLs: [!Sub '${PublicOrigin}/signed-out']
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      IdTokenValidity: 15
+      AccessTokenValidity: 15
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+        RefreshToken: days
+  ReadAppClientSecret:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: feiran-v2-read-app-client
+      Roles: [!Ref HostRoleName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: cognito-idp:DescribeUserPoolClient
+            Resource: !GetAtt UserPool.Arn
+Outputs:
+  Issuer:
+    Description: WORKBENCH_OIDC_ISSUER
+    Value: !GetAtt UserPool.ProviderURL
+  UserPoolId:
+    Value: !Ref UserPool
+  ClientId:
+    Description: WORKBENCH_OIDC_CLIENT_ID
+    Value: !Ref AppClient
+  ManagedLoginDomain:
+    Description: WORKBENCH_OIDC_DOMAIN
+    Value: !Sub 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com'

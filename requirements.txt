@@ -5,5 +5,8 @@ fastapi==0.141.1
 uvicorn==0.53.0
 # Reads an uploaded CV PDF.
 pypdf==6.19.0
+# V2 sign-in: verifies Cognito's ID tokens (RS256 signatures, issuer, audience, expiry).
+PyJWT==2.15.1
+cryptography==50.0.2
 # Used by the web tests (fastapi.testclient).
 httpx2==2.13.1

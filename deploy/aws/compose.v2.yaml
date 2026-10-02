@@ -1,0 +1,23 @@
+# Feiran V2 on the EC2 host, on top of compose.yaml and deploy/aws/compose.aws.yaml (NOT IN USE
+# YET; see docs/v2-operations.md for the host changes still needed before the cloud drill):
+#
+#   docker compose -f compose.yaml -f deploy/aws/compose.aws.yaml -f deploy/aws/compose.v2.yaml up
+#
+# The same image runs web_v2.py instead of web.py: signed-in users through Cognito, one Uvicorn
+# worker with its bounded task runner. The single-owner login is not used and is never a
+# fallback. The app client's secret comes as a file the host fetched into memory (/run).
+services:
+  workbench:
+    command: ["python", "web_v2.py"]
+    environment:
+      WORKBENCH_OIDC_ISSUER: ${WORKBENCH_OIDC_ISSUER:?set WORKBENCH_OIDC_ISSUER (cognito stack output Issuer)}
+      WORKBENCH_OIDC_CLIENT_ID: ${WORKBENCH_OIDC_CLIENT_ID:?set WORKBENCH_OIDC_CLIENT_ID}
+      WORKBENCH_OIDC_DOMAIN: ${WORKBENCH_OIDC_DOMAIN:?set WORKBENCH_OIDC_DOMAIN}
+      WORKBENCH_PUBLIC_ORIGIN: ${WORKBENCH_PUBLIC_ORIGIN:?set WORKBENCH_PUBLIC_ORIGIN, e.g. https://dxxxx.cloudfront.net}
+      WORKBENCH_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+    secrets:
+      - oidc_client_secret
+
+secrets:
+  oidc_client_secret:
+    file: ${WORKBENCH_OIDC_SECRET_FILE:?set WORKBENCH_OIDC_SECRET_FILE to the host file holding the app client secret}

@@ -11,13 +11,16 @@ imported as pending for the user to read and confirm like any other.
 import hashlib
 import io
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from cv import PROFILE_VERSION, CVError, _header
 from deepseek_client import DEFAULT_MODEL, DeepSeekError
-from facts import list_facts, tag_pattern
+from facts import fact_source, tag_pattern
 from privacy import EMAIL, WEB, is_phone, mask, phones
 
 
@@ -158,6 +161,52 @@ def read_pdf(data: bytes) -> dict[str, list[Any]]:
         raise CVImportError(f"简历最多 {MAX_LINES} 行")
     links.sort(key=lambda link: link["at"])
     return {"lines": lines, "links": [{key: link[key] for key in ("url", "pieces", "context")} for link in links]}
+
+
+PARSE_SECONDS = 20
+PARSE_MEMORY_BYTES = 768 * 1024 * 1024
+_CHILD = "import cv_import; cv_import._read_pdf_child()"
+
+
+def read_pdf_limited(data: bytes, timeout: float = PARSE_SECONDS) -> dict[str, list[Any]]:
+    """read_pdf in a separate process that is stopped after ``timeout`` seconds and may use only
+    so much CPU time and memory, so a crafted PDF cannot tie up the server. The child gets no
+    secrets: only PATH is passed on."""
+    if len(data) > MAX_PDF_BYTES:
+        raise CVImportError(f"PDF 不能超过 {MAX_PDF_BYTES // 1_000_000} MB")
+    try:
+        finished = subprocess.run([sys.executable, "-c", _CHILD], input=data, capture_output=True, timeout=timeout,
+                                  cwd=Path(__file__).parent, env={"PATH": os.environ.get("PATH", ""),
+                                                                   "PYTHONDONTWRITEBYTECODE": "1"})
+    except subprocess.TimeoutExpired:
+        raise CVImportError("读取这个 PDF 用时过长；请上传普通的文字版 PDF") from None
+    try:
+        answer = json.loads(finished.stdout)
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict) or ("ok" not in answer and "error" not in answer):
+        raise CVImportError("无法读取这个 PDF")
+    if "error" in answer:
+        raise CVImportError(str(answer["error"])[:300])
+    return answer["ok"]
+
+
+def _read_pdf_child() -> None:
+    """The child's side of read_pdf_limited: PDF bytes on stdin, one JSON answer on stdout."""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (PARSE_SECONDS, PARSE_SECONDS))
+        if sys.platform.startswith("linux"):  # macOS does not enforce an address-space limit
+            resource.setrlimit(resource.RLIMIT_AS, (PARSE_MEMORY_BYTES, PARSE_MEMORY_BYTES))
+    except (ImportError, ValueError, OSError):
+        pass
+    try:
+        answer: dict[str, Any] = {"ok": read_pdf(sys.stdin.buffer.read(MAX_PDF_BYTES + 1))}
+    except CVImportError as exc:
+        answer = {"error": str(exc)}
+    except BaseException:  # MemoryError and the like: say nothing more
+        answer = {"error": "无法读取这个 PDF"}
+    sys.stdout.write(json.dumps(answer, ensure_ascii=False))
 
 
 def _compact(text: str) -> str:
@@ -580,11 +629,13 @@ def build_profile(
     proposal: dict[str, Any], contact: dict[str, Any], facts_db: Path
 ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
     """The CV profile for a reviewed upload, the new facts to import as pending, and how many
-    lines reuse a fact already stored with exactly the same text."""
+    lines reuse a fact already stored with exactly the same text. ``facts_db`` is the
+    single-user database or one user's fact source (facts.fact_source)."""
     known: dict[str, str] = {}
     stored: set[str] = set()
-    if Path(facts_db).exists():
-        for fact in list_facts(facts_db):
+    facts = fact_source(facts_db)
+    if facts.available():
+        for fact in facts.listed():
             known.setdefault(fact["text"], fact["id"])
             stored.add(fact["id"])
     items: list[dict[str, Any]] = []
