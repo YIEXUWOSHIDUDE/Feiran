@@ -1,6 +1,6 @@
 # Feiran V2 运维与云端演练清单
 
-> 本文只列可审阅的操作步骤，不记录进度；结果、未验证项和阻塞只写在 [v2-plan.md](v2-plan.md)。截至 2026-10-02，已只读核对现有 AWS 栈，**V2 尚未创建云资源或部署**。用户已授权推进隔离试运行；新增费用、IAM 授权、邀请邮件、真实资料迁移和收费模型调用按实际授权范围执行。本文本身不扩大用户授权。
+> 本文只列可审阅的操作步骤，不记录进度；结果、未验证项和阻塞只写在 [v2-plan.md](v2-plan.md)。2026-10-02 已按用户授权创建隔离试运行的基础、HTTPS 和 Cognito 栈；应用启动及登录验收结果见 v2-plan.md §18。用户将用途收窄为求职作品展示，初始只开放管理员创建的测试身份；邀请邮件、真实资料迁移和收费模型调用仍未授权。本文本身不扩大用户授权。
 
 ## 1. 执行前要拿到的授权与费用决定
 
@@ -62,7 +62,7 @@ aws cloudformation execute-change-set --region "$AWS_REGION" --stack-name feiran
 aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name feiran-v2-auth --query 'Stacks[0].Outputs'
 ```
 
-模板要点：只允许管理员建用户（无自助注册），邮箱为用户名且大小写不敏感，授权码流程 + `openid email`，回调 `${PublicOrigin}/auth/callback`、退出 `${PublicOrigin}/signed-out`，ID/访问令牌 15 分钟（应用自己的服务端会话最长 12 小时、空闲 2 小时）。应用另有注册开关与账户上限，所以即便以后放开 Cognito 自助注册，未开启应用注册时新身份也进不来。模板本地已过 `cfn-lint`，未在 AWS 上创建过。
+模板要点：只允许管理员建用户（无自助注册），邮箱为用户名且大小写不敏感，授权码流程 + `openid email`，回调 `${PublicOrigin}/auth/callback`、退出 `${PublicOrigin}/signed-out`，ID/访问令牌 15 分钟（应用自己的服务端会话最长 12 小时、空闲 2 小时）。应用另有注册开关与账户上限，所以即便以后放开 Cognito 自助注册，未开启应用注册时新身份也进不来。模板已通过 `cfn-lint`，并在隔离试运行栈中创建成功；创建成功不等于真实登录验收通过。
 
 ## 4. 启动与试点设置（G3/G4，先只用合成账号）
 
