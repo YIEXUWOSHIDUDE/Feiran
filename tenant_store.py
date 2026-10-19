@@ -11,11 +11,17 @@ versions, approvals, final PDFs, tasks and quotas. Existing rule modules (cv, ga
 requirement_flow, cv_import) keep producing their JSON documents; this store keeps them as
 versioned payloads and never rewrites their rules. This store never opens or migrates the V1
 database; v2_migrate.py is the explicit offline path.
+
+Sponsor answers (sponsorship.py) are worked out when words are saved: a public board read, a
+user's saved job, the user's explicit check or backfill_sponsorship. Reading a page only reads
+them. Format 3 has grown only by such added tables, which a release from before them ignores;
+upgrade_store adds them to a store that release made.
 """
 
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -24,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+import sponsorship
 from cv import (CVError, approve_draft, build_draft_from_facts, content_fingerprint, is_final_approval,
                 profile_fact_ids, profile_languages, verify_draft)
 from cv_import import build_profile
@@ -363,10 +370,41 @@ CREATE TABLE request_keys (
     PRIMARY KEY(user_id, operation, request_key)
 );
 """
+# Added after format 3 was in use, so only as new tables (upgrade_store). A change to an
+# existing table would need a new SCHEMA_VERSION and an explicit migration instead.
+SPONSOR_TABLES = ("public_sponsor_assessments", "user_sponsor_assessments")
+SPONSOR_SCHEMA = (
+    # What the rules of rule_version found in the words of public postings, shared by everyone
+    # following a board that lists them: keyed by the exact words (their sha256, as
+    # public_postings.text_hash), never by a link. Where and when each posting was read stays
+    # with the posting.
+    """CREATE TABLE IF NOT EXISTS public_sponsor_assessments (
+    text_sha256 TEXT NOT NULL,
+    rule_version INTEGER NOT NULL CHECK(rule_version > 0),
+    status TEXT NOT NULL CHECK(status IN ('supported', 'not_supported', 'conditional', 'unknown', 'conflicting')),
+    evidence TEXT NOT NULL,
+    assessed_at TEXT NOT NULL,
+    PRIMARY KEY(text_sha256, rule_version)
+)""",
+    # The same for the words of one user's saved jobs (pasted, or read for them): never shared.
+    """CREATE TABLE IF NOT EXISTS user_sponsor_assessments (
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    text_sha256 TEXT NOT NULL,
+    rule_version INTEGER NOT NULL CHECK(rule_version > 0),
+    status TEXT NOT NULL CHECK(status IN ('supported', 'not_supported', 'conditional', 'unknown', 'conflicting')),
+    evidence TEXT NOT NULL,
+    assessed_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, text_sha256, rule_version)
+)""",
+)
+SPONSOR_BATCH = 50  # public texts assessed per short write transaction
+# Where a backfill round stopped: the last public words (by their hash) or saved job it worked on.
+_BACKFILL_POSITION = re.compile(r"public:([0-9a-f]{64})|private:([^:\s]+):([^:\s]+)")
 # Every table holding one user's rows, children before parents: deleting an account goes in this order.
 USER_TABLES = ("artifacts", "approvals", "material_facts", "materials", "job_gaps", "job_notes",
                "job_requirements", "jobs", "profile_facts", "profile_versions", "profiles", "fact_versions",
-               "facts", "uploads", "posting_matches", "followed_boards", "tasks", "request_keys", "sessions")
+               "facts", "uploads", "posting_matches", "user_sponsor_assessments", "followed_boards", "tasks",
+               "request_keys", "sessions")
 
 
 def _clock() -> datetime:
@@ -445,7 +483,8 @@ def _connect(path: Path) -> sqlite3.Connection:
 
 
 def initialize_store(path: Path) -> None:
-    """Create a new private V2 database, or verify an existing V2 database.
+    """Create a new private V2 database, or verify an existing V2 database and add the tables
+    this release keeps beside it (upgrade_store).
 
     Refuse legacy/unknown schemas and links without changing them. This is deliberately
     explicit: opening a user workspace cannot create an empty store after a missing mount.
@@ -455,8 +494,8 @@ def initialize_store(path: Path) -> None:
     if path.is_symlink():
         raise StoreError("A V2 store cannot be a symbolic link")
     if path.exists():
-        with transaction(path):
-            return
+        upgrade_store(path)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
@@ -466,11 +505,37 @@ def initialize_store(path: Path) -> None:
         connection.execute('PRAGMA foreign_keys = ON')
         settings = "".join(f"\nINSERT INTO settings VALUES ('{key}', '{value}');"
                            for key, value in DEFAULT_SETTINGS.items())
-        connection.executescript('BEGIN IMMEDIATE;\n' + SCHEMA + settings +
+        added = "".join(f"\n{statement};" for statement in SPONSOR_SCHEMA)
+        connection.executescript('BEGIN IMMEDIATE;\n' + SCHEMA + added + settings +
                                  f'\nPRAGMA application_id = {APPLICATION_ID};'
                                  f'\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;')
     finally:
         connection.close()
+
+
+def _add_sponsor_tables(connection: sqlite3.Connection) -> None:
+    for statement in SPONSOR_SCHEMA:
+        connection.execute(statement)
+
+
+def upgrade_store(path: Path) -> list[str]:
+    """Bring a format-3 store an earlier release made up to this release, as often as it is run:
+    add the tables it lacks (never changing or rebuilding one it has) and drop private sponsor
+    answers of accounts deleted by a release that did not know them. Returns the tables added.
+    Nothing is assessed here: words saved before stay "not assessed" until a board refresh, the
+    user's explicit check, or backfill_sponsorship."""
+    with transaction(path) as connection:
+        present = {row['name'] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        orphaned = 'user_sponsor_assessments' in present and connection.execute(
+            '''SELECT 1 FROM user_sponsor_assessments s JOIN users u ON u.user_id = s.user_id
+               WHERE u.deleted_at IS NOT NULL LIMIT 1''').fetchone() is not None
+    missing = [name for name in SPONSOR_TABLES if name not in present]
+    if missing or orphaned:
+        with transaction(path, write=True) as connection:
+            _add_sponsor_tables(connection)
+            connection.execute('''DELETE FROM user_sponsor_assessments
+                WHERE user_id IN (SELECT user_id FROM users WHERE deleted_at IS NOT NULL)''')
+    return missing
 
 
 @contextmanager
@@ -702,6 +767,7 @@ def read_deletions(ledger: Path) -> list[dict[str, str]]:
 def _purge_user(connection: sqlite3.Connection, record: dict[str, str]) -> None:
     """Delete one account's private rows and leave its tombstone (inside the caller's transaction)."""
     user_id = record["user_id"]
+    _add_sponsor_tables(connection)  # a store restored from before them has none to name yet
     for table in USER_TABLES:
         connection.execute(f'DELETE FROM {table} WHERE user_id = ?', (user_id,))
     connection.execute("DELETE FROM quota_usage WHERE scope = ?", (user_id,))
@@ -1204,7 +1270,8 @@ class UserWorkspace:
         job as first captured: when it was captured (``captured_at``, the server's clock) is not
         part of what was asked, so a resend is never a new capture. Different words under the
         same request ID are refused, unless ``first_capture_wins`` (a task re-reading a posting
-        on a retry: the job it made the first time is its job)."""
+        on a retry: the job it made the first time is its job). The saved words' sponsor wording
+        is assessed here, once; a resend that finds them unassessed (the rules failed) tries again."""
         snapshot = _jd_snapshot(jd)
         payload = _json(snapshot)
         existing = connection.execute('SELECT * FROM jobs WHERE user_id = ? AND request_id = ?',
@@ -1214,11 +1281,70 @@ class UserWorkspace:
                 return {key: value for key, value in stored.items() if key != 'captured_at'}
             if not first_capture_wins and asked(json.loads(existing['payload'])) != asked(snapshot):
                 raise Conflict("Request key was used for a different JD")
-            return self._job(connection, existing['job_id'])
-        job_id = secrets.token_hex(16)
-        connection.execute('INSERT INTO jobs VALUES (?, ?, ?, ?, ?)',
-                           (self.user_id, job_id, request_id, payload, _now()))
-        return self._job(connection, job_id)
+            job = self._job(connection, existing['job_id'])
+        else:
+            job_id = secrets.token_hex(16)
+            connection.execute('INSERT INTO jobs VALUES (?, ?, ?, ?, ?)',
+                               (self.user_id, job_id, request_id, payload, _now()))
+            job = self._job(connection, job_id)
+        self._assess_saved_text(connection, job['jd'].get('text'))
+        return job
+
+    def _assess_saved_text(self, connection: sqlite3.Connection, text: Any) -> str:
+        """Make sure words of this user's saved jobs have a sponsor answer under the current rules,
+        inside the caller's write transaction. Returns 'stored' (one was there), 'shared',
+        'assessed' or 'failed' (nothing stored; a later check tries again).
+
+        Words that a board this user follows lists right now are public words with one shared
+        answer, which is copied (it is one the user can already see). When the board's own
+        assessment has not run yet, the shared answer is made here from that stored public
+        posting's words, never from what the user sent, so each public text is still assessed
+        once however many followers save it meanwhile. Other words are assessed for this user
+        alone, and nothing of theirs is written where another user could read it."""
+        if not isinstance(text, str):
+            return 'failed'
+        digest, version = hashlib.sha256(text.encode('utf-8')).hexdigest(), sponsorship.RULE_VERSION
+        if connection.execute('''SELECT 1 FROM user_sponsor_assessments WHERE user_id = ? AND text_sha256 = ?
+                AND rule_version = ?''', (self.user_id, digest, version)).fetchone():
+            return 'stored'
+        public = connection.execute('''SELECT p.text FROM public_postings p JOIN followed_boards f
+            ON f.provider = p.provider AND f.board = p.board WHERE f.user_id = ? AND p.text_hash = ? LIMIT 1''',
+                                    (self.user_id, digest)).fetchone()
+        if public is not None:
+            shared = connection.execute('''SELECT status, evidence, assessed_at FROM public_sponsor_assessments
+                WHERE text_sha256 = ? AND rule_version = ?''', (digest, version)).fetchone()
+            outcome = 'shared' if shared is not None else 'assessed'
+            answer = tuple(shared) if shared is not None else _answer_public_text(connection, digest, public['text'])
+            if answer is None:
+                return 'failed'
+        else:
+            made = _sponsor_answer(text)
+            if made is None:
+                return 'failed'
+            answer, outcome = (*made, _now()), 'assessed'
+        connection.execute('INSERT INTO user_sponsor_assessments VALUES (?, ?, ?, ?, ?, ?)',
+                           (self.user_id, digest, version, *answer))
+        connection.execute('''DELETE FROM user_sponsor_assessments WHERE user_id = ? AND text_sha256 = ?
+            AND rule_version != ?''', (self.user_id, digest, version))  # older rules' answer, replaced
+        return outcome
+
+    def _saved_answer(self, connection: sqlite3.Connection, text: Any) -> dict[str, Any] | None:
+        """This user's stored sponsor answer for saved words under the current rules, or None."""
+        if not isinstance(text, str):
+            return None
+        return _answer(connection.execute('''SELECT status, evidence, rule_version, assessed_at
+            FROM user_sponsor_assessments WHERE user_id = ? AND text_sha256 = ? AND rule_version = ?''',
+                                          (self.user_id, hashlib.sha256(text.encode('utf-8')).hexdigest(),
+                                           sponsorship.RULE_VERSION)).fetchone())
+
+    def assess_job_sponsorship(self, job_id: str) -> str:
+        """The user's explicit check of one saved job's sponsor wording: for a job saved before
+        answers were kept, after a check that failed, or once the rules changed. Words that have
+        an answer under the current rules are not assessed again, so repeating it changes
+        nothing. Returns what _assess_saved_text did."""
+        with self._transaction(write=True) as connection:
+            job = self._job(connection, _text(job_id, 'job_id'))
+            return self._assess_saved_text(connection, job['jd'].get('text'))
 
     def create_job(self, jd: Any, *, request_id: str) -> dict:
         """Save an immutable JD snapshot; retry only repeats the same user request.
@@ -1231,7 +1357,7 @@ class UserWorkspace:
             return self._new_job(connection, jd, request_id)
 
     def paste_job(self, jd: Any, *, request_id: str, key: str | None, input_sha256: str, units: int,
-                  consent: str | None) -> dict[str, Any]:
+                  consent: str | None, review_only: bool = False) -> dict[str, Any]:
         """Save a job the user pasted and queue the work that finds its requirements, in one
         transaction. ``request_id`` names the pasted words: sending them again (a resend after a
         lost answer, or the same paste later) finds the same job as first captured, and the work
@@ -1247,6 +1373,8 @@ class UserWorkspace:
             self._bind_request(connection, 'paste_job', key, input_sha256)
             job = self._new_job(connection, jd, request_id)
             job_id = job['job_id']
+            if review_only:
+                return {'job': job, 'task': None, 'refused': None}
             if self._requirements(connection, job_id) is not None:
                 return {'job': job, 'task': None, 'refused': None}
             ongoing = connection.execute("""SELECT * FROM tasks WHERE user_id = ? AND operation = 'prepare_job'
@@ -1783,8 +1911,9 @@ class UserWorkspace:
     def job_snapshot(self, job_id: str) -> dict[str, Any]:
         """The job, its requirements, notes, the current CV per language (with the draft it grew
         from, whether its inputs are current and its approval and final PDF, if still valid),
-        the latest gap check, confirmed facts and this job's recent tasks, from one transaction,
-        so they agree with each other."""
+        the latest gap check, confirmed facts, the stored sponsor answer for the job's words
+        (None when not assessed: nothing is assessed while reading) and this job's recent tasks,
+        from one transaction, so they agree with each other."""
         with self._transaction() as connection:
             job = self._job(connection, _text(job_id, 'job_id'))
             cvs = {}
@@ -1809,6 +1938,8 @@ class UserWorkspace:
                     'final_pdf': bool(artifact), 'pages': artifact['pages'] if artifact else None,
                 }
             return {
+                'facts': self._list_facts(connection),
+                'sponsorship': self._saved_answer(connection, job['jd'].get('text')),
                 'job': job, 'requirements': self._requirements(connection, job_id),
                 'notes': {name: self._note(connection, job_id, name) for name in NOTE_NAMES},
                 'cv': cvs, 'cv_languages': self._languages(connection), 'gaps': self._gaps(connection, job_id),
@@ -1905,17 +2036,21 @@ class UserWorkspace:
 
     def ranking_rows(self, terms: list[str], find: Callable[[str], list[str]]) -> list[dict[str, Any]]:
         """Public postings of the boards this user follows, each with the user's confirmed skill
-        words it mentions. Matches are this user's own cache: redone for a posting whose text
-        changed or when the user's confirmed skills change; never shared with another user."""
+        words it mentions and the stored sponsor answer for its words (read only: one not yet
+        assessed shows as such). Matches are this user's own cache: redone for a posting whose
+        text changed or when the user's confirmed skills change; never shared with another user."""
         key = hashlib.sha256(json.dumps(terms, ensure_ascii=False).encode("utf-8")).hexdigest()
         with self._transaction() as connection:
             rows = connection.execute('''SELECT p.provider, p.board, p.job_id, p.title, p.location, p.source,
                        p.posted_at, p.text, p.text_hash, p.last_seen_at, f.company,
-                       m.terms_key, m.text_hash AS matched_hash, m.matched_tags
+                       m.terms_key, m.text_hash AS matched_hash, m.matched_tags,
+                       s.status, s.evidence, s.rule_version, s.assessed_at
                 FROM followed_boards f JOIN public_postings p ON p.provider = f.provider AND p.board = f.board
                 LEFT JOIN posting_matches m ON m.user_id = f.user_id AND m.provider = p.provider
                      AND m.board = p.board AND m.job_id = p.job_id
-                WHERE f.user_id = ? ORDER BY p.provider, p.board, p.job_id''', (self.user_id,)).fetchall()
+                LEFT JOIN public_sponsor_assessments s ON s.text_sha256 = p.text_hash AND s.rule_version = ?
+                WHERE f.user_id = ? ORDER BY p.provider, p.board, p.job_id''',
+                                      (sponsorship.RULE_VERSION, self.user_id)).fetchall()
         # Matching runs outside any transaction; only the new matches are written, in one short one.
         result, found = [], []
         for row in rows:
@@ -1928,7 +2063,9 @@ class UserWorkspace:
                                                                           row['job_id'], row['text_hash']))
             result.append({**{name: row[name] for name in ('provider', 'board', 'job_id', 'title', 'location',
                                                             'source', 'posted_at', 'text_hash', 'last_seen_at',
-                                                            'company')}, 'matched': matched})
+                                                            'company')}, 'matched': matched,
+                           'sponsorship': sponsorship.shown(_answer(row if row['status'] else None),
+                                                            source=row['source'], captured_at=row['last_seen_at'])})
         if found:
             with self._transaction(write=True) as connection:
                 # A posting replaced or closed meanwhile is skipped: its match would describe other text.
@@ -2014,7 +2151,7 @@ class UserWorkspace:
 
     def submit_task(self, operation: str, *, key: str, request: dict, units: int, heavy: str,
                     job_id: str | None = None, consent: str | None = None, context: dict | None = None,
-                    bind: bool = False) -> dict:
+                    bind: bool = False, bind_operation: str | None = None) -> dict:
         """Queue heavy work (model calls, with any page read they need, or a PDF) for the task runner.
 
         ``request`` is what the client asked for and names the request together with the key;
@@ -2031,7 +2168,7 @@ class UserWorkspace:
         """
         with self._transaction(write=True) as connection:
             if bind:  # ``key`` is the page's request key: bound with the task; a refusal rolls both back
-                self._bind_request(connection, operation, key, input_digest(request))
+                self._bind_request(connection, bind_operation or operation, key, input_digest(request))
             return self._submit_task(connection, operation, key=key, request=request, units=units, heavy=heavy,
                                      job_id=job_id, consent=consent, context=context)
 
@@ -2133,6 +2270,8 @@ class UserWorkspace:
 def _reserve(connection: sqlite3.Connection, user_id: str, units: int, settings: dict[str, str]) -> str:
     """Reserve today's units for a user and the whole site, or refuse: quotas must be set."""
     day = _today()
+    if units == 0:  # Public job reads use the bounded queue without reserving paid work.
+        return day
     user_limit, site_limit = _positive(settings.get("user_daily_units")), _positive(settings.get("site_daily_units"))
     if user_limit is None or site_limit is None:
         raise Refused("Daily limits are not configured, so no work can start", "quota_unconfigured")
@@ -2255,30 +2394,182 @@ def _refs(values: Any) -> list[tuple[str, int]]:
 
 
 # ---------------------------------------------------------------------------------------------
+# Sponsor answers: worked out when words are saved (a user's own in _assess_saved_text), and
+# only ever read by pages
+
+def _answer(row: Any) -> dict[str, Any] | None:
+    """A stored sponsor answer as sponsorship.shown takes it."""
+    if row is None:
+        return None
+    return {"status": row['status'], "evidence": json.loads(row['evidence']), "rule_version": row['rule_version'],
+            "assessed_at": row['assessed_at']}
+
+
+def _sponsor_answer(text: Any) -> tuple[str, str] | None:
+    """The current rules' (status, evidence JSON) for ``text``, or None if they failed or gave
+    something that is not an answer: then nothing is stored, the words stay not assessed and a
+    later refresh, explicit check or backfill tries again. A failure is never stored as one."""
+    if not isinstance(text, str):
+        return None
+    try:
+        status, evidence = sponsorship.checked(text, sponsorship.assess_sponsorship(text))
+        return status, _json(evidence)
+    except Exception:  # whatever went wrong in the rules, these words simply have no answer yet
+        return None
+
+
+def _answer_public_text(connection: sqlite3.Connection, digest: str, text: str) -> tuple[str, str, str] | None:
+    """Assess the words of a stored public posting and save their shared answer, replacing any
+    of older rules, in the caller's write transaction (which has found none under the current
+    rules). Returns (status, evidence JSON, assessed_at), or None when the rules failed or the
+    words are not the ones ``digest`` names: then nothing is saved."""
+    if hashlib.sha256(text.encode('utf-8')).hexdigest() != digest:
+        return None  # an answer is only ever kept for the words it read
+    made = _sponsor_answer(text)
+    if made is None:
+        return None
+    answer, version = (*made, _now()), sponsorship.RULE_VERSION
+    connection.execute('INSERT INTO public_sponsor_assessments VALUES (?, ?, ?, ?, ?)', (digest, version, *answer))
+    connection.execute('DELETE FROM public_sponsor_assessments WHERE text_sha256 = ? AND rule_version != ?',
+                       (digest, version))
+    return answer
+
+
+def _assess_public(path: Path, hashes: Iterable[str]) -> dict[str, int]:
+    """Assess, under the current rules, the words of public postings named by ``hashes`` that
+    have no answer yet. Those already answered are found by reading alone, so an unchanged board
+    takes no write lock. The rest go in batches, each looked up again, assessed and saved inside
+    one short write transaction, so two reads of a board at once (or of two boards listing the
+    same words) assess each text once: the later waits, then finds the answer saved. Holding
+    the write lock while assessing is right only for these local rules (well under a
+    millisecond for a typical description); a paid model call must run outside any transaction,
+    as tasks do."""
+    version, wanted = sponsorship.RULE_VERSION, list(dict.fromkeys(hashes))
+    answered: set[str] = set()
+    with transaction(path) as connection:  # usually all are answered: then nothing takes the write lock
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            answered.update(row[0] for row in connection.execute(
+                f'''SELECT text_sha256 FROM public_sponsor_assessments WHERE rule_version = ?
+                    AND text_sha256 IN ({", ".join("?" * len(part))})''', (version, *part)))
+    pending = [digest for digest in wanted if digest not in answered]
+    counts = {"assessed": 0, "failed": 0}
+    for start in range(0, len(pending), SPONSOR_BATCH):
+        batch = pending[start:start + SPONSOR_BATCH]
+        with transaction(path, write=True) as connection:
+            rows = connection.execute(f'''SELECT text_hash, text FROM public_postings
+                WHERE text_hash IN ({", ".join("?" * len(batch))}) AND text_hash NOT IN (
+                    SELECT text_sha256 FROM public_sponsor_assessments WHERE rule_version = ?)
+                GROUP BY text_hash''', (*batch, version)).fetchall()
+            for row in rows:
+                answered_now = _answer_public_text(connection, row['text_hash'], row['text']) is not None
+                counts["assessed" if answered_now else "failed"] += 1
+    return counts
+
+
+def backfill_sponsorship(path: Path, *, limit: int, after: str | None = None) -> dict[str, Any]:
+    """Work on at most ``limit`` saved texts that have no sponsor answer under the current rules,
+    in one fixed order: public postings by their words' hash, then active accounts' saved jobs by
+    account and job. For a store from before answers were kept, or after the rules changed.
+
+    ``next`` in the result names where this round stopped while texts remain after it: given
+    back as ``after``, the next round goes on from there, so a text that keeps failing never
+    holds up those behind it. ``next`` is None once a round reaches the end; a round from the
+    start (no ``after``) then tries the failed ones again. Every round stays within its limit,
+    and an answer once stored is never worked out again. The rules are local: no model is
+    called and nothing leaves the store. Returns counts and that position only."""
+    if type(limit) is not int or limit < 0:
+        raise StoreError("The limit must be a whole number of 0 or more")
+    begin: tuple = ()
+    if after is not None:
+        position = _BACKFILL_POSITION.fullmatch(after) if isinstance(after, str) else None
+        if position is None:
+            raise StoreError("Not a position a sponsorship backfill gave")
+        begin = (0, position[1]) if position[1] else (1, position[2], position[3])
+    version = sponsorship.RULE_VERSION
+    with transaction(path) as connection:
+        public = [row[0] for row in connection.execute('''SELECT DISTINCT text_hash FROM public_postings
+            WHERE text_hash NOT IN (SELECT text_sha256 FROM public_sponsor_assessments WHERE rule_version = ?)''',
+                                                       (version,))]
+        stored = {(row[0], row[1]) for row in connection.execute(
+            'SELECT user_id, text_sha256 FROM user_sponsor_assessments WHERE rule_version = ?', (version,))}
+        private: list[tuple[str, str]] = []
+        for row in connection.execute('''SELECT j.user_id, j.job_id, json_extract(j.payload, '$.text') AS text
+                FROM jobs j JOIN users u ON u.user_id = j.user_id WHERE u.active = 1
+                ORDER BY j.user_id, j.job_id'''):
+            if isinstance(row['text'], str):
+                key = (row['user_id'], hashlib.sha256(row['text'].encode('utf-8')).hexdigest())
+                if key not in stored:
+                    stored.add(key)  # one job per user's words is enough
+                    private.append((row['user_id'], row['job_id']))
+    queue = sorted([(0, digest) for digest in public] + [(1, user_id, job_id) for user_id, job_id in private])
+    waiting = [key for key in queue if key > begin]
+    chosen = waiting[:limit]
+    done = _assess_public(path, [key[1] for key in chosen if key[0] == 0])
+    outcomes = {"assessed": 0, "shared": 0, "stored": 0, "failed": 0, "skipped": 0}
+    for _, user_id, job_id in (key for key in chosen if key[0] == 1):
+        try:
+            outcomes[UserWorkspace(path, user_id).assess_job_sponsorship(job_id)] += 1
+        except NotFound:  # the account was disabled or deleted meanwhile
+            outcomes["skipped"] += 1
+    last = chosen[-1] if chosen and len(waiting) > len(chosen) else None
+    return {"rule_version": version,
+            "public": {**done, "remaining": len(public) - done["assessed"]},
+            "private": {"assessed": outcomes["assessed"], "shared": outcomes["shared"], "failed": outcomes["failed"],
+                        "skipped": outcomes["skipped"],
+                        "remaining": len(private) - outcomes["assessed"] - outcomes["shared"] - outcomes["stored"]},
+            "next": None if last is None else f"public:{last[1]}" if last[0] == 0 else f"private:{last[1]}:{last[2]}"}
+
+
+# ---------------------------------------------------------------------------------------------
 # The shared public job-board cache (public data only; never user text)
 
 def store_public_board(path: Path, provider: str, board: str, company: str, postings: list[dict[str, Any]]) -> dict:
     """Replace one public board's postings with what its public API lists now. Only postings
-    read from a board's public API come here: never pasted text, CVs or anything of a user's."""
+    read from a board's public API come here: never pasted text, CVs or anything of a user's.
+
+    Then the sponsor wording of words without an answer under the current rules is assessed
+    (_assess_public). Words read again unchanged keep their answer and when it was made; only
+    the posting's last_seen_at moves. Changed words get an answer of their own, and answers for
+    words no posting lists any more go."""
     now = _now()
+    hashes = [hashlib.sha256(job["text"].encode("utf-8")).hexdigest() for job in postings]
     with transaction(path, write=True) as connection:
         connection.execute('''INSERT INTO public_boards VALUES (?, ?, ?, ?) ON CONFLICT(provider, board)
             DO UPDATE SET company = excluded.company, fetched_at = excluded.fetched_at''', (provider, board, company, now))
-        before = {row['job_id'] for row in connection.execute(
-            'SELECT job_id FROM public_postings WHERE provider = ? AND board = ?', (provider, board))}
-        for job in postings:
+        before = {row['job_id']: row['text_hash'] for row in connection.execute(
+            'SELECT job_id, text_hash FROM public_postings WHERE provider = ? AND board = ?', (provider, board))}
+        for job, digest in zip(postings, hashes):
             connection.execute('''INSERT INTO public_postings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider, board, job_id) DO UPDATE SET title = excluded.title, location = excluded.location,
                 source = excluded.source, posted_at = excluded.posted_at, text = excluded.text,
                 text_hash = excluded.text_hash, last_seen_at = excluded.last_seen_at''',
                                (provider, board, job["job_id"], job["title"], job.get("location"), job["source"],
-                                job.get("posted_at"), job["text"],
-                                hashlib.sha256(job["text"].encode("utf-8")).hexdigest(), now, now))
+                                job.get("posted_at"), job["text"], digest, now, now))
         listed = {job["job_id"] for job in postings}
-        for job_id in before - listed:  # no longer on the board: closed (their matches go with them)
+        for job_id in before.keys() - listed:  # no longer on the board: closed (their matches go with them)
             connection.execute('DELETE FROM public_postings WHERE provider = ? AND board = ? AND job_id = ?',
                                (provider, board, job_id))
-        return {"open": len(listed), "new": len(listed - before), "closed": len(before - listed)}
+        dropped = sorted(set(before.values()) - set(hashes))
+        for start in range(0, len(dropped), 500):
+            part = dropped[start:start + 500]
+            connection.execute(f'''DELETE FROM public_sponsor_assessments WHERE text_sha256 IN ({", ".join("?" * len(part))})
+                AND text_sha256 NOT IN (SELECT text_hash FROM public_postings)''', part)
+        counts = {"open": len(listed), "new": len(listed - before.keys()), "closed": len(before.keys() - listed)}
+    return {**counts, "sponsorship": _assess_public(path, hashes)}
+
+
+def assess_public_board(path: Path, provider: str, board: str) -> dict[str, int]:
+    """Assess the words of one stored board's postings that have no answer under the current
+    rules (an earlier failure, or older rules), without reading the board again: a refresh
+    answered from the shared copy still retries them. Usually there are none and nothing is
+    written."""
+    with transaction(path) as connection:
+        hashes = [row[0] for row in connection.execute('''SELECT DISTINCT text_hash FROM public_postings
+            WHERE provider = ? AND board = ? AND text_hash NOT IN (
+                SELECT text_sha256 FROM public_sponsor_assessments WHERE rule_version = ?)''',
+                                                       (provider, board, sponsorship.RULE_VERSION))]
+    return _assess_public(path, hashes)
 
 
 def public_board_age(path: Path, provider: str, board: str) -> tuple[str | None, timedelta | None, int]:
@@ -2338,6 +2629,8 @@ def mark_spending(path: Path, user_id: str, task_id: str, token: str, stage: str
     LateResult, so no call is made for it."""
     with transaction(path, write=True) as connection:
         row = _running_task(connection, user_id, task_id, token)
+        if row['units'] == 0:
+            raise StoreError("This task does not allow paid calls")
         state = _usage_state(row['usage'])
         state["calls"] += 1
         state["open_calls"] += 1

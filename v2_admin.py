@@ -1,12 +1,13 @@
 """Operator commands for V2's data folder, run beside the app (on the host, in the released image).
 
-    python v2_admin.py settings --data /data
-    python v2_admin.py set user_daily_units 40 --data /data
-    python v2_admin.py accounts --data /data [--subject COGNITO_SUB]
-    python v2_admin.py disable USER_ID --data /data
-    python v2_admin.py enable USER_ID --data /data
-    python v2_admin.py delete USER_ID --confirm USER_ID --data /data
-    python v2_admin.py usage --data /data [--day 2026-10-01]
+    python v2_admin.py --data /data settings
+    python v2_admin.py --data /data set user_daily_units 40
+    python v2_admin.py --data /data accounts [--subject COGNITO_SUB]
+    python v2_admin.py --data /data disable USER_ID
+    python v2_admin.py --data /data enable USER_ID
+    python v2_admin.py --data /data delete USER_ID --confirm USER_ID
+    python v2_admin.py --data /data usage [--day 2026-10-01]
+    python v2_admin.py --data /data sponsorship [--limit 500] [--after NEXT]
 
 Nothing here signs anyone in or creates an account: an account belongs to one Cognito identity
 (issuer and subject) and is made by its first verified sign-in, only while registration is open
@@ -16,6 +17,13 @@ queued and running tasks; a model call already under way may still be billed. De
 the account's data and keeps a tombstone in the database and in the deletion ledger beside it
 (written first), so neither signing in again nor restoring an older backup reopens it. Output
 names accounts by internal ID and Cognito subject only, never by CV content.
+
+sponsorship works, with the local rules, on at most --limit saved texts that have no sponsor
+answer under the current rules (postings and jobs saved before answers were kept, or after the
+rules changed), and prints counts and "next". While "next" is not null, run it again with
+--after set to that value: each round goes on where the last stopped, so a text that keeps
+failing cannot hold up the others. Once "next" is null, a round without --after tries the
+failed ones again. What is stored is never assessed again, and pages never assess anything.
 """
 
 import argparse
@@ -45,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     delete.add_argument("--confirm", required=True, help="the same user ID again")
     usage = commands.add_parser("usage", help="units reserved on one day (UTC), site and per account")
     usage.add_argument("--day")
+    backfill = commands.add_parser("sponsorship", help="assess saved texts with no sponsor answer under the current rules")
+    backfill.add_argument("--limit", type=int, default=500, help="at most this many texts (0 only counts)")
+    backfill.add_argument("--after", help='go on after this position: the "next" a previous round printed')
     args = parser.parse_args(argv)
     database = args.data / DATABASE
     try:
@@ -65,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             record = tenant_store.delete_account(database, args.user_id, args.data / tenant_store.DELETION_LEDGER)
             result = {"user_id": record["user_id"], "deleted_at": record["deleted_at"]}
+        elif args.command == "sponsorship":
+            tenant_store.upgrade_store(database)  # the tables, if the app has not started on this store yet
+            result = tenant_store.backfill_sponsorship(database, limit=args.limit, after=args.after)
         else:
             result = tenant_store.usage_on(database, args.day)
     except NotFound as exc:

@@ -28,10 +28,12 @@ A single-owner Feiran workspace is now deployed on AWS with a public HTTPS addre
 
 ## Using Feiran
 
+The V2 sponsor hints and review-before-generation flow below are implemented on the local branch and have not yet been deployed to the existing cloud instance.
+
 Once you have access to a running workspace:
 
 1. **Bring your experience.** Choose Chinese or English when uploading a PDF; both CVs are kept separately. Check and confirm the extracted facts. Editing a fact saves a new version that needs confirmation.
-2. **Choose a job.** In My jobs → New job, enter any public posting URL and choose Read and generate. Greenhouse, Lever, Ashby and Tencent links use their public APIs; other sites are read as webpages, preferring structured JobPosting data. Feiran reads the title and description, then prepares a CV draft for review. Check the extracted text for completeness. Login, CAPTCHA, JavaScript-only pages and incomplete responses may require manual pasting. Repeating a saved URL opens the existing job. You can also browse followed companies.
+2. **Choose a job.** In V2, paste a public job URL or description, or browse followed companies, to review the job first. Greenhouse, Lever, Ashby and Tencent use public APIs; other URLs use page content, preferring JobPosting data. Login, CAPTCHA, JavaScript-only or incomplete pages may require pasting the description. Review the sponsor label, original evidence, source and capture time, plus skill words paired with confirmed experience. Unknown sponsor policies remain visible by default. Click **Prepare CV** when ready to extract requirements and generate a draft. Reading a job uses no model calls or generation allowance. Saved URLs reopen the existing job. V1 local mode keeps its previous read-and-prepare flow.
 3. **Review your tailored CV.** Check the job requirements, proposed wording and layout changes. See which requirements your CV supports, which evidence was left out, and where information is missing. Add suggested experience only when it is true for you.
 4. **Approve and export.** Read the CV and every change, approve that version, and download the final PDF. Changed content needs a new review.
 
@@ -52,7 +54,9 @@ All regions share one listings database; Mainland China, other regions and unkno
 
 AI can misunderstand a requirement or change the meaning of a sentence. Automated checks catch some unsupported changes, but they cannot verify your real experience or replace your review.
 
-Job ordering is based on skill-word overlap, not eligibility or the probability of an offer. Missing evidence does not mean you lack a qualification, and a saved job description does not prove a role is still open.
+Sponsor labels use finite English/Chinese text rules; unrecognized wording stays unknown. In V2, each description is checked once, when a job is saved or a followed company is read, and the result is stored with its check time and rules version. Opening pages reuses it; an unchanged re-read updates only the capture time, and changed wording gets a new check while saved jobs keep theirs. **Wording not checked yet** means no result exists under the current rules (saved before results were kept, a failed check, or new rules): use the job's **Check the sponsor wording** button or refresh the company. V1 local mode checks again on every read and stores nothing. Employer sponsorship history does not establish the policy of this role, and these labels do not decide a candidate's visa eligibility.
+
+Job ordering and pre-generation hints are based on skill-word overlap, not eligibility or the probability of an offer. Missing evidence does not mean you lack a qualification, and a saved job description does not prove a role is still open.
 
 Feiran prepares and reviews materials. It does not submit applications, track applications or predict hiring outcomes. Optional semantic review remains an unvalidated experiment and is not part of the normal web workflow.
 

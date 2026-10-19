@@ -26,7 +26,7 @@ from requirement_flow import RequirementError, apply_requirement_decisions, prop
 
 # Model calls each operation may make at most (the quota it reserves); a PDF counts as one.
 UNITS = {"upload_cv": 1, "prepare_job": 3, "job_from_url": 3, "start_listing": 3, "prepare_cv": 2,
-         "tailor_cv": 1, "plan_cv": 1, "check_gaps": 2, "export_pdf": 1}
+         "tailor_cv": 1, "plan_cv": 1, "check_gaps": 2, "export_pdf": 1, "read_job_url": 0, "read_listing": 0}
 # The data flow each operation needs the user's agreement to (tenant_store.CONSENT_STAGES).
 CONSENT = {"upload_cv": "upload_parsing", "prepare_job": "job_processing", "job_from_url": "job_processing",
            "start_listing": "job_processing", "prepare_cv": "job_processing", "tailor_cv": "job_processing",
@@ -236,7 +236,7 @@ def run_prepare_job(ctx: Any) -> None:
                       {"job_id": request["job_id"]})
 
 
-def _job_from_posting(ctx: Any, selected: dict) -> None:
+def _job_from_posting(ctx: Any, selected: dict, *, review_only: bool = False) -> None:
     jd = selected.get("jd") or {}
     if not isinstance(jd.get("text"), str) or not jd["text"].strip():
         raise TaskFailed("岗位接口未返回 JD 正文，请使用手动粘贴。", "no_text")
@@ -246,6 +246,9 @@ def _job_from_posting(ctx: Any, selected: dict) -> None:
         return
     job = ctx.user.task_job(task_id=ctx.task_id, token=ctx.token, jd=prepare_review_input(selected)["jd"])
     ctx.job_id = job["job_id"]
+    if review_only:
+        ctx.finish("succeeded", result={"job_id": job["job_id"], "existing": False, "review_only": True})
+        return
     _find_and_prepare(ctx, job["job_id"], 0, None, {"job_id": job["job_id"], "existing": False})
 
 
@@ -266,7 +269,7 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         ctx.user.publish_upload(task_id=ctx.task_id, token=ctx.token, proposal=proposal,
                                 language=request["language"], source_sha256=request["source_sha256"])
 
-    def run_job_from_url(ctx: Any) -> None:
+    def run_job_from_url(ctx: Any, *, review_only: bool = False) -> None:
         request = ctx.request
         ctx.stage("reading")
         try:
@@ -279,9 +282,9 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
             raise TaskFailed(str(exc), "unreadable") from exc
         if isinstance(selected.get("jd"), dict):
             selected["jd"]["requested_url"] = request["url"]
-        _job_from_posting(ctx, selected)
+        _job_from_posting(ctx, selected, review_only=review_only)
 
-    def run_start_listing(ctx: Any) -> None:
+    def run_start_listing(ctx: Any, *, review_only: bool = False) -> None:
         request = ctx.request
         ctx.stage("reading")
         try:
@@ -290,7 +293,7 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
             raise TaskFailed(str(exc), "unreadable") from exc
         if isinstance(selected.get("jd"), dict):
             selected["jd"]["company"] = selected["jd"].get("company") or request.get("company")
-        _job_from_posting(ctx, selected)
+        _job_from_posting(ctx, selected, review_only=review_only)
 
     def run_prepare_cv(ctx: Any) -> None:
         prepare_cv(ctx, ctx.request["job_id"], ctx.request["language"], explicit=True)
@@ -331,6 +334,8 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
     return {
         "upload_cv": run_upload, "prepare_job": run_prepare_job, "job_from_url": run_job_from_url,
         "start_listing": run_start_listing, "prepare_cv": run_prepare_cv,
+        "read_job_url": lambda ctx: run_job_from_url(ctx, review_only=True),
+        "read_listing": lambda ctx: run_start_listing(ctx, review_only=True),
         "tailor_cv": lambda ctx: _redo_stage(ctx, "rewording"), "plan_cv": lambda ctx: _redo_stage(ctx, "layout"),
         "check_gaps": run_check_gaps, "export_pdf": run_export,
     }
