@@ -366,6 +366,7 @@ table.listings td:nth-child(2) > a { color: var(--ink); font-weight: 700; text-d
 table.listings td:nth-child(2) > a:hover { color: var(--accent); }
 .start { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
 .start select { width: auto; max-width: 190px; }
+.start .listing-action { display: contents; }
 .check { display: flex; align-items: center; gap: 6px; white-space: nowrap; color: var(--ink-soft); font-size: 13px; font-weight: 600; }
 .requirement-text .auto { font-size: 12px; font-weight: 400; }
 table.changes td.icon { width: 1%; color: var(--accent); font-weight: 800; }
@@ -475,3 +476,42 @@ input[type="file"]::file-selector-button { padding: 8px 12px; margin-right: 12px
 .fact-edit-text { min-height: 110px; }
 .fact-editor { margin-top: 10px; }
 .cv-panel > .field { max-width: 320px; }
+
+/* Sponsorship is visible before opening a role; evidence and profile details stay readable. */
+.toolbar .sponsorship-select { width: auto; max-width: 100%; flex: 1 1 260px; }
+.sponsor-filter-note { font-size: 13px; }
+.sponsorship { margin: 18px 0; min-width: 0; }
+.sponsorship.compact { margin: 10px 0 0; }
+.sponsor-badge { display: inline-flex; flex-wrap: wrap; max-width: 100%; padding: 6px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: #f1f4f8; color: var(--ink-soft); font-size: 13px; line-height: 1.5; font-weight: 700; overflow-wrap: anywhere; }
+.sponsor-supported { border-color: #bde4cf; background: var(--ok-soft); color: var(--ok); }
+.sponsor-not_supported, .sponsor-conflicting { border-color: #f5bbb5; background: var(--bad-soft); color: var(--bad); }
+.sponsor-conditional { border-color: #efd69b; background: var(--warn-soft); color: var(--warn); }
+.sponsor-not_assessed { border-style: dashed; background: transparent; }
+.sponsorship > button { margin: 6px 0 0 8px; }
+.sponsor-evidence { font-size: 13px; }
+.sponsor-evidence summary { font-weight: 500; }
+.sponsor-evidence p, .source-reference, .listing-description { overflow-wrap: anywhere; }
+.sponsor-evidence blockquote, .skill-evidence blockquote { margin: 10px 0; border-left: 3px solid var(--line-strong); padding: 4px 0 4px 12px; color: var(--ink-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
+.listing-title { color: var(--ink); font-weight: 700; overflow-wrap: anywhere; }
+.listing-title a { color: inherit; text-decoration: none; }
+.listing-title a:hover { color: var(--accent); text-decoration: underline; }
+.mobile-label { display: none; }
+.skill-evidence { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 12px; }
+.skill-evidence h3 { margin: 0 0 6px; }
+.skill-evidence h4 { color: var(--muted); font-size: 12px; font-weight: 600; margin: 0 0 6px; }
+.skill-evidence-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+.skill-evidence-pair > div { min-width: 0; overflow-wrap: anywhere; }
+.skill-evidence ul { padding-left: 20px; margin: 10px 0; }
+.job-review-panel .toolbar button { white-space: normal; }
+@media (max-width: 760px) {
+  .skill-evidence-pair { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  table.listings, table.listings tbody { display: block; width: 100%; overflow: visible; }
+  table.listings thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  table.listings tr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; padding: 18px 0; border-top: 1px solid var(--line); }
+  table.listings td, table.listings td:nth-child(2), table.listings td:nth-child(3) { display: block; width: auto; min-width: 0; border: 0; padding: 0; }
+  table.listings td.listing-rank { display: none; }
+  .listings .start { align-items: stretch; }
+  .listings .start select, .listings .start .button, .listings .start button { width: 100%; max-width: 100%; white-space: normal; }
+  .mobile-label { display: inline; color: var(--muted); margin-right: 8px; font-size: 12px; }
+  .sponsor-badge { font-size: 12px; }
+}

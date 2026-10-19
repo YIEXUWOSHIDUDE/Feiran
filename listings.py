@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 from facts import load_search_terms, tag_finder
 from job_search import SearchError, check_board, fetch_board
+from sponsorship import STATUSES, assess_sponsorship, shown
 
 
 DEFAULT_DATABASE = Path(".local/listings.db")
@@ -312,11 +313,16 @@ def ranked_listings(
     offset: int = 0,
     hide_senior: bool = False,
     region: str = "all",
+    sponsorship: str = "all",
 ) -> dict[str, Any]:
     """Open postings, most confirmed skills mentioned first; a count of words, not a fit score.
 
     The same role posted in several cities (same title and text) is one row. Ties go to the
     newest posting. A location filter keeps postings whose location is unknown.
+
+    This single-owner copy works the local sponsor rules out again on each read and stores no
+    answer, so a rule change shows at once and there is nothing to backfill (V2 stores them:
+    tenant_store). A paid analysis could never run here.
     """
     if isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE or offset < 0:
         raise ListingsError(f"每页岗位数必须在 1 到 {MAX_PAGE_SIZE} 之间")
@@ -346,15 +352,17 @@ def ranked_listings(
                 )
             rows = connection.execute(
                 """SELECT l.provider, l.board, l.job_id, l.title, l.location, l.source, l.posted_at,
-                          l.text_hash, l.matched_tags, l.last_seen_at, s.company
+                          l.text, l.text_hash, l.matched_tags, l.last_seen_at, s.company
                    FROM listings AS l JOIN sources AS s USING (provider, board)
                    ORDER BY l.provider, l.board, l.job_id"""
             ).fetchall()
     finally:
         connection.close()
-    postings = [{**dict(row), "matched": json.loads(row["matched_tags"])} for row in rows]
+    postings = [{**dict(row), "matched": json.loads(row["matched_tags"]),
+                 "sponsorship": shown(assess_sponsorship(row["text"]), source=row["source"],
+                                      captured_at=row["last_seen_at"])} for row in rows]
     return group_postings(postings, len({tag.casefold() for tag in tags}), title, location, limit, offset,
-                          hide_senior, region)
+                          hide_senior, region, sponsorship)
 
 
 def group_postings(
@@ -366,14 +374,18 @@ def group_postings(
     offset: int = 0,
     hide_senior: bool = False,
     region: str = "all",
+    sponsorship: str = "all",
 ) -> dict[str, Any]:
-    """Filter and rank postings (each with its ``matched`` skill words), most skills mentioned
+    """Filter and rank postings (each with its ``matched`` skill words and the ``sponsorship``
+    answer its caller read or worked out; none shows as not assessed), most skills mentioned
     first. The same role posted in several cities (same title and text) is one row; ties go to
     the newest posting; a location filter keeps postings whose location is unknown."""
     if isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE or offset < 0:
         raise ListingsError(f"每页岗位数必须在 1 到 {MAX_PAGE_SIZE} 之间")
     if region not in {"all", "cn", "other", "unknown"}:
         raise ListingsError("地区筛选无效")
+    if sponsorship not in {"all", "not_assessed", *STATUSES}:
+        raise ListingsError("Sponsor filter is invalid")
     title_key, location_key = title.strip().casefold(), location.strip().casefold()
     groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for row in postings:
@@ -383,6 +395,9 @@ def group_postings(
             continue
         if location_key and row["location"] and location_key not in row["location"].casefold():
             continue
+        assessment = row.get("sponsorship") or shown(None, source=row["source"], captured_at=row["last_seen_at"])
+        if sponsorship != "all" and assessment["status"] != sponsorship:
+            continue
         role = (row["provider"], row["board"], row["title"].casefold(), row["text_hash"])
         if role not in groups:
             groups[role] = {
@@ -391,10 +406,12 @@ def group_postings(
                 "company": row["company"],
                 "title": row["title"],
                 "matched": row["matched"],
+                "sponsorship": assessment,
                 "postings": [],
             }
         groups[role]["postings"].append({
-            field: row[field] for field in ("job_id", "location", "source", "posted_at", "last_seen_at")
+            **{field: row[field] for field in ("job_id", "location", "source", "posted_at", "last_seen_at")},
+            "sponsorship": assessment,
         })
     ranked = list(groups.values())
     for group in ranked:

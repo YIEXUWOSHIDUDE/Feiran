@@ -43,6 +43,7 @@ from gaps import GAPS_VERSION, coverage, places
 from identity import Identity, IdentityError, OIDCSettings
 from job_search import SearchError, check_board, fetch_board, parse_board_link, parse_posting_link, prepare_pasted_jd
 from job_url import normalize_url
+from job_review import build_job_review
 from listings import STALE_AFTER, ListingsError, group_postings, load_starter
 from requirement_flow import RequirementError, add_manual_requirements, apply_requirement_decisions
 from task_runner import TaskRunner
@@ -74,6 +75,7 @@ REFUSED_STATUS = {"queue_full": 429, "quota_exhausted": 429, "too_many_attempts"
                   "tasks_paused": 503, "quota_unconfigured": 503, "consent_required": 403}
 # What each model data flow sends, shown before a user first uses it (tenant_store.CONSENT_STAGES).
 PAGE_OUT_OF_DATE = "This page is out of date; reload it"
+SPONSOR_CHECK_FAILED = "The sponsor wording could not be checked; nothing was saved. Try again later."
 CONSENT_NOTICES = {
     "upload_parsing": (
         "Reading an uploaded CV: your name, email, phone and links stay on this server. The other lines of the "
@@ -184,9 +186,11 @@ class StartListingRequest(BaseModel):
     provider: str
     board: str
     job_id: str
+    review_only: bool = False
 
 
 class NewJobRequest(BaseModel):
+    review_only: bool = False
     title: str
     text: str
     company: str | None = None
@@ -196,6 +200,7 @@ class NewJobRequest(BaseModel):
 
 class JobURLRequest(BaseModel):
     url: str
+    review_only: bool = False
 
 
 class AddRequirementRequest(BaseModel):
@@ -267,7 +272,9 @@ def claim_v2_format(folder: Path) -> None:
 
 class BoardReads:
     """Public board reads: at most a few at once for the whole site and a bounded number per user
-    per hour; a recent copy in the shared public cache is served without reading again."""
+    per hour; a recent copy in the shared public cache is served without reading again. Either
+    way, postings whose sponsor wording has no answer under the current rules are assessed now
+    (tenant_store); pages only read the answers."""
 
     def __init__(self, fetch: Callable[..., list[dict]], database: Path) -> None:
         self.fetch, self.database = fetch, database
@@ -278,7 +285,8 @@ class BoardReads:
     def read(self, user_id: str, provider: str, board: str, company: str | None = None) -> dict[str, Any]:
         cached_company, age, count = tenant_store.public_board_age(self.database, provider, board)
         if age is not None and age < BOARD_FRESH:
-            return {"company": company or cached_company, "open": count, "new": 0, "closed": 0, "cached": True}
+            return {"company": company or cached_company, "open": count, "new": 0, "closed": 0, "cached": True,
+                    "sponsorship": tenant_store.assess_public_board(self.database, provider, board)}
         now = time.monotonic()
         with self.lock:
             reads = self.recent.setdefault(user_id, deque())
@@ -537,7 +545,7 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
         return f"client:{supplied}"
 
     def submit(request: Request, operation: str, intent: dict, *, key: str, context: dict | None = None,
-               job_id: str | None = None, follow_up: bool = False) -> dict:
+               job_id: str | None = None, follow_up: bool = False, bind_operation: str | None = None) -> dict:
         """Queue one operation for this user. ``intent`` is what the page asked for; ``context`` what
         the server worked out from the state of now (the CV to build on, say). The page sends an
         Idempotency-Key for each of the user's actions, and the same key with the same intent finds
@@ -548,7 +556,7 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
         woken at once."""
         named = None if follow_up else client_key(request)
         task = workspace(request).submit_task(operation, key=named or key, bind=named is not None,
-                                              request=intent, context=context, units=UNITS[operation],
+                                              request=intent, context=context, units=UNITS[operation], bind_operation=bind_operation,
                                               heavy=HEAVY.get(operation, "model"), job_id=job_id,
                                               consent=CONSENT.get(operation))
         runner.wake()
@@ -709,18 +717,19 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
 
     @app.get("/api/listings")
     def listings(request: Request, title: str = "", location: str = "", limit: int = 50, offset: int = 0,
-                 hide_senior: bool = False, region: str = "all") -> dict:
+                 hide_senior: bool = False, region: str = "all", sponsorship: str = "all") -> dict:
         user = workspace(request)
         tags = list(dict.fromkeys(tag for fact in user.list_facts() if fact["status"] == "confirmed"
                                   for tag in fact["tags"]))
         rows = user.ranking_rows(tags, tag_finder(tags))
         ranked = group_postings(rows, len({tag.casefold() for tag in tags}), title, location, limit, offset,
-                                hide_senior, region)
+                                hide_senior, region, sponsorship)
         started = {summary["source"]: summary["job_id"] for summary in reversed(user.job_summaries())
                    if summary["source"]}
         for group in ranked["listings"]:
-            group["started_job"] = next((started[item["source"]] for item in group["postings"]
-                                         if item["source"] in started), None)
+            for item in group["postings"]:  # each location opens the job saved from that posting
+                item["started_job"] = started.get(item["source"])
+            group["started_job"] = next((item["started_job"] for item in group["postings"] if item["started_job"]), None)
         return ranked
 
     @app.post("/api/listings/start", response_model=None)
@@ -728,11 +737,14 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
         user = workspace(request)
         posting = user.followed_posting(body.provider, body.board, body.job_id)
         intent = {"provider": posting["provider"], "board": posting["board"], "posting_id": posting["job_id"]}
+        if body.review_only:
+            intent["review_only"] = True
         existing = user.find_job(source=posting["source"])
         if existing:  # answered by the job already made from it; the request key is bound all the same
             user.bind_request("start_listing", client_key(request), tenant_store.input_digest(intent))
             return {"job_id": existing, "existing": True}
-        task = submit(request, "start_listing", intent, context={"company": posting["company"]},
+        task = submit(request, "read_listing" if body.review_only else "start_listing", intent,
+                      context={"company": posting["company"]}, bind_operation="start_listing",
                       key=f"listing:{posting['provider']}:{posting['board']}:{posting['job_id']}")
         return queued(task)
 
@@ -750,10 +762,16 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
         and saves nothing (UserWorkspace.paste_job)."""
         user = workspace(request)
         selected = prepare_pasted_jd(body.text, body.title, body.company, body.url, body.location)
-        digest = hashlib.sha256(json.dumps(body.model_dump(), sort_keys=True).encode()).hexdigest()
+        content = body.model_dump(exclude={"review_only"})
+        digest = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+        intent = {**content, "review_only": True} if body.review_only else content
+        request_digest = hashlib.sha256(json.dumps(intent, sort_keys=True).encode()).hexdigest()
         outcome = user.paste_job(selected["jd"], request_id=f"paste:{digest}", key=client_key(request),
-                                 input_sha256=digest, units=UNITS["prepare_job"], consent=CONSENT["prepare_job"])
+                                 input_sha256=request_digest, units=UNITS["prepare_job"], consent=CONSENT["prepare_job"],
+                                 review_only=body.review_only)
         job_id = outcome["job"]["job_id"]
+        if body.review_only:
+            return JSONResponse({"job_id": job_id, "review_only": True})
         if outcome["refused"] is not None:
             refused = outcome["refused"]
             return JSONResponse({"job_id": job_id, "task_error": {"code": refused.code, "error": str(refused)}})
@@ -766,16 +784,18 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
     def new_job_from_url(request: Request, body: JobURLRequest) -> dict | JSONResponse:
         user = workspace(request)
         url = normalize_url(body.url)
+        intent = {"url": url, "review_only": True} if body.review_only else {"url": url}
         try:
             identity_key = parse_posting_link(url)
         except SearchError:
             identity_key = None
         existing = user.find_job(identity=identity_key, url=url)
         if existing:  # answered by the job already made from it; the request key is bound all the same
-            user.bind_request("job_from_url", client_key(request), tenant_store.input_digest({"url": url}))
+            user.bind_request("job_from_url", client_key(request), tenant_store.input_digest(intent))
             return {"job_id": existing, "existing": True}
-        task = submit(request, "job_from_url", {"url": url},
-                      context={"identity": list(identity_key) if identity_key else None}, key=f"url:{url}")
+        task = submit(request, "read_job_url" if body.review_only else "job_from_url", intent,
+                      context={"identity": list(identity_key) if identity_key else None}, key=f"url:{url}",
+                      bind_operation="job_from_url")
         return queued(task)
 
     def job_view(user: UserWorkspace, job_id: str) -> dict:
@@ -784,6 +804,16 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
     @app.get("/api/jobs/{job_id}")
     def job(request: Request, job_id: str) -> dict:
         return job_view(workspace(request), job_id)
+
+    @app.post("/api/jobs/{job_id}/sponsorship", response_model=None)
+    def check_sponsorship(request: Request, job_id: str) -> dict | JSONResponse:
+        """The user's explicit check of a saved job's sponsor wording that is not assessed yet
+        (saved before answers were kept, a failed check, or new rules); the local rules only.
+        A check that fails stores nothing and says so, so the page never shows it as done."""
+        user = workspace(request)
+        if user.assess_job_sponsorship(job_id) == "failed":
+            return JSONResponse({"error": SPONSOR_CHECK_FAILED, "code": "sponsor_check_failed"}, status_code=503)
+        return job_view(user, job_id)
 
     def current_requirements(user: UserWorkspace, job_id: str, shown: int) -> dict:
         """The job's requirements, as long as they are still the version the page showed: a page
@@ -957,7 +987,8 @@ def build_job_view(snapshot: dict) -> dict:
     steps = ["input"]
     view: dict[str, Any] = {"job_id": job["job_id"], "jd": jd, "language": language,
                             "cv_languages": snapshot["cv_languages"],
-                            "requirements_version": requirements["version"] if requirements else 0}
+                            "requirements_version": requirements["version"] if requirements else 0,
+                            "review": build_job_review(jd, snapshot.get("facts", []), snapshot.get("sponsorship"))}
     decided = requirements.get("decided") if requirements else None
     shown = decided or (requirements or {}).get("candidates")
     if shown:

@@ -83,6 +83,7 @@ from job_search import (
     prepare_pasted_jd,
     prepare_review_input,
 )
+from job_review import build_job_review
 from job_url import fetch_job_url, normalize_url
 from listings import (
     ListingsError,
@@ -106,6 +107,7 @@ from requirement_flow import (
 )
 from review import build_report
 import run_log
+from sponsorship import assess_sponsorship
 from workspace import (
     DEFAULT_ROOT,
     JOB_ID,
@@ -541,9 +543,13 @@ def create_app(
     def job_view_locked(job_id: str) -> dict:
         steps = workspace.state(job_id)
         jd = {key: value for key, value in require(job_id, "input")["jd"].items() if key != "raw_content"}
+        # The single-owner app works the local sponsor rules out on each read and keeps no
+        # answer (nothing to backfill); V2 assesses once when a job is saved.
         view: dict = {
             "job_id": job_id, "steps": steps, "jd": jd,
             "language": job_cv_language(jd["text"], job_id), "cv_languages": cv_languages(),
+            "review": build_job_review(jd, list_facts(facts_db) if facts_db.exists() else [],
+                                       assess_sponsorship(jd["text"])),
         }
         decided = workspace.read(job_id, "decided")
         requirements = decided or workspace.read(job_id, "candidates")
@@ -982,14 +988,15 @@ def create_app(
 
     @app.get("/api/listings")
     def listings(
-        title: str = "", location: str = "", limit: int = 50, offset: int = 0, hide_senior: bool = False, region: str = "all"
+        title: str = "", location: str = "", limit: int = 50, offset: int = 0, hide_senior: bool = False, region: str = "all",
+        sponsorship: str = "all"
     ) -> dict:
-        ranked = ranked_listings(listings_db, facts_db, title, location, limit, offset, hide_senior, region)
+        ranked = ranked_listings(listings_db, facts_db, title, location, limit, offset, hide_senior, region, sponsorship)
         started = started_jobs()
         for group in ranked["listings"]:
-            group["started_job"] = next(
-                (started[item["source"]] for item in group["postings"] if item["source"] in started), None
-            )
+            for item in group["postings"]:  # each location opens the job started from that posting
+                item["started_job"] = started.get(item["source"])
+            group["started_job"] = next((item["started_job"] for item in group["postings"] if item["started_job"]), None)
         return ranked
 
     @app.post("/api/listings/start")

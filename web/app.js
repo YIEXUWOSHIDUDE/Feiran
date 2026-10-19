@@ -357,7 +357,8 @@ function field(label, input, hint) {
 async function renderJobs() {
   const { jobs } = await api("/api/jobs");
   const postingURL = el("input", { type: "url", required: true, placeholder: t("Paste a job posting URL") });
-  const importURL = el("button", { type: "submit" }, t("Read and generate"));
+  const importLabel = MODE === "v2" ? t("Read and review") : t("Read and generate");
+  const importURL = el("button", { type: "submit" }, importLabel);
   const urlForm = el("form", {},
     field(t("Job posting URL"), postingURL, t("Enter any public job posting URL. If the site blocks reading or the description is incomplete, paste it manually below.")),
     el("div", { class: "toolbar" }, importURL));
@@ -366,16 +367,16 @@ async function renderJobs() {
     if (importURL.disabled) return;
     run(async () => {
       importURL.disabled = true;
-      I18n.setText(importURL, t("Reading and preparing…"));
+      I18n.setText(importURL, MODE === "v2" ? t("Reading the job…") : t("Reading and preparing…"));
       try {
         const { job_id, existing } = await api("/api/jobs/from-url", {
-          method: "POST", body: JSON.stringify({ url: postingURL.value.trim() }),
+          method: "POST", body: JSON.stringify({ url: postingURL.value.trim(), ...(MODE === "v2" ? { review_only: true } : {}) }),
         });
         if (existing) flash = [t("This job is already saved. Opened its existing version."), "ok"];
         location.hash = `#job/${job_id}`;
       } finally {
         importURL.disabled = false;
-        I18n.setText(importURL, t("Read and generate"));
+        I18n.setText(importURL, importLabel);
       }
     });
   });
@@ -386,9 +387,10 @@ async function renderJobs() {
     location: el("input", { type: "text", placeholder: t("Location") }),
     text: el("textarea", { required: true, placeholder: t("Paste the full job description here") }),
   };
-  const create = el("button", {}, t("Create job"));
+  const create = el("button", {}, MODE === "v2" ? t("Save and review job") : t("Create job"));
   create.addEventListener("click", () => run(async () => {
     const body = Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key, input.value.trim() || null]));
+    if (MODE === "v2") body.review_only = true;
     const { job_id } = await api("/api/jobs", { method: "POST", body: JSON.stringify(body) });
     location.hash = `#job/${job_id}`;
   }));
@@ -405,10 +407,10 @@ async function renderJobs() {
     el("section", { class: "panel jobs-panel" }, el("h2", {}, t("Jobs")), list),
     el("section", { class: "panel new-job-panel" },
       el("h2", {}, t("New job")),
-      el("p", { class: "muted" }, t("Paste a job link to read its description and prepare a CV draft for review.")),
+      el("p", { class: "muted" }, MODE === "v2" ? t("Save a job, check its sponsorship wording and your experience, then decide whether to prepare a CV.") : t("Paste a job link to read its description and prepare a CV draft for review.")),
       urlForm,
       el("details", {}, el("summary", {}, t("Paste the description manually")),
-      el("p", { class: "muted" }, t("Paste a job description from any site. Its requirements are found and your CV is prepared for it automatically.")),
+      el("p", { class: "muted" }, MODE === "v2" ? t("Paste the full job description to review it first. A CV is prepared only when you choose to continue.") : t("Paste a job description from any site. Its requirements are found and your CV is prepared for it automatically.")),
       el("div", { class: "grid" }, field(t("Title *"), inputs.title), field(t("Company"), inputs.company), field(t("Official link"), inputs.url, t("Leave empty if unknown; the source is then recorded as unknown.")), field(t("Location"), inputs.location)),
       field(t("Job description *"), inputs.text),
       el("div", { class: "toolbar" }, create)),
@@ -445,7 +447,7 @@ function remember(key, value) {
 }
 
 // Filters survive page changes; a download started on one visit is awaited by the next.
-const find = { title: "", location: "", region: recall("find.region", "all"), limit: 50, hideSenior: recall("find.hideSenior", false), refreshing: null };
+const find = { title: "", location: "", region: recall("find.region", "all"), sponsorship: recall("find.sponsorship", "all"), limit: 50, hideSenior: recall("find.hideSenior", false), refreshing: null };
 
 function findStatus(text) {
   const node = document.getElementById("find-status");
@@ -477,32 +479,91 @@ function locationsText(postings) {
   return names.length > 3 ? t`${I18n.join(names.slice(0, 3), "; ")} +${names.length - 3} more` : I18n.join(names, "; ");
 }
 
+const SPONSORSHIP_LABELS = {
+  supported: t("JD says sponsorship available"),
+  not_supported: t("JD says no sponsorship"),
+  conditional: t("Sponsorship has conditions"),
+  unknown: t("Not stated · verify sponsorship"),
+  conflicting: t("Conflicting sponsorship statements"),
+  not_assessed: t("Wording not checked yet"),
+};
+
+// Source data is untrusted: only web URLs become links, and quoted evidence stays text.
+function sourceReference(source) {
+  try {
+    const url = new URL(source);
+    if (url.protocol === "https:" || url.protocol === "http:") {
+      return el("a", { href: url.href, target: "_blank", rel: "noopener noreferrer" }, source);
+    }
+  } catch { /* Unknown or non-web sources remain plain text. */ }
+  return source || t("Source: unknown");
+}
+
+// `check` (a button) is offered with a saved job whose wording has no answer under the current rules.
+function sponsorshipSummary(sponsorship, compact = false, check = null) {
+  const data = sponsorship || {};
+  // A status this page does not know is never shown as "unknown": that would say the rules found nothing.
+  const status = Object.hasOwn(SPONSORSHIP_LABELS, data.status) ? data.status : "not_assessed";
+  const evidence = Array.isArray(data.evidence) ? data.evidence : [];
+  return el("div", { class: `sponsorship ${compact ? "compact" : ""}` },
+    el("span", { class: `sponsor-badge sponsor-${status}` }, t("Visa sponsorship"), ": ", SPONSORSHIP_LABELS[status]),
+    status === "not_assessed" ? check : null,
+    el("details", { class: "sponsor-evidence" },
+      el("summary", {}, t("Check the wording and source")),
+      status === "not_assessed"
+        ? el("p", { class: "muted" }, t("The sponsor wording of this saved description has not been checked with the current rules yet, so nothing is known either way."))
+        : evidence.length
+          ? evidence.map((quote) => el("blockquote", {}, quote.text))
+          : el("p", { class: "muted" }, t("No explicit sponsorship statement was recognized in this description. This does not mean sponsorship is unavailable.")),
+      el("p", { class: "muted" }, t("This reads the saved job description, not the employer's sponsorship history. Check the full wording and confirm with the employer.")),
+      el("p", { class: "source-reference" }, sourceReference(data.source)),
+      el("p", { class: "muted" }, data.captured_at ? t`Description captured ${localDate(data.captured_at)}` : t("Capture date unknown"),
+        " · ", t("Capture date is not the posting date; current availability is unverified.")),
+      data.assessed_at && status !== "not_assessed"
+        ? el("p", { class: "muted" }, t`Wording checked ${localDate(data.assessed_at)} with sponsor rules version ${data.rule_version}`)
+        : null));
+}
+
 function listingRow(item, rank) {
-  const first = item.postings[0];
   const count = new Set(item.matched.map((tag) => tag.toLowerCase())).size;
+  // Each location is its own posting: the details, links and action shown always belong to the
+  // chosen one. A location already saved as a job is chosen first, so Open opens what is shown.
+  const saved = Math.max(0, item.postings.findIndex((posting) => posting.started_job));
   let choose = null;
-  if (item.postings.length > 1 && !item.started_job) {
-    choose = el("select", { title: t("Location") }, item.postings.map((posting, index) =>
-      el("option", { value: String(index) }, posting.location || t("location unknown"))));
+  if (item.postings.length > 1) {
+    choose = el("select", { title: t("Location"), "aria-label": t("Location") }, item.postings.map((posting, index) =>
+      el("option", { value: String(index), selected: index === saved }, posting.location || t("location unknown"))));
   }
-  const action = item.started_job
-    ? el("a", { class: "button", href: `#job/${item.started_job}` }, t("Open"))
-    : actionButton(t("Start"), async () => {
-      const posting = item.postings[choose ? Number(choose.value) : 0];
-      const { job_id } = await api("/api/listings/start", {
-        method: "POST",
-        body: JSON.stringify({ provider: item.provider, board: item.board, job_id: posting.job_id }),
-      });
-      location.hash = `#job/${job_id}`;
-    });
-  const title = first.source.startsWith("https://")
-    ? el("a", { href: first.source, target: "_blank", rel: "noopener noreferrer" }, item.title)
-    : item.title;
+  const selectedPosting = () => item.postings[choose ? Number(choose.value) : 0];
+  const description = el("td", { class: "listing-description" });
+  const action = el("span", { class: "listing-action" });
+  const draw = () => {
+    const posting = selectedPosting();
+    const title = el("div", { class: "listing-title" });
+    const source = sourceReference(posting.source);
+    if (source instanceof Node) {
+      I18n.setText(source, item.title);
+      title.append(source);
+    } else title.append(I18n.node(item.title));
+    description.replaceChildren(title,
+      el("div", { class: "muted" }, I18n.join([item.company, posting.location || t("location unknown"), posting.posted_at ? t`posted ${localDate(posting.posted_at)}` : null].filter(Boolean), " · ")),
+      sponsorshipSummary(posting.sponsorship || { ...item.sponsorship, source: posting.source, captured_at: posting.last_seen_at }, true));
+    action.replaceChildren(posting.started_job
+      ? el("a", { class: "button", href: `#job/${posting.started_job}` }, t("Open"))
+      : actionButton(MODE === "v2" ? t("Review job") : t("Start"), async () => {
+        const { job_id } = await api("/api/listings/start", {
+          method: "POST",
+          body: JSON.stringify({ provider: item.provider, board: item.board, job_id: posting.job_id, ...(MODE === "v2" ? { review_only: true } : {}) }),
+        });
+        location.hash = `#job/${job_id}`;
+      }));
+  };
+  if (choose) choose.addEventListener("change", draw);
+  draw();
   return el("tr", {},
-    el("td", { class: "muted" }, String(rank)),
-    el("td", {}, title,
-      el("div", { class: "muted" }, I18n.join([item.company, locationsText(item.postings), item.posted_at ? t`posted ${localDate(item.posted_at)}` : null].filter(Boolean), " · "))),
-    el("td", {}, el("strong", {}, String(count)), el("div", { class: "tags" }, item.matched.map((tag) => el("span", { class: "tag" }, tag)))),
+    el("td", { class: "muted listing-rank" }, String(rank)),
+    description,
+    el("td", { class: "listing-skills" }, el("span", { class: "mobile-label" }, t("Your skills it mentions")), el("strong", {}, String(count)), el("div", { class: "tags" }, item.matched.map((tag) => el("span", { class: "tag" }, tag)))),
     el("td", { class: "choice" }, el("div", { class: "start" }, choose, action)),
   );
 }
@@ -521,6 +582,15 @@ async function renderFind() {
   region.addEventListener("change", () => run(async () => {
     find.region = region.value;
     remember("find.region", find.region);
+    find.limit = 50;
+    await drawList();
+  }));
+  const sponsorship = el("select", { class: "sponsorship-select", "aria-label": t("Visa sponsorship filter") },
+    el("option", { value: "all", selected: find.sponsorship === "all" }, t("All sponsorship statuses (including unknown)")),
+    Object.entries(SPONSORSHIP_LABELS).map(([value, label]) => el("option", { value, selected: find.sponsorship === value }, label)));
+  sponsorship.addEventListener("change", () => run(async () => {
+    find.sponsorship = sponsorship.value;
+    remember("find.sponsorship", find.sponsorship);
     find.limit = 50;
     await drawList();
   }));
@@ -549,7 +619,7 @@ async function renderFind() {
 
   async function drawList() {
     const params = new URLSearchParams({
-      title: find.title, location: find.location, region: find.region, limit: String(find.limit), hide_senior: String(find.hideSenior),
+      title: find.title, location: find.location, region: find.region, sponsorship: find.sponsorship, limit: String(find.limit), hide_senior: String(find.hideSenior),
     });
     const [data, { sources }] = await Promise.all([api(`/api/listings?${params}`), api("/api/sources")]);
     const newest = sources.map((source) => source.fetched_at).filter(Boolean).sort().pop();
@@ -630,9 +700,10 @@ async function renderFind() {
       el("p", { class: "muted" },
         t("Most matched first: how many of your confirmed skills each posting mentions. "),
         t("It counts words; it is not a fit score or your chance of an offer. Pending facts never count.")),
-      el("div", { class: "toolbar" }, region, inputs.title, inputs.location, filterButton,
+      el("div", { class: "toolbar" }, region, sponsorship, inputs.title, inputs.location, filterButton,
         el("label", { class: "check", title: t("Hides Senior, Staff, Principal, Lead, Manager, Director… titles. \"Member of Technical Staff\" stays.") }, hideSenior, t(" Hide senior roles")),
         refreshAll),
+      el("p", { class: "muted sponsor-filter-note" }, t("Unknown sponsorship stays visible by default. These labels describe the JD; they do not establish your eligibility.")),
       status,
       listBox),
     el("section", { class: "panel companies-panel" }, companiesBox),
@@ -974,10 +1045,10 @@ function gapsPanel(view, refresh) {
     t("then it becomes a confirmed fact and the CV is prepared again."));
   if (!gaps) {
     return el("section", { class: "panel step-panel gaps-panel" }, heading, intro,
-      el("p", { class: "muted" }, t("Checking…")), el("div", { class: "toolbar" }, check));
+      el("p", { class: "muted" }, MODE === "v2" ? t("Not checked yet. Choose Check now to compare this CV with the requirements.") : t("Checking…")), el("div", { class: "toolbar" }, check));
   }
   const notes = [];
-  if (gaps.stale) notes.push(el("p", { class: "warning" }, t("Your CV or facts changed since this check. Checking again…")));
+  if (gaps.stale) notes.push(el("p", { class: "warning" }, MODE === "v2" ? t("Your CV or facts changed since this check. Choose Check again to update the result.") : t("Your CV or facts changed since this check. Checking again…")));
   const checking = gaps.evidence_check || {};
   if (checking.fallback_reason) {
     notes.push(el("p", { class: "warning" }, t`Not checked: ${I18n.serverText(checking.message || checking.fallback_reason)} `,
@@ -1052,28 +1123,71 @@ function unfinishedNote(notice, refresh) {
   return el("p", { class: "warning" }, text, " ", ...tools);
 }
 
+// Review uses confirmed facts already held by the server; it does not generate a CV.
+function jobReviewPanel(view, refresh, needsPreparation) {
+  const review = view.review;
+  if (!review) return null;
+  const matches = review.skill_matches || [];
+  const confirmed = review.confirmed_fact_count || 0;
+  const pending = review.pending_fact_count || 0;
+  const ready = confirmed > 0 && (view.cv_languages || []).length > 0;
+  const running = (view.tasks || []).some((task) => !TERMINAL.has(task.status));
+  let next = null;
+  if (needsPreparation) {
+    if (ready) {
+      const prepare = actionButton(t("Prepare a CV for this job"), async () => {
+        try {
+          await api(`/api/jobs/${view.job_id}/requirements/find`, { method: "POST", body: JSON.stringify({ expected_version: view.requirements_version }) });
+        } finally {
+          await refresh();
+        }
+      });
+      prepare.disabled = running;
+      next = el("div", {}, el("p", { class: "muted" }, t("When you continue, the job requirements will be extracted and a draft prepared from your confirmed facts. Review the draft before exporting.")),
+        el("div", { class: "toolbar" }, prepare));
+    } else {
+      next = el("p", { class: "warning" }, t("Before preparing a CV, save your CV profile and confirm at least one fact. You can keep reviewing this job meanwhile."), " ",
+        el("a", { href: "#facts" }, t("Complete your profile and facts")));
+    }
+  }
+  return el("section", { class: "panel job-review-panel" },
+    el("h2", {}, t("Does this job deserve a closer look?")),
+    el("p", { class: "muted" }, t("Compare the job wording with your confirmed experience. These are shared skill words, not a qualification check, a fit score or an offer prediction.")),
+    el("p", {}, t`${confirmed} confirmed facts · ${pending} awaiting confirmation`, " · ", el("a", { href: "#facts" }, t("Review or correct your facts"))),
+    matches.length ? matches.map((match) => el("article", { class: "skill-evidence" },
+      el("h3", {}, match.tag),
+      el("div", { class: "skill-evidence-pair" },
+        el("div", {}, el("h4", {}, t("In the job description")), el("blockquote", {}, match.job_quote)),
+        el("div", {}, el("h4", {}, t("In your confirmed facts")), el("ul", {}, (match.facts || []).map((fact) => el("li", {}, fact.text)))))))
+      : el("p", { class: "muted" }, t("No shared skill words found in your confirmed facts. This alone does not mean the role is unsuitable; review the description and your experience.")),
+    next);
+}
+
 async function renderJob(jobId) {
-  // Requirements are checked against the CV once it exists, after the page shows, so Start
-  // stays quick; and again, at most once per refresh, whenever the facts or the CV's wording
-  // changed since, for example after True for me or Start over.
+  // V2 opening a saved role is read-only. Model checks run only from an explicit button.
+  // The single-user page retains its existing automatic coverage check.
   const refresh = async (checked = false) => {
     const view = await api(`/api/jobs/${jobId}`);
     const jd = view.jd;
+    const needsPreparation = MODE === "v2" && !view.requirements_version && !Object.values(view.cv || {}).some((cv) => cv.head);
     app.replaceChildren(
       el("section", { class: "panel job-hero" },
         el("h2", {}, jd.title || jobId),
         el("p", { class: "muted" },
           [jd.company, jd.location].filter(Boolean).join(" · ") || t("Company unknown"), t(" · captured "), localDate(jd.captured_at)),
-        jd.source ? el("p", {}, el("a", { href: jd.source, target: "_blank", rel: "noopener noreferrer" }, jd.source)) : el("p", { class: "muted" }, t("Source: unknown")),
+        el("p", { class: "source-reference muted" }, sourceReference(jd.source)),
         jd.provider === "web" ? el("p", { class: "muted" }, t("Read from a public webpage. Check the description below for completeness; the source and whether the role is still open have not been verified.")) : null,
+        view.review ? sponsorshipSummary(view.review.sponsorship, false, MODE === "v2" ? actionButton(t("Check the sponsor wording"), async () => {
+          await api(`/api/jobs/${jobId}/sponsorship`, { method: "POST" });
+          await refresh(true);
+        }, true) : null) : null,
         el("details", {}, el("summary", {}, t("Job description")), el("pre", { class: "jd" }, jd.text)),
         interruptedNote(view.interrupted),
         (view.interrupted_operations || []).map((notice) => unfinishedNote(notice, refresh)),
         (view.tasks || []).map((task) => taskNote(task, refresh)),
       ),
-      requirementsPanel(view, refresh),
-      cvPanel(view, refresh),
-      gapsPanel(view, refresh),
+      ...(view.review ? [jobReviewPanel(view, refresh, needsPreparation)] : []),
+      ...(needsPreparation ? [] : [requirementsPanel(view, refresh), cvPanel(view, refresh), gapsPanel(view, refresh)]),
     );
     // V2: while this job's work runs on the server, look again shortly; the page stays usable.
     if ((view.tasks || []).some((task) => !TERMINAL.has(task.status))) {
@@ -1081,7 +1195,7 @@ async function renderJob(jobId) {
       return view;
     }
     const due = !view.gaps || view.gaps.outdated || view.gaps.stale;
-    if (!checked && due && (view.selected_requirements || []).length && view.cv[view.language].head) {
+    if (MODE !== "v2" && !checked && due && (view.selected_requirements || []).length && view.cv[view.language].head) {
       await api(`/api/jobs/${jobId}/gaps`, { method: "POST" });
       return refresh(true);
     }
@@ -1092,6 +1206,7 @@ async function renderJob(jobId) {
 
 // V2: work on this job that is waiting, running, or ended without a result.
 const TASK_NAMES = {
+  read_job_url: t("reading the job for review"), read_listing: t("reading the job for review"),
   prepare_job: t("finding requirements and preparing the CV"), job_from_url: t("reading the job and preparing the CV"),
   start_listing: t("reading the job and preparing the CV"), prepare_cv: t("preparing your CV"),
   tailor_cv: t("rewording your CV"), plan_cv: t("adjusting your CV"), check_gaps: t("checking what your CV shows"),
