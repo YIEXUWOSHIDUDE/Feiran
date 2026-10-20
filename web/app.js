@@ -1000,25 +1000,31 @@ function suggestionBlock(item, post) {
 function writeOwn(view, item, places, refresh, ai = false) {
   if (item.suggestion_status === "added" || !places.length) return null;
   const suggestion = ai ? item.suggestion || {} : {};
+  const guidance = ai && !item.suggestion ? item.guidance : null;
   const chosen = suggestion.kind === "skill" ? `skill:${suggestion.fact_id}`
-    : suggestion.kind === "bullet" ? `entry:${suggestion.entry_key}` : null;
+    : suggestion.kind === "bullet" ? `entry:${suggestion.entry_key}`
+      : guidance ? places.find(place => place.kind === "bullet")?.id : null;
   const select = el("select", {}, places.map((place) => el("option", { value: place.id, selected: place.id === chosen },
     place.kind === "skill" ? t`Add to skills line: ${place.where}` : t`New line under ${place.where}`)));
-  const input = el("input", { type: "text", value: suggestion.kind === "skill" ? suggestion.items.join(", ") : suggestion.text || "" });
+  const input = el("input", { type: "text", value: suggestion.kind === "skill" ? suggestion.items.join(", ") : suggestion.text || guidance?.template || "" });
   const hint = () => {
     I18n.attribute(input, "placeholder", select.value.startsWith("skill:") ? t("Skills to add, separated by commas") : t("The line as it should read on your CV"));
   };
   select.addEventListener("change", hint);
   hint();
   const add = actionButton(ai ? t("Confirm this is true — add to my CV") : t("Add to my CV"), async () => {
+    if (input.value.includes("[[") || input.value.includes("]]")) {
+      throw new Error(t("Replace every [[placeholder]] with your own details before adding this line."));
+    }
     await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/write`, {
       method: "POST", body: JSON.stringify({ place: select.value, text: input.value }),
     });
     await refresh();
   });
   return el("details", { class: "write-own", open: ai },
-    el("summary", {}, ai ? t("Review the suggested entry") : t("Write your own line")),
-    el("p", { class: "muted" }, t("Only what is true for you. It is added as you write it, as a confirmed fact, and the CV is prepared again.")),
+    el("summary", {}, guidance ? t("Edit this reference template") : ai ? t("Review the suggested entry") : t("Write your own line")),
+    guidance ? el("p", { class: "muted" }, t("Replace the [[placeholders]] with your details. You do not need to add confirmed facts first.")) : null,
+    el("p", { class: "muted" }, t("Suggestions may go beyond your saved facts. Choose what applies, edit it, and confirm before adding it to your CV.")),
     el("div", { class: "write-row" }, select, input, add));
 }
 
@@ -1030,10 +1036,14 @@ function aiEntry(view, item, refresh) {
   let opened = false;
   const result = (currentView, currentItem) => {
     opened = true;
-    content.replaceChildren(currentItem.suggestion
-      ? writeOwn(currentView, currentItem, currentView.gaps.places || [], refresh, true)
-        || el("p", {}, t("No place is available for this entry. Update your CV first."))
-      : el("p", { class: "muted" }, t("AI could not suggest an honest line from this information. In Write your own line, describe a real project, what you did, and the tools or dates that support this requirement. If you do not have that experience, leave the gap open.")));
+    const guidance = currentItem.guidance;
+    content.replaceChildren(...[
+      guidance ? el("p", { class: "muted" }, guidance.source === "ai"
+        ? t("AI ideas for experiences you may want to add") : t("Reference template for this requirement")) : null,
+      guidance ? el("ul", {}, guidance.questions.map(question => el("li", {}, question))) : null,
+      writeOwn(currentView, currentItem, currentView.gaps.places || [], refresh, true)
+        || el("p", {}, t("No place is available for this entry. Update your CV first.")),
+    ].filter(Boolean));
   };
   const button = actionButton(t("AI suggested entry"), async () => {
     if (opened) { content.hidden = !content.hidden; return; }

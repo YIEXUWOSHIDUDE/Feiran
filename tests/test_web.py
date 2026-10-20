@@ -78,7 +78,7 @@ class FakeDeepSeek(FakeChat):
                 raise DeepSeekError("测试中不联网", reason="unreachable")
             request = json.loads(messages[-1]["content"])
             return {"model": "deepseek-flash", "content": {"requirements": self.evidence(request)}, "usage": {}}
-        if messages[0]["content"] == SUGGEST_RULES:
+        if messages[0]["content"].startswith(SUGGEST_RULES):
             if self.gap_suggestions is None:
                 raise DeepSeekError("测试中不联网", reason="unreachable")
             request = json.loads(messages[-1]["content"])

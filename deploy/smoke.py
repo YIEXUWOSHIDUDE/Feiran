@@ -84,7 +84,7 @@ class ScriptedDeepSeek:
                  "sets": [[line["id"]] for line in lines if "REST APIs" in line["text"]]}
                 if "REST APIs" in item["text"] else {"id": item["id"], "verdict": "none"}
                 for item in request["requirements"]]}
-        elif system == SUGGEST_RULES:
+        elif system.startswith(SUGGEST_RULES):
             content = {"suggestions": []}
         else:
             raise AssertionError(f"unexpected request: {system[:60]}")
