@@ -277,6 +277,167 @@ def is_senior_title(title: str) -> bool:
     return bool(SENIOR_TITLE.search(ANY_LEVEL_TITLE.sub("", title)))
 
 
+# Hiding senior roles also reads the JD for required experience of this many years or more.
+# The wording rules below are a finite list (see requires_senior_experience), not language understanding.
+SENIOR_YEARS = 5
+_NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+                 "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20}
+_CHINESE_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_NUMBER = "|".join([r"\d{1,2}", *_NUMBER_WORDS])
+_CHINESE_NUMBER = r"\d{1,2}|[一二两三四五六七八九十]{1,3}"
+# Without a number of five or more shortly before "year" or 年, no rule below can apply.
+# Looking from the year word back is quick; looking from every number forward is not.
+_YEAR_WORD = re.compile(r"year|yrs|年")
+_FIVE_OR_MORE = re.compile(r"(?<!\d)(?:0?[5-9]|[1-9]\d)|\b(?:five|six|seven|eight|nine|ten|eleven|twelve|fifteen|"
+                           r"twenty)\b|[五六七八九十]")
+# "at least 5 years of experience", "5 to 8 years of related industry experience", "five (5)+ years' ..."
+_YEARS = re.compile(
+    r"(?:\b(?:(?P<upper>up\s+to|less\s+than|fewer\s+than|under|no\s+more\s+than|(?:a\s+)?maximum(?:\s+of)?)"
+    r"|at\s+least|(?:a\s+)?minimum(?:\s+of)?|min\.|no\s+less\s+than|more\s+than|over)\s+)?"
+    rf"(?<![\w.])(?P<low>{_NUMBER})(?:\s*\(\d{{1,2}}\))?(?:\s*(?:-|–|—|to)\s*(?:{_NUMBER})(?:\s*\(\d{{1,2}}\))?)?"
+    r"(?:\s*\+|\s+or\s+more)?\s*(?:years?|yrs?)\b['’]?"
+    r"(?=(?:\s+(?!years?\b|yrs?\b)[\w/&+#'’-]+(?:\.[\w/&+#'’-]+)*){0,6}?\s+"
+    r"(?:experience|experienced|working|industry)\b)",
+    re.IGNORECASE)
+# "5年以上工作经验", "五年以上", "5至8年Java开发经验"
+_CHINESE_YEARS = re.compile(
+    r"(?:(?P<upper>最多|不超过|少于|低于|小于)|至少|最少|不少于|不低于|超过|大于)?"
+    rf"(?<!\d)(?P<low>{_CHINESE_NUMBER})\s*(?:[-~～—–至到]\s*(?:{_CHINESE_NUMBER})\s*)?年(?!以下|以内|内|制)"
+    r"(?=[^，,；;。：:、\n]{0,15}?经验)")
+# Years count only as the candidate's: opening a clause, after "and", "you have", "must have"...,
+# or after "with" in a clause naming who is hired ("candidates with", "looking for someone with").
+# "Our company has", "a mentor who has", "Senior engineers with" and "a team with" do not qualify.
+_LEAD = re.compile(
+    r"(?:^|\b(?:and|plus|including|requires?|required|requiring|needs?)"
+    r"|(?:^|\b(?:you|you'll|you’ll|candidates?|applicants?|must|should|will|would)\s+)(?:have|has|bring|possess))$",
+    re.IGNORECASE)
+_HIRED_WITH = re.compile(r"\b(?:candidates?|applicants?|someone|somebody|individuals?|degree|looking\s+for|seeking|"
+                         r"hiring)\b.*\bwith$", re.IGNORECASE)
+_OTHERS = re.compile(r"\b(?:mentor\w*|learn(?:ing)?\s+from|work(?:ing)?\s+(?:with|alongside)|alongside|"
+                     r"colleagues|peers|teammates|team)\b", re.IGNORECASE)
+_CHINESE_LEAD = re.compile(r"(?:需|需要|要求|应|须|必须)?(?:具有|具备|拥有|有)?")
+_BULLET = re.compile(r"^[\s\-–—•*·▪◦●○■>]*(?:\(?\d{1,2}[).、]\s*)?")
+_OPTIONAL_BEFORE = re.compile(r"\b(?:ideally|preferably|preferred|bonus|nice[\s-]to[\s-]have|optionally)\b|最好|优先",
+                              re.IGNORECASE)
+_OPTIONAL_AFTER = re.compile(r"\b(?:preferred|a\s+plus|nice[\s-]to[\s-]have|bonus|desired|desirable|optional|"
+                             r"advantageous|an\s+advantage|helpful)\b|优先|加分|更佳|为佳", re.IGNORECASE)
+# A heading (or the label before a colon) opens a part whose years do not count (preferred, or
+# about the company) or a required one. "As an ideal candidate, you will have:" is a required
+# one: "ideal" is not "ideally". A required heading has to end in its heading words, so a line
+# like "Required to travel" is no heading.
+_PREFERRED_HEADING = re.compile(r"\b(?:preferred|nice[\s-]to[\s-]haves?|bonus|desired|desirable|ideally|"
+                                r"good\s+to\s+have|great\s+to\s+have|pluses|a\s+plus)\b|^(?:加分|优先)", re.IGNORECASE)
+_ABOUT_HEADING = re.compile(r"^(?:about\s+(?!you\b|the\s+(?:role|job|position|opportunity|team)\b)\S.*|"
+                            r"who\s+we\s+are|our\s+(?:company|story)|关于我们|公司(?:介绍|简介))$", re.IGNORECASE)
+_REQUIRED_HEADING = re.compile(
+    r"\b(?:requirements?|required|qualifications|must[\s-]haves?|looking\s+for|about\s+you|who\s+you\s+are|"
+    r"you(?:'ll|’ll|\s+will)?\s+(?:have|need|bring)|ideal\s+candidate)\W*$|^(?:任职|岗位|职位|基本)?(?:要求|资格|条件)$",
+    re.IGNORECASE)
+_CLAUSE_BREAK = re.compile(r"[,;:!?()，；：。！？（）、]|\.(?=\s)")
+_SENTENCE_BREAK = re.compile(r"[;!?；。！？]|\.(?=\s|$)")
+# "Bachelor's and 5 years, or Master's and 2": an alternative that asks for fewer years.
+_OR = re.compile(r"\bor\b(?!\s+(?:more|greater|above)\b)|或(?!以上)", re.IGNORECASE)
+
+
+def _years(number: str) -> int:
+    """5, five or 五 as a number; anything unreadable counts as 0, which hides nothing."""
+    if number.isdecimal():
+        return int(number)
+    if number.casefold() in _NUMBER_WORDS:
+        return _NUMBER_WORDS[number.casefold()]
+    tens, ten, units = number.partition("十")
+    if not ten:
+        return _CHINESE_DIGITS.get(number, 0)
+    return (_CHINESE_DIGITS.get(tens, 0) if tens else 1) * 10 + _CHINESE_DIGITS.get(units, 0)
+
+
+def _units(text: str) -> list[str]:
+    """The JD's lines (one per paragraph or list item); a line opening with "or" belongs to the
+    one before, as in "Bachelor's AND 6+ years" / "OR Master's AND 4+ years"."""
+    units: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if units and re.match(r"(?:or\b|或)", line, re.IGNORECASE):
+            units[-1] += " " + line
+        elif line:
+            units.append(line)
+    return units
+
+
+def _section(unit: str, first_years: int) -> bool | None:
+    """True if this line opens a part whose years do not count (preferred, or about the company),
+    False if it opens a required one, None if it is no heading. A heading is a short line, or a
+    label ending in a colon before any years."""
+    label = re.match(r"([^:：]*)[:：]", unit) if ":" in unit or "：" in unit else None
+    if label and label.end() <= first_years and len(label.group(1).split()) <= 8:
+        head = label.group(1).strip()
+    elif (first_years == len(unit) and len(unit) <= 80 and len(unit.split()) <= 5
+          and not unit.endswith((".", "。"))):
+        head = unit
+    else:
+        return None
+    if _PREFERRED_HEADING.search(head) or _ABOUT_HEADING.match(head):
+        return True
+    return False if _REQUIRED_HEADING.search(head) else None
+
+
+def requires_senior_experience(text: str) -> bool:
+    """Whether the JD states that the role requires at least SENIOR_YEARS years of experience.
+
+    It reads only this wording: "5+ years", "5 or more years", "at least / a minimum of five
+    years", "5 years", ranges "5-8 / 5–8 / 5 to 8 years" (the lower end counts), or "5年以上 /
+    五年以上 / 5至8年", followed within a few words by experience (经验). The years must open a
+    line or clause, follow "and", "you have", "must have" and the like, or follow "with" in a
+    clause naming who is hired ("candidates with"); so "Our company has 10 years of
+    experience" and "Senior engineers with 10+ years of experience will mentor you" do not
+    count. Years under a preferred heading (Preferred / Nice to have / 加分项) or an About us /
+    About <company> heading, or marked ideally, preferably, preferred, a plus, 优先 in their own
+    clause, do not count; a later required heading (Requirements, Required Qualifications, ...)
+    counts again. An "or" offering fewer years ("Bachelor's and 5 years, or Master's and 2
+    years", "a degree or 5+ years") keeps the role. Anything phrased otherwise leaves the role
+    visible."""
+    lowered = text.lower()
+    if not any(_FIVE_OR_MORE.search(lowered, max(0, word.start() - 24), word.start())
+               for word in _YEAR_WORD.finditer(lowered)):
+        return False
+    ignored = False  # inside a preferred part or one about the company
+    for unit in _units(text):
+        found = []
+        if _YEAR_WORD.search(unit.lower()):
+            found = sorted([(match, False) for match in _YEARS.finditer(unit)]
+                           + [(match, True) for match in _CHINESE_YEARS.finditer(unit)],
+                           key=lambda item: item[0].start())
+        section = _section(unit, found[0][0].start() if found else len(unit))
+        if section is not None:
+            ignored = section
+        if ignored:
+            continue
+        stated = []  # (match, lower bound, whether it reads as the candidate's requirement)
+        for index, (match, chinese) in enumerate(found):
+            following = found[index + 1][0].start() if index + 1 < len(found) else len(unit)
+            stop = _SENTENCE_BREAK.search(unit, match.end(), following)
+            start = max([0] + [item.end() for item in _CLAUSE_BREAK.finditer(unit, 0, match.start())])
+            before = unit[start:match.start()]
+            # A marker after the years reaches to the sentence end or the next years, so the
+            # "ideally" in "5 to 8 years ..., ideally 2 years ..." belongs to the 2 years only.
+            if (match["upper"] or _OPTIONAL_BEFORE.search(before)
+                    or _OPTIONAL_AFTER.search(unit, match.end(), stop.start() if stop else following)):
+                continue
+            lead = _BULLET.sub("", before).strip()
+            if chinese:
+                required = bool(_CHINESE_LEAD.fullmatch(lead))
+            else:
+                required = bool(_LEAD.search(lead) or _HIRED_WITH.search(lead)) and not _OTHERS.search(lead)
+            stated.append((match, _years(match["low"]), required))
+        for match, years, required in stated:
+            if required and years >= SENIOR_YEARS and not any(
+                    fewer < SENIOR_YEARS
+                    and _OR.search(unit[min(match.end(), other.end()):max(match.start(), other.start())])
+                    for other, fewer, _ in stated):
+                return True
+    return False
+
+
 def _matched_count(tags: list[str]) -> int:
     return len({tag.casefold() for tag in tags})
 
@@ -318,7 +479,8 @@ def ranked_listings(
     """Open postings, most confirmed skills mentioned first; a count of words, not a fit score.
 
     The same role posted in several cities (same title and text) is one row. Ties go to the
-    newest posting. A location filter keeps postings whose location is unknown.
+    newest posting. A location filter keeps postings whose location is unknown. Filters work
+    as group_postings describes.
 
     This single-owner copy works the local sponsor rules out again on each read and stores no
     answer, so a rule change shows at once and there is nothing to backfill (V2 stores them:
@@ -376,27 +538,36 @@ def group_postings(
     region: str = "all",
     sponsorship: str = "all",
 ) -> dict[str, Any]:
-    """Filter and rank postings (each with its ``matched`` skill words and the ``sponsorship``
-    answer its caller read or worked out; none shows as not assessed), most skills mentioned
-    first. The same role posted in several cities (same title and text) is one row; ties go to
-    the newest posting; a location filter keeps postings whose location is unknown."""
+    """Filter and rank postings (each with its stored JD ``text``, its ``matched`` skill words and
+    the ``sponsorship`` answer its caller read or worked out; none shows as not assessed), most
+    skills mentioned first. The same role posted in several cities (same title and text) is one
+    row; ties go to the newest posting; a location filter keeps postings whose location is unknown.
+
+    The title filter keeps titles containing every word of it, in any order ("software inter"
+    finds "Software Engineering Internship"). hide_senior drops senior titles and JDs that
+    requires_senior_experience reads as asking for five or more years; the rest stay. The text
+    is only read here: no listing returned carries it."""
     if isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE or offset < 0:
         raise ListingsError(f"每页岗位数必须在 1 到 {MAX_PAGE_SIZE} 之间")
     if region not in {"all", "cn", "other", "unknown"}:
         raise ListingsError("地区筛选无效")
     if sponsorship not in {"all", "not_assessed", *STATUSES}:
         raise ListingsError("Sponsor filter is invalid")
-    title_key, location_key = title.strip().casefold(), location.strip().casefold()
+    title_words, location_key = title.casefold().split(), location.strip().casefold()
     groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for row in postings:
         if region != "all" and region not in location_regions(row["location"]):
             continue
-        if title_key not in row["title"].casefold() or (hide_senior and is_senior_title(row["title"])):
+        name = row["title"].casefold()
+        if not all(word in name for word in title_words) or (hide_senior and is_senior_title(row["title"])):
             continue
         if location_key and row["location"] and location_key not in row["location"].casefold():
             continue
         assessment = row.get("sponsorship") or shown(None, source=row["source"], captured_at=row["last_seen_at"])
         if sponsorship != "all" and assessment["status"] != sponsorship:
+            continue
+        # Reading the JD costs the most, so it comes after every other filter.
+        if hide_senior and requires_senior_experience(row.get("text") or ""):
             continue
         role = (row["provider"], row["board"], row["title"].casefold(), row["text_hash"])
         if role not in groups:

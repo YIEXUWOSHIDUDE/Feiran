@@ -573,7 +573,7 @@ async function renderFind() {
   const listBox = el("div", {}, el("p", { class: "muted" }, t("Loading…")));
   const companiesBox = el("div");
   const inputs = {
-    title: el("input", { type: "text", placeholder: t("Title contains, e.g. engineer or intern"), value: find.title }),
+    title: el("input", { type: "text", placeholder: t("Title contains all words, e.g. software intern"), value: find.title }),
     location: el("input", { type: "text", placeholder: t("Location contains, e.g. New York or Remote"), value: find.location }),
   };
   const region = el("select", { class: "region-select", "aria-label": t("Job region") },
@@ -701,7 +701,7 @@ async function renderFind() {
         t("Most matched first: how many of your confirmed skills each posting mentions. "),
         t("It counts words; it is not a fit score or your chance of an offer. Pending facts never count.")),
       el("div", { class: "toolbar" }, region, sponsorship, inputs.title, inputs.location, filterButton,
-        el("label", { class: "check", title: t("Hides Senior, Staff, Principal, Lead, Manager, Director… titles. \"Member of Technical Staff\" stays.") }, hideSenior, t(" Hide senior roles")),
+        el("label", { class: "check", title: t("Hides roles titled Senior, Staff, Principal, Lead, Manager, Director… (\"Member of Technical Staff\" does not count) and roles whose JD explicitly requires 5+ years of experience. Roles whose level is unclear stay visible.") }, hideSenior, t(" Hide senior roles")),
         refreshAll),
       el("p", { class: "muted sponsor-filter-note" }, t("Unknown sponsorship stays visible by default. These labels describe the JD; they do not establish your eligibility.")),
       status,

@@ -17,7 +17,7 @@ from tenant_store import UserWorkspace, set_setting, set_user_active
 from tests.fake_identity import CLIENT_ID, DOMAIN, ISSUER, ORIGIN, FakeCognito
 from tests.test_cv import FakePrinter
 from tests.test_cv_import import ANSWER, LINES, minimal_pdf
-from tests.test_listings import FakeBoards, posting
+from tests.test_listings import MONGODB_DUBLIN, MONGODB_GERMANY, FakeBoards, posting
 from tests.test_web import FakeDeepSeek
 from v2_flow import make_handlers
 from cv_import import MAX_PDF_BYTES
@@ -482,6 +482,41 @@ class IsolationTests(V2Case):
         refused = again.get("/auth/callback", params=self.cognito.authorize(started.headers["location"], "alice"),
                             follow_redirects=False)
         self.assertEqual(refused.status_code, 403)
+
+
+class ListingFilterTests(V2Case):
+    def test_listing_filters_read_the_stored_jd_and_every_title_word_before_paging(self):
+        self.boards.jobs = [
+            posting("1", "Solutions Architect", MONGODB_DUBLIN, location="Dublin"),
+            posting("2", "Solutions Architect", MONGODB_GERMANY, location="Germany"),
+            posting("3", "Software Engineer Intern", "Python.\n2+ years of experience preferred."),
+            posting("4", "Software Engineering Internship", "Python."),
+            posting("5", "Senior Software Engineer, Internal Tools", "Python."),
+            posting("6", "Software Engineer, Internal Platform", "Requirements\n5+ years of experience with Python."),
+        ]
+        client, headers = self.browser()
+        added = client.post("/api/sources", json={"link": "https://job-boards.greenhouse.io/example"}, headers=headers)
+        self.assertEqual(added.status_code, 200, added.text)
+
+        def listed(query=""):
+            response = client.get("/api/listings" + query, headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            ranked = response.json()
+            for group in ranked["listings"]:  # the JD is read on the server, never sent with the list
+                self.assertNotIn("text", group)
+                for item in group["postings"]:
+                    self.assertNotIn("text", item)
+            return ranked["total"], sorted(group["postings"][0]["job_id"] for group in ranked["listings"])
+
+        self.assertEqual(listed(), (6, ["1", "2", "3", "4", "5", "6"]))
+        self.assertEqual(listed("?hide_senior=true"), (2, ["3", "4"]))
+        self.assertEqual(listed("?hide_senior=true&limit=1&offset=1"), (2, ["4"]))
+        self.assertEqual(listed("?title=software%20inter"), (4, ["3", "4", "5", "6"]))
+        self.assertEqual(listed("?title=%20INTER%20%20software&hide_senior=true"), (2, ["3", "4"]))
+        # A posting read again is judged by its new words.
+        tenant_store.store_public_board(self.database, "greenhouse", "example", "Example", self.boards.jobs[:3] + [
+            posting("4", "Software Engineering Internship", "Minimum Qualifications\nAt least five years of work experience.")])
+        self.assertEqual(listed("?title=software%20inter&hide_senior=true"), (1, ["3"]))
 
 
 if __name__ == "__main__":
