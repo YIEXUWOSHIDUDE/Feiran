@@ -530,6 +530,48 @@ class MoreRouteTests(V2Case):
     def job(self, client, headers, job_id):
         return client.get(f"/api/jobs/{job_id}", headers=headers).json()
 
+    def test_targeted_suggestion_is_private_cached_and_never_confirms_a_fact(self):
+        client, headers = self.ready_user()
+        job_id = self.new_job(client, headers)
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        before = client.get("/api/facts", headers=headers).json()
+        view = self.job(client, headers, job_id)
+        rid = next(r["requirement_id"] for r in view["gaps"]["requirements"] if r["text"] == "熟悉Python，了解SQL")
+        self.chat.gap_suggestions = lambda ids: [{"requirement": ids["熟悉Python，了解SQL"], "kind": "skill",
+            "line": "fact-skills-languages", "items": ["SQL"]}]
+        url = f"/api/jobs/{job_id}/gaps/{rid}/suggest"
+        other, other_headers = self.browser("other")
+        self.assertEqual(other.post(url, headers=other_headers).status_code, 404)
+        response = client.post(url, headers={**headers, "Idempotency-Key": "one-suggestion"})
+        self.assertEqual(self.settle(client, headers, response)["status"], "succeeded")
+        self.assertEqual(client.get("/api/facts", headers=headers).json(), before)
+        usage = client.get("/api/me", headers=headers).json()["usage"]["tokens"]["calls"]
+        for _ in range(2):
+            saved = client.post(url, headers={**headers, "Idempotency-Key": "one-suggestion"})
+            self.assertEqual(saved.status_code, 200)
+        self.assertEqual(client.get("/api/me", headers=headers).json()["usage"]["tokens"]["calls"], usage)
+        row = next(r for r in saved.json()["gaps"]["requirements"] if r["requirement_id"] == rid)
+        self.assertEqual(row["suggestion"]["items"], ["SQL"])
+        self.assertEqual(row["suggestion_status"], "open")
+
+    def test_targeted_suggestion_is_not_published_after_inputs_change(self):
+        client, headers = self.ready_user()
+        job_id = self.new_job(client, headers)
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        view = self.job(client, headers, job_id)
+        rid = view["gaps"]["requirements"][0]["requirement_id"]
+        uid = tenant_store.provision_user(self.database, issuer=ISSUER, subject="alice")
+        user = UserWorkspace(self.database, uid)
+        def change_during_call(ids):
+            user.decline_gap(job_id, rid)
+            return [{"requirement": rid, "kind": "none"}]
+        self.chat.gap_suggestions = change_during_call
+        response = client.post(f"/api/jobs/{job_id}/gaps/{rid}/suggest", headers=headers)
+        self.assertEqual(self.settle(client, headers, response)["status"], "superseded")
+        row = next(r for r in self.job(client, headers, job_id)["gaps"]["requirements"] if r["requirement_id"] == rid)
+        self.assertEqual(row["suggestion_status"], "declined")
+        self.assertFalse(row["ai_checked"])
+
     def test_requirement_decisions_prepare_again_and_each_change_can_be_undone(self):
         self.chat.plan = self.PLAN
         client, headers = self.ready_user()

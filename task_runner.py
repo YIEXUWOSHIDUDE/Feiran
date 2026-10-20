@@ -19,12 +19,43 @@ from typing import Any, Callable
 
 import run_log
 import tenant_store
-from deepseek_client import chat_json
-from tenant_store import LateResult, NotFound, StoreError, UserWorkspace
+from deepseek_client import MAX_TOKENS, CallRefused, chat_json, estimate_prompt_tokens
+from tenant_store import LateResult, NotFound, Refused, StoreError, UserWorkspace
 from v2_flow import TaskFailed
 
 
 log = logging.getLogger("workbench.tasks")
+
+
+class CallMeter:
+    """The ledger side of one task execution's model calls (deepseek_client.chat_json's
+    ``meter``): each call is begun, settled or failed in model_calls (tenant_store.begin_call).
+    A refusal to begin (allowance, new work paused) becomes CallRefused, so the stage falls back
+    and says why; a call for an execution that has ended raises LateResult, and nothing is sent.
+    A report that cannot be stored is logged and leaves the call pending, still reserved; the
+    next start marks it unknown."""
+
+    def __init__(self, database: Path, user_id: str, task_id: str, token: str) -> None:
+        self.database, self.user_id, self.task_id, self.token = database, user_id, task_id, token
+
+    def begin(self, prompt_tokens: int, max_output: int) -> tuple[str, int]:
+        try:
+            return tenant_store.begin_call(self.database, self.user_id, self.task_id, self.token,
+                                           prompt_tokens=prompt_tokens, max_output=max_output)
+        except Refused as exc:
+            raise CallRefused(str(exc), exc.code, exc.detail) from exc
+
+    def settle(self, call: str, usage: object) -> None:
+        try:
+            tenant_store.settle_call(self.database, self.user_id, call, usage)
+        except StoreError:
+            run_log.event(log, "meter_failed", level=logging.ERROR, error=True, step="settle")
+
+    def fail(self, call: str, reason: str) -> None:
+        try:
+            tenant_store.fail_call(self.database, self.user_id, call, reason)
+        except StoreError:
+            run_log.event(log, "meter_failed", level=logging.ERROR, error=True, step="fail")
 
 
 @dataclass
@@ -41,14 +72,23 @@ class TaskContext:
     model: Callable[..., dict] = field(repr=False)
 
     def chat(self, messages: list[dict], model: str, effort: str) -> dict:
-        """The model, metered for this task: before each call the task is marked as possibly
-        costing money (a cancelled or timed-out task raises LateResult here and no call is made);
-        after it, the reported token counts are added under this execution's token, so an answer
-        that comes after the task ended never changes a later attempt's accounting. A call that
-        raises leaves the task's cost unknown."""
-        tenant_store.mark_spending(self.database, self.user.user_id, self.task_id, self.token, "model")
-        answer = self.model(messages, model=model, effort=effort)
-        tenant_store.record_usage(self.database, self.user.user_id, self.task_id, self.token, answer.get("usage"))
+        """The model, metered per transport call under this execution (CallMeter), so a late
+        answer settles its own call and never a later attempt's. The real client
+        (``meters_calls``) takes the meter and records each HTTP attempt itself, after its key
+        and request were checked: a missing key makes no call. Any other model (tests, stand-ins)
+        is metered here, one call per answer, so no call is counted twice. A cancelled, timed-out
+        or retried execution raises LateResult before anything is sent; a call that raises leaves
+        the task's cost unknown."""
+        meter = CallMeter(self.database, self.user.user_id, self.task_id, self.token)
+        if getattr(self.model, "meters_calls", False) is True:  # declared, not merely answered (a Mock answers anything)
+            return self.model(messages, model=model, effort=effort, meter=meter)
+        call, _budget = meter.begin(estimate_prompt_tokens(messages), MAX_TOKENS)
+        try:
+            answer = self.model(messages, model=model, effort=effort)
+        except BaseException as exc:
+            meter.fail(call, getattr(exc, "reason", "model_error"))
+            raise
+        meter.settle(call, answer.get("usage") if isinstance(answer, dict) else None)
         return answer
 
     def stage(self, name: str) -> None:

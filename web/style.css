@@ -515,3 +515,9 @@ input[type="file"]::file-selector-button { padding: 8px 12px; margin-right: 12px
   .mobile-label { display: inline; color: var(--muted); margin-right: 8px; font-size: 12px; }
   .sponsor-badge { font-size: 12px; }
 }
+
+.account-usage { max-width: 1240px; margin: 12px auto; padding: 12px 20px; background: #eef4fa; border-radius: 10px; color: #243b53; }
+.account-usage summary { cursor: pointer; font-weight: 600; }
+.account-usage p { margin: 8px 0 0; font-size: .9rem; }
+.ai-entry { margin: 12px 0; padding: 12px; border-left: 3px solid #526eaa; background: #f5f8fc; }
+.ai-entry input { width: 100%; min-width: 0; }

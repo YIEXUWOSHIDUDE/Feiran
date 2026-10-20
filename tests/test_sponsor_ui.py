@@ -42,7 +42,7 @@ const sandbox = {
   localStorage: { getItem() { return null; }, setItem() {} },
   document: {
     querySelector(selector) { return { content: selector.includes("mode") ? MODE : "synthetic-token" }; },
-    getElementById(id) { return id === "app" ? app : message; },
+    getElementById(id) { return id === "app" ? app : id === "message" ? message : null; },
     createElement(tag) { return new Element(tag); },
     createTextNode(value) { return new TextNode(value); },
   },
