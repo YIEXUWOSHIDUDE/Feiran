@@ -39,7 +39,7 @@ from cv import CVError, rejected_lines, render_html, rewritten_lines
 from cv_import import MAX_PDF_BYTES, CVImportError, read_pdf_limited
 from cv_status import CANDIDATE_FIELDS, describe_fallbacks, explained
 from facts import FactStoreError, parse_fact_refs, tag_finder
-from gaps import GAPS_VERSION, coverage, places
+from gaps import GAPS_VERSION, coverage, places, suggestion_target
 from identity import Identity, IdentityError, OIDCSettings
 from job_search import SearchError, check_board, fetch_board, parse_board_link, parse_posting_link, prepare_pasted_jd
 from job_url import normalize_url
@@ -935,6 +935,31 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
                       context={"language": view["language"], "base_gaps_version": version},
                       key=f"gaps:{job_id}:{head['material']['material_id']}:{version}:{facts}", job_id=job_id)
         return queued(task, **view)
+
+    @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/suggest", response_model=None)
+    def suggest_entry(request: Request, job_id: str, requirement_id: str) -> dict | JSONResponse:
+        user = workspace(request)
+        snapshot = user.job_snapshot(job_id)
+        view = build_job_view(snapshot)
+        inputs = user.gaps_inputs(job_id, view['language'])
+        if not inputs['gaps'] or not inputs['head'] or not inputs['requirements']:
+            raise StoreError('Check this CV against the requirements first.')
+        try:
+            item = suggestion_target(inputs['gaps']['gaps'], inputs['requirements']['decided'],
+                                     inputs['head']['draft'],
+                                     [(f['id'], f['version']) for f in inputs['facts'].listed() if f['status'] == 'confirmed'],
+                                     requirement_id)
+        except ValueError as exc:
+            raise Conflict(str(exc)) from exc
+        if item.get('suggestion') or item.get('ai_checked') or item['status'] in ('added', 'declined'):
+            return job_view(user, job_id)
+        version = inputs['gaps']['version']
+        task = submit(request, 'suggest_gap', {'job_id': job_id, 'requirement_id': requirement_id},
+                      context={'language': view['language'], 'base_gaps_version': version,
+                               'checked_head': inputs['head']['material_id'],
+                               'requirements_version': inputs['requirements']['version']},
+                      key=f'suggestion:{job_id}:{requirement_id}:{version}', job_id=job_id)
+        return queued(task)
 
     def gap_change(request: Request, job_id: str, change: Callable[[UserWorkspace], dict]) -> JSONResponse:
         user = workspace(request)

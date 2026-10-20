@@ -7,7 +7,7 @@ from cv import build_draft, tailor_draft
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError
 from facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
-from gaps import EVIDENCE_RULES, SUGGEST_RULES, accept_gap, addition, coverage, decline_gap, find_gaps, places, write_line
+from gaps import suggest_gap, EVIDENCE_RULES, SUGGEST_RULES, accept_gap, addition, coverage, decline_gap, find_gaps, places, write_line
 from requirement_flow import apply_requirement_decisions, propose_requirements
 from tests.test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
 from tests.test_cv_plan import FakePlanner
@@ -580,3 +580,58 @@ class CoverageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TargetedSuggestionTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.db = make_store(directory.name)
+        self.cv = build_draft(PROFILE, self.db, "en")
+        self.decided = decided_job()
+        self.checked = find_gaps(self.decided, self.cv, self.db, FakeDeepSeek(lambda ids: []))
+        self.ids = {r["text"]: r["requirement_id"] for r in self.checked["requirements"]}
+
+    def test_one_row_only_saved_reused_and_facts_unchanged(self):
+        before = list_facts(self.db)
+        rid = self.ids["Writing integration tests for services"]
+        chat = FakeDeepSeek(lambda ids: [{"requirement": ids["Writing integration tests for services"],
+            "kind": "bullet", "entry": "s1e0", "text": "Wrote integration tests for internal services.",
+            "tags": ["integration tests"]}])
+        result = suggest_gap(self.checked, self.decided, self.cv, self.db, rid, chat)
+        self.assertEqual(len(chat.sent), 1)
+        self.assertEqual(len(json.loads(chat.sent[0])["gaps"]), 1)
+        self.assertEqual(list_facts(self.db), before)
+        self.assertTrue(next(r for r in result["requirements"] if r["requirement_id"] == rid)["suggestion"])
+        self.assertEqual(suggest_gap(result, self.decided, self.cv, self.db, rid, chat), result)
+        self.assertEqual(len(chat.sent), 1)
+        for old, new in zip(self.checked["requirements"], result["requirements"]):
+            if old["requirement_id"] != rid:
+                self.assertEqual(old, new)
+        for private in ("Alex Example", "Example Corp", "Example University", *(f["id"] for f in FACTS)):
+            self.assertNotIn(private, chat.sent[0])
+
+    def test_years_cannot_be_patched_with_a_model_claim_and_none_is_cached(self):
+        rid = self.ids["3+ years of backend experience"]
+        chat = FakeDeepSeek(lambda ids: [{"requirement": rid, "kind": "bullet", "entry": "s1e0",
+            "text": "Applied extensive backend experience to production services.", "tags": []}])
+        result = suggest_gap(self.checked, self.decided, self.cv, self.db, rid, chat)
+        row = next(r for r in result["requirements"] if r["requirement_id"] == rid)
+        self.assertIsNone(row["suggestion"])
+        self.assertTrue(row["ai_needs_details"])
+        suggest_gap(result, self.decided, self.cv, self.db, rid, chat)
+        self.assertEqual(len(chat.sent), 1)
+        with self.assertRaises(ValueError):
+            accept_gap(result, rid, self.db, copy.deepcopy(PROFILE))
+
+    def test_changed_requirements_and_invalid_response_do_not_save_success(self):
+        rid = self.ids["Writing integration tests for services"]
+        changed = copy.deepcopy(self.decided)
+        changed["selected_requirements"][0]["text"] = "New requirement"
+        chat = FakeDeepSeek(lambda ids: [])
+        with self.assertRaises(ValueError):
+            suggest_gap(self.checked, changed, self.cv, self.db, rid, chat)
+        self.assertEqual(chat.sent, [])
+        with self.assertRaises(DeepSeekError):
+            suggest_gap(self.checked, self.decided, self.cv, self.db, rid, chat)
+        self.assertNotIn("ai_checked", next(r for r in self.checked["requirements"] if r["requirement_id"] == rid))

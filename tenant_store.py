@@ -16,6 +16,13 @@ Sponsor answers (sponsorship.py) are worked out when words are saved: a public b
 user's saved job, the user's explicit check or backfill_sponsorship. Reading a page only reads
 them. Format 3 has grown only by such added tables, which a release from before them ignores;
 upgrade_store adds them to a store that release made.
+
+Model use is metered per transport call in model_calls (begin_call, settle_call, fail_call):
+each call has its own ID, belongs to one task execution and one UTC day, holds a conservative
+reservation while it runs and is charged what the provider reported (prompt plus completion
+tokens) once it answers, or keeps its reservation when its use cannot be proven. The quota mode
+is "legacy" (fixed units per task, reserved at submit) until the operator configures "tokens"
+(daily token limits checked when each call starts); legacy units are never read as tokens.
 """
 
 import hashlib
@@ -65,8 +72,22 @@ ACTIVE_TASKS = ("queued", "running")
 RETRYABLE_TASKS = ("failed", "interrupted", "cancelled", "superseded")
 MAX_TASK_ATTEMPTS = 3
 SETTING_KEYS = ("registration_open", "max_accounts", "tasks_enabled", "user_daily_units", "site_daily_units",
-                "queue_limit")
+                "queue_limit", "quota_mode", "user_daily_tokens", "site_daily_tokens")
 DEFAULT_SETTINGS = {"registration_open": "0", "max_accounts": "100", "tasks_enabled": "1", "queue_limit": "20"}
+# No quota_mode setting means legacy: a store made before tokens existed keeps its unit limits as
+# units. Tokens mode needs both token limits, set together with it (configure_quota).
+QUOTA_MODES = ("legacy", "tokens")
+UNIT_LIMITS = ("user_daily_units", "site_daily_units")
+TOKEN_LIMITS = ("user_daily_tokens", "site_daily_tokens")
+MAX_DAILY_TOKENS = 10 ** 12
+# The smallest output budget a model call starts with in tokens mode: with less room left it is
+# refused before anything is sent, since a shorter answer would most likely be cut off and wasted.
+MIN_OUTPUT_TOKENS = 1024
+# Model work is refused at submit when less is left than any one call could need (the shortest
+# instructions here are near a kilobyte, so about MIN_OUTPUT_TOKENS of prompt plus that output).
+MIN_START_TOKENS = 2 * MIN_OUTPUT_TOKENS
+MAX_REPORTED_TOKENS = 10 ** 9  # a single call reporting more than this is malformed, not believed
+RESETS = "It resets at 00:00 UTC."
 DATABASE = "v2.db"  # in the data folder, beside the deletion ledger
 DELETION_LEDGER = "deleted-accounts.jsonl"
 
@@ -400,11 +421,68 @@ SPONSOR_SCHEMA = (
 SPONSOR_BATCH = 50  # public texts assessed per short write transaction
 # Where a backfill round stopped: the last public words (by their hash) or saved job it worked on.
 _BACKFILL_POSITION = re.compile(r"public:([0-9a-f]{64})|private:([^:\s]+):([^:\s]+)")
+# Model metering, added the same way. Its rows name their account (users) and nothing else, so a
+# release from before them can still delete an account; what such a release leaves behind of a
+# deleted account goes at the next upgrade_store.
+METER_TABLES = ("model_calls", "quota_exemptions", "deleted_model_usage")
+METER_SCHEMA = (
+    # One row per transport call (each HTTP attempt): its own ID, the task execution it was made
+    # for (the attempt and a hash of its execution token), the UTC day it was reserved on, the
+    # reservation (prompt estimate plus output budget) and what the provider reported. pending:
+    # under way; settled: the reported prompt and completion tokens are its charge; unknown: no
+    # usable report (an HTTP error, no answer, malformed usage, a restart), so it stays charged at
+    # least its reservation. Never a prompt or an answer.
+    """CREATE TABLE IF NOT EXISTS model_calls (
+    call_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK(attempt >= 0),
+    execution_sha256 TEXT NOT NULL,
+    day TEXT NOT NULL,
+    reserved INTEGER NOT NULL CHECK(reserved > 0),
+    max_output INTEGER NOT NULL CHECK(max_output > 0),
+    exempt INTEGER NOT NULL CHECK(exempt IN (0, 1)),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'settled', 'unknown')),
+    prompt_tokens INTEGER CHECK(prompt_tokens >= 0),
+    completion_tokens INTEGER CHECK(completion_tokens >= 0),
+    cache_hit_tokens INTEGER CHECK(cache_hit_tokens >= 0 AND cache_hit_tokens <= prompt_tokens),
+    cache_miss_tokens INTEGER CHECK(cache_miss_tokens >= 0 AND cache_miss_tokens <= prompt_tokens),
+    error TEXT,
+    late INTEGER NOT NULL DEFAULT 0 CHECK(late IN (0, 1)),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    CHECK(status != 'settled' OR (prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL))
+)""",
+    "CREATE INDEX IF NOT EXISTS model_calls_by_day ON model_calls(day, user_id)",
+    "CREATE INDEX IF NOT EXISTS model_calls_by_task ON model_calls(user_id, task_id)",
+    # Accounts the operator marked as test accounts with no daily model limit (v2_admin.py only).
+    """CREATE TABLE IF NOT EXISTS quota_exemptions (
+    user_id TEXT PRIMARY KEY REFERENCES users(user_id),
+    kind TEXT NOT NULL CHECK(kind = 'test_unlimited'),
+    granted_at TEXT NOT NULL
+)""",
+    # What deleted accounts' calls charged each day, without saying whose, so deleting an account
+    # never gives the site back tokens that were spent.
+    """CREATE TABLE IF NOT EXISTS deleted_model_usage (
+    day TEXT PRIMARY KEY,
+    calls INTEGER NOT NULL CHECK(calls >= 0),
+    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+    charged_tokens INTEGER NOT NULL CHECK(charged_tokens >= 0)
+)""",
+)
+ADDED_TABLES = SPONSOR_TABLES + METER_TABLES
+ADDED_INDEXES = ("model_calls_by_day", "model_calls_by_task")
+ADDED_SCHEMA = SPONSOR_SCHEMA + METER_SCHEMA
+# What one call counts against a limit: a settled call what was reported; any other at least its
+# reservation, and more if a part that was reported says so.
+_CHARGE = ("CASE WHEN status = 'settled' THEN prompt_tokens + completion_tokens "
+           "ELSE MAX(reserved, COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) END")
 # Every table holding one user's rows, children before parents: deleting an account goes in this order.
 USER_TABLES = ("artifacts", "approvals", "material_facts", "materials", "job_gaps", "job_notes",
                "job_requirements", "jobs", "profile_facts", "profile_versions", "profiles", "fact_versions",
-               "facts", "uploads", "posting_matches", "user_sponsor_assessments", "followed_boards", "tasks",
-               "request_keys", "sessions")
+               "facts", "uploads", "posting_matches", "user_sponsor_assessments", "followed_boards", "model_calls",
+               "quota_exemptions", "tasks", "request_keys", "sessions")
 
 
 def _clock() -> datetime:
@@ -505,7 +583,7 @@ def initialize_store(path: Path) -> None:
         connection.execute('PRAGMA foreign_keys = ON')
         settings = "".join(f"\nINSERT INTO settings VALUES ('{key}', '{value}');"
                            for key, value in DEFAULT_SETTINGS.items())
-        added = "".join(f"\n{statement};" for statement in SPONSOR_SCHEMA)
+        added = "".join(f"\n{statement};" for statement in ADDED_SCHEMA)
         connection.executescript('BEGIN IMMEDIATE;\n' + SCHEMA + added + settings +
                                  f'\nPRAGMA application_id = {APPLICATION_ID};'
                                  f'\nPRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;')
@@ -513,28 +591,39 @@ def initialize_store(path: Path) -> None:
         connection.close()
 
 
-def _add_sponsor_tables(connection: sqlite3.Connection) -> None:
-    for statement in SPONSOR_SCHEMA:
+def _add_tables(connection: sqlite3.Connection) -> None:
+    for statement in ADDED_SCHEMA:
         connection.execute(statement)
+
+
+# Rows of the added tables that an older release, not knowing them, left behind for accounts it deleted.
+_ORPHANS = {table: f'''SELECT 1 FROM {table} t JOIN users u ON u.user_id = t.user_id
+                       WHERE u.deleted_at IS NOT NULL LIMIT 1'''
+            for table in ("user_sponsor_assessments", "model_calls", "quota_exemptions")}
 
 
 def upgrade_store(path: Path) -> list[str]:
     """Bring a format-3 store an earlier release made up to this release, as often as it is run:
-    add the tables it lacks (never changing or rebuilding one it has) and drop private sponsor
-    answers of accounts deleted by a release that did not know them. Returns the tables added.
-    Nothing is assessed here: words saved before stay "not assessed" until a board refresh, the
-    user's explicit check, or backfill_sponsorship."""
+    add the tables (and their indexes) it lacks, never changing or rebuilding one it has, and drop
+    what a release that did not know them left of deleted accounts: private sponsor answers,
+    test-account marks, and model calls (their charge kept in the site's day totals). Returns the
+    tables added. Nothing is assessed here: words saved before stay "not assessed" until a board
+    refresh, the user's explicit check, or backfill_sponsorship. No setting changes: a store
+    without quota_mode stays in legacy mode, its unit limits units."""
     with transaction(path) as connection:
-        present = {row['name'] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        orphaned = 'user_sponsor_assessments' in present and connection.execute(
-            '''SELECT 1 FROM user_sponsor_assessments s JOIN users u ON u.user_id = s.user_id
-               WHERE u.deleted_at IS NOT NULL LIMIT 1''').fetchone() is not None
-    missing = [name for name in SPONSOR_TABLES if name not in present]
-    if missing or orphaned:
+        present = {row['name'] for row in connection.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")}
+        orphaned = any(table in present and connection.execute(query).fetchone() is not None
+                       for table, query in _ORPHANS.items())
+    missing = [name for name in ADDED_TABLES if name not in present]
+    if missing or orphaned or not set(ADDED_INDEXES) <= present:
         with transaction(path, write=True) as connection:
-            _add_sponsor_tables(connection)
-            connection.execute('''DELETE FROM user_sponsor_assessments
-                WHERE user_id IN (SELECT user_id FROM users WHERE deleted_at IS NOT NULL)''')
+            _add_tables(connection)
+            for row in connection.execute('''SELECT DISTINCT c.user_id FROM model_calls c JOIN users u
+                                              ON u.user_id = c.user_id WHERE u.deleted_at IS NOT NULL''').fetchall():
+                _fold_calls(connection, row['user_id'])
+            for table in _ORPHANS:
+                connection.execute(f'''DELETE FROM {table}
+                    WHERE user_id IN (SELECT user_id FROM users WHERE deleted_at IS NOT NULL)''')
     return missing
 
 
@@ -581,23 +670,100 @@ def get_settings(path: Path) -> dict[str, str]:
         return _settings(connection)
 
 
+def _quota_mode(settings: dict[str, str]) -> str:
+    return "tokens" if settings.get("quota_mode") == "tokens" else "legacy"
+
+
+def _daily_limits(settings: dict[str, str], mode: str) -> tuple[int | None, int | None]:
+    """The (user, site) daily limits of a quota mode; None where one is not configured."""
+    return tuple(_positive(settings.get(name)) for name in (TOKEN_LIMITS if mode == "tokens" else UNIT_LIMITS))
+
+
+def _check_settings(settings: dict[str, str]) -> None:
+    """Refuse settings that would leave work without finite limits: tokens mode without both
+    token limits, or registration open without the active mode's limits and an account limit."""
+    if settings.get("quota_mode") == "tokens" and None in _daily_limits(settings, "tokens"):
+        raise StoreError("Set user_daily_tokens and site_daily_tokens before quota_mode tokens "
+                         "(v2_admin.py quota tokens sets all three at once)")
+    mode = _quota_mode(settings)
+    if settings.get("registration_open") == "1" and (None in _daily_limits(settings, mode)
+                                                      or _positive(settings.get("max_accounts")) is None):
+        user, site = TOKEN_LIMITS if mode == "tokens" else UNIT_LIMITS
+        raise StoreError(f"Set finite {user}, {site} and max_accounts before opening registration")
+
+
+def _write_settings(connection: sqlite3.Connection, updates: dict[str, str]) -> dict[str, str]:
+    previous = _settings(connection)
+    settings = {**previous, **updates}
+    _check_settings(settings)
+    if settings.get('quota_mode', 'legacy') != previous.get('quota_mode', 'legacy'):
+        if connection.execute("SELECT 1 FROM tasks WHERE status IN ('queued', 'running') LIMIT 1").fetchone():
+            raise StoreError('Wait for queued and running tasks to finish before changing quota mode')
+    for key, value in updates.items():
+        connection.execute('INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                           (key, value))
+    return settings
+
+
 def set_setting(path: Path, key: str, value: str) -> None:
     """Change one site setting. Registration opens only with finite daily quotas and a finite
-    account limit configured, so the site can never be open without spending limits."""
+    account limit configured, so the site can never be open without spending limits; tokens mode
+    needs its two token limits first."""
     if key not in SETTING_KEYS:
         raise StoreError(f"Unknown setting: {key}")
     if key in ("registration_open", "tasks_enabled"):
         if value not in ("0", "1"):
             raise StoreError(f"{key} must be 0 or 1")
-    elif _positive(value) is None:
-        raise StoreError(f"{key} must be a positive whole number")
+    elif key == "quota_mode":
+        if value not in QUOTA_MODES:
+            raise StoreError("quota_mode must be legacy or tokens")
+    elif _positive(value) is None or (key in TOKEN_LIMITS and int(value) > MAX_DAILY_TOKENS):
+        raise StoreError(f"{key} must be a positive whole number" +
+                         (f" of at most {MAX_DAILY_TOKENS}" if key in TOKEN_LIMITS else ""))
     with transaction(path, write=True) as connection:
-        settings = {**_settings(connection), key: value}
-        if settings.get("registration_open") == "1" and not all(
-                _positive(settings.get(name)) for name in ("user_daily_units", "site_daily_units", "max_accounts")):
-            raise StoreError("Set finite user_daily_units, site_daily_units and max_accounts before opening registration")
-        connection.execute('INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-                           (key, value))
+        _write_settings(connection, {key: value})
+
+
+def configure_quota(path: Path, mode: str, *, user_daily_tokens: int | None = None,
+                    site_daily_tokens: int | None = None) -> dict[str, str]:
+    """The operator's switch between quota modes, in one transaction. "tokens" sets both daily
+    token limits with it; "legacy" goes back to the unit limits already set. Nothing is converted
+    either way: units stay units and tokens tokens. Returns the settings."""
+    if mode not in QUOTA_MODES:
+        raise StoreError("The quota mode must be legacy or tokens")
+    updates = {"quota_mode": mode}
+    if mode == "tokens":
+        for name, value in zip(TOKEN_LIMITS, (user_daily_tokens, site_daily_tokens)):
+            if type(value) is not int or not 0 < value <= MAX_DAILY_TOKENS:
+                raise StoreError(f"{name} must be a positive whole number of at most {MAX_DAILY_TOKENS}")
+            updates[name] = str(value)
+    elif user_daily_tokens is not None or site_daily_tokens is not None:
+        raise StoreError("Token limits are set together with quota mode tokens")
+    with transaction(path, write=True) as connection:
+        return _write_settings(connection, updates)
+
+
+def set_test_unlimited(path: Path, user_id: str, *, enabled: bool) -> dict[str, Any]:
+    """Trusted operator change (v2_admin.py; no page or sign-in can make it): mark one account as
+    a test account with no daily model limit, or end that. Such an account is never refused for
+    its own or the site's daily limit, but every call it makes is still metered and counts in the
+    site's total; the kill switch, the queue and its bounds, deadlines and disabling still apply,
+    and a site without configured limits still starts no work."""
+    if type(enabled) is not bool:
+        raise StoreError("Invalid test account state")
+    with transaction(path, write=True) as connection:
+        if connection.execute('SELECT 1 FROM users WHERE user_id = ? AND deleted_at IS NULL',
+                              (_text(user_id, 'user_id'),)).fetchone() is None:
+            raise NotFound("Account unavailable")
+        if enabled:
+            connection.execute("INSERT OR IGNORE INTO quota_exemptions VALUES (?, 'test_unlimited', ?)", (user_id, _now()))
+        else:
+            connection.execute('DELETE FROM quota_exemptions WHERE user_id = ?', (user_id,))
+    return {"user_id": user_id, "test_unlimited": enabled}
+
+
+def _exempt(connection: sqlite3.Connection, user_id: str) -> bool:
+    return connection.execute('SELECT 1 FROM quota_exemptions WHERE user_id = ?', (user_id,)).fetchone() is not None
 
 
 def list_accounts(path: Path) -> list[dict[str, Any]]:
@@ -609,15 +775,93 @@ def list_accounts(path: Path) -> list[dict[str, Any]]:
                 for row in connection.execute("SELECT * FROM users ORDER BY created_at, user_id")]
 
 
+def _resets_at(day: str) -> str:
+    """When a UTC day's allowance starts again: the next midnight, UTC."""
+    return (datetime.fromisoformat(day).replace(tzinfo=timezone.utc) + timedelta(days=1)).isoformat()
+
+
+def _charged(connection: sqlite3.Connection, day: str, user_id: str | None = None) -> int:
+    """The tokens charged on one day: one account's calls, or (no user) the whole site's,
+    deleted accounts' included."""
+    if user_id is not None:
+        return connection.execute(f'SELECT COALESCE(SUM({_CHARGE}), 0) FROM model_calls WHERE day = ? AND user_id = ?',
+                                  (day, user_id)).fetchone()[0]
+    calls = connection.execute(f'SELECT COALESCE(SUM({_CHARGE}), 0) FROM model_calls WHERE day = ?', (day,)).fetchone()[0]
+    gone = connection.execute('SELECT charged_tokens FROM deleted_model_usage WHERE day = ?', (day,)).fetchone()
+    return calls + (gone[0] if gone else 0)
+
+
+def _call_summary(connection: sqlite3.Connection, where: str, values: tuple) -> dict[str, Any]:
+    """Model calls matching ``where``: how many, still under way or of unknown use; the input and
+    output tokens reported by settled calls (cached input, a part of input, where it was reported);
+    what is held beyond that for calls not settled; and the total charged."""
+    row = connection.execute(f'''SELECT COUNT(*) AS calls, COALESCE(SUM(status = 'pending'), 0) AS pending,
+        COALESCE(SUM(status = 'unknown'), 0) AS unknown,
+        COALESCE(SUM(CASE WHEN status = 'settled' THEN prompt_tokens END), 0) AS input,
+        COALESCE(SUM(CASE WHEN status = 'settled' THEN completion_tokens END), 0) AS output,
+        SUM(CASE WHEN status = 'settled' THEN cache_hit_tokens END) AS cached,
+        COALESCE(SUM({_CHARGE}), 0) AS charged FROM model_calls WHERE {where}''', values).fetchone()
+    total = row['input'] + row['output']
+    return {"calls": row['calls'], "pending_calls": row['pending'], "unknown_calls": row['unknown'],
+            "input": row['input'], "output": row['output'], "total": total, "cached_input": row['cached'],
+            "reserved": row['charged'] - total, "charged": row['charged']}
+
+
+def _account_usage(connection: sqlite3.Connection, user_id: str, day: str) -> dict[str, Any]:
+    """One account's day as its own page shows it: the active quota mode's measure (tokens charged,
+    or legacy units reserved) against its limit, and the model calls metered either way. The
+    site's numbers are never part of it: they would show other accounts' use."""
+    settings = _settings(connection)
+    mode = _quota_mode(settings)
+    unlimited = _exempt(connection, user_id)
+    tokens = _call_summary(connection, 'day = ? AND user_id = ?', (day, user_id))
+    if mode == "tokens":
+        used = tokens["charged"]
+    else:
+        row = connection.execute('SELECT units FROM quota_usage WHERE scope = ? AND day = ?', (user_id, day)).fetchone()
+        used = row['units'] if row else 0
+    limit = None if unlimited else _daily_limits(settings, mode)[0]
+    return {"mode": mode, "unit": "tokens" if mode == "tokens" else "units", "day": day, "resets_at": _resets_at(day),
+            "configured": None not in _daily_limits(settings, mode), "test_unlimited": unlimited, "used": used,
+            "limit": limit, "remaining": None if limit is None else max(0, limit - used), "tokens": tokens}
+
+
 def usage_on(path: Path, day: str | None = None) -> dict[str, Any]:
-    """The units reserved on one day (UTC; today by default): the whole site's and each account's."""
+    """One day (UTC; today by default), for the operator: the legacy units reserved (the site's
+    and each account's), the model calls metered (the site, deleted accounts' part included, and
+    each account), the limits, the test accounts, and the token counts that tasks reported
+    before calls were metered, which are incomplete (no day, no retries, no unusable answers)."""
     day = day or _today()
     with transaction(path) as connection:
         used = {row["scope"]: row["units"]
                 for row in connection.execute("SELECT scope, units FROM quota_usage WHERE day = ?", (day,))}
         settings = _settings(connection)
-    return {"day": day, "site": used.pop("*", 0), "site_limit": _positive(settings.get("site_daily_units")),
-            "user_limit": _positive(settings.get("user_daily_units")), "accounts": used}
+        site = _call_summary(connection, 'day = ?', (day,))
+        gone = connection.execute('SELECT * FROM deleted_model_usage WHERE day = ?', (day,)).fetchone()
+        if gone:
+            site = {**site, "calls": site["calls"] + gone["calls"], "input": site["input"] + gone["input_tokens"],
+                    "output": site["output"] + gone["output_tokens"],
+                    "total": site["total"] + gone["input_tokens"] + gone["output_tokens"],
+                    "charged": site["charged"] + gone["charged_tokens"]}
+            site["reserved"] = site["charged"] - site["total"]
+        accounts = {row["user_id"]: _call_summary(connection, 'day = ? AND user_id = ?', (day, row["user_id"]))
+                    for row in connection.execute('SELECT DISTINCT user_id FROM model_calls WHERE day = ? ORDER BY user_id',
+                                                  (day,))}
+        unlimited = [row["user_id"] for row in connection.execute('SELECT user_id FROM quota_exemptions ORDER BY user_id')]
+        earlier = {"prompt_tokens": 0, "completion_tokens": 0}
+        for row in connection.execute("SELECT usage FROM tasks"):
+            for name, count in _usage_state(row["usage"])["tokens"].items():
+                if name in earlier:
+                    earlier[name] += count
+    user_tokens, site_tokens = _daily_limits(settings, "tokens")
+    return {"day": day, "mode": _quota_mode(settings), "site": used.pop("*", 0),
+            "site_limit": _positive(settings.get("site_daily_units")),
+            "user_limit": _positive(settings.get("user_daily_units")), "accounts": used,
+            "tokens": {"site": site, "deleted_accounts_charged": gone["charged_tokens"] if gone else 0,
+                       "site_limit": site_tokens, "user_limit": user_tokens, "accounts": accounts,
+                       "test_unlimited": unlimited},
+            "earlier_reported_tokens": {**earlier, "complete": False,
+                                        "note": "reported by tasks before per-call metering, all days together"}}
 
 
 def provision_user(path: Path, *, issuer: str, subject: str) -> str:
@@ -764,10 +1008,27 @@ def read_deletions(ledger: Path) -> list[dict[str, str]]:
     return records
 
 
+def _fold_calls(connection: sqlite3.Connection, user_id: str) -> None:
+    """Add one account's model calls, per day and without its ID, to what deleted accounts
+    charged, before the calls themselves are deleted."""
+    for row in connection.execute(f'''SELECT day, COUNT(*) AS calls,
+            COALESCE(SUM(CASE WHEN status = 'settled' THEN prompt_tokens END), 0) AS input,
+            COALESCE(SUM(CASE WHEN status = 'settled' THEN completion_tokens END), 0) AS output,
+            COALESCE(SUM({_CHARGE}), 0) AS charged FROM model_calls WHERE user_id = ? GROUP BY day''',
+                                  (user_id,)).fetchall():
+        connection.execute('''INSERT INTO deleted_model_usage VALUES (?, ?, ?, ?, ?) ON CONFLICT(day) DO UPDATE SET
+            calls = calls + excluded.calls, input_tokens = input_tokens + excluded.input_tokens,
+            output_tokens = output_tokens + excluded.output_tokens,
+            charged_tokens = charged_tokens + excluded.charged_tokens''',
+                           (row['day'], row['calls'], row['input'], row['output'], row['charged']))
+
+
 def _purge_user(connection: sqlite3.Connection, record: dict[str, str]) -> None:
-    """Delete one account's private rows and leave its tombstone (inside the caller's transaction)."""
+    """Delete one account's private rows and leave its tombstone (inside the caller's transaction).
+    What its model calls charged stays in the site's day totals, without its ID."""
     user_id = record["user_id"]
-    _add_sponsor_tables(connection)  # a store restored from before them has none to name yet
+    _add_tables(connection)  # a store restored from before them has none to name yet
+    _fold_calls(connection, user_id)
     for table in USER_TABLES:
         connection.execute(f'DELETE FROM {table} WHERE user_id = ?', (user_id,))
     connection.execute("DELETE FROM quota_usage WHERE scope = ?", (user_id,))
@@ -1381,7 +1642,7 @@ class UserWorkspace:
                 AND job_id = ? AND status IN ('queued', 'running', 'succeeded') ORDER BY created_at DESC LIMIT 1""",
                                          (self.user_id, job_id)).fetchone()
             if ongoing is not None:
-                return {'job': job, 'task': _task_view(ongoing), 'refused': None}
+                return {'job': job, 'task': _task_view(ongoing, connection), 'refused': None}
             try:
                 task = self._submit_task(connection, 'prepare_job', key=key or f"prepare-job:{job_id}:0",
                                          request={'job_id': job_id}, context={'base_requirements_version': 0},
@@ -1945,9 +2206,9 @@ class UserWorkspace:
                 'cv': cvs, 'cv_languages': self._languages(connection), 'gaps': self._gaps(connection, job_id),
                 'confirmed': [(fact['id'], fact['version']) for fact in self._list_facts(connection)
                               if fact['status'] == 'confirmed'],
-                'tasks': [_task_view(row) for row in connection.execute(
+                'tasks': [_task_view(row, connection) for row in connection.execute(
                     '''SELECT * FROM tasks WHERE user_id = ? AND job_id = ? AND dismissed = 0
-                       ORDER BY created_at DESC LIMIT 10''', (self.user_id, job_id))],
+                       ORDER BY created_at DESC LIMIT 10''', (self.user_id, job_id)).fetchall()],
             }
 
     def job_summaries(self) -> list[dict[str, Any]]:
@@ -2164,8 +2425,10 @@ class UserWorkspace:
         superseded is queued again by the same request with the context of now, up to
         MAX_TASK_ATTEMPTS. Before queueing: new tasks must be switched on, the user must have
         agreed to the data flow (``consent``), each user has at most one queued task besides one
-        running, the site's queue is bounded, and the day's quota is reserved for the user and
-        the site in this same transaction. A refusal changes nothing.
+        running, the site's queue is bounded, and the day's quota is checked in this same
+        transaction (_reserve): legacy units are reserved here, tokens when each call starts.
+        ``units`` is the operation's legacy cost; 0, like ``heavy`` "pdf", also means it makes no
+        model call. A refusal changes nothing.
         """
         with self._transaction(write=True) as connection:
             if bind:  # ``key`` is the page's request key: bound with the task; a refusal rolls both back
@@ -2189,7 +2452,7 @@ class UserWorkspace:
             if json.loads(existing['request_payload']).get("intent") != json.loads(_json(request)):
                 raise Conflict("This request key was already used for a different request")
             if existing['status'] not in RETRYABLE_TASKS:
-                return _task_view(existing)
+                return _task_view(existing, connection)
             if existing['attempts'] >= MAX_TASK_ATTEMPTS:
                 raise Refused("This was tried too many times; start over", "too_many_attempts")
         settings = _settings(connection)
@@ -2204,7 +2467,7 @@ class UserWorkspace:
         limit = _positive(settings.get("queue_limit")) or 1
         if connection.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'").fetchone()[0] >= limit:
             raise Refused("The site is busy; try again in a minute", "queue_full")
-        day = _reserve(connection, self.user_id, units, settings)
+        day = _reserve(connection, self.user_id, units, settings, model=heavy == 'model' and units > 0)
         now = _now()
         if existing is not None:
             # A new attempt counts its own calls (for its units); what earlier attempts cost,
@@ -2222,15 +2485,15 @@ class UserWorkspace:
                 job_id, status, heavy, units, reserved_day, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)''',
                                (self.user_id, task_id, operation, key, payload, job_id, heavy, units, day, now))
         return _task_view(connection.execute('SELECT * FROM tasks WHERE user_id = ? AND task_id = ?',
-                                             (self.user_id, task_id)).fetchone())
+                                             (self.user_id, task_id)).fetchone(), connection)
 
     def get_task(self, task_id: str) -> dict:
         with self._transaction() as connection:
             row = connection.execute('SELECT * FROM tasks WHERE user_id = ? AND task_id = ?',
                                      (self.user_id, _text(task_id, 'task_id', 64))).fetchone()
-        if row is None:
-            raise NotFound("Task not found")
-        return _task_view(row)
+            if row is None:
+                raise NotFound("Task not found")
+            return _task_view(row, connection)
 
     def task_request(self, task_id: str, token: str) -> dict:
         """What a running task was asked to do, for its runner (checked against its token)."""
@@ -2250,7 +2513,7 @@ class UserWorkspace:
                 _end_task(connection, self.user_id, task_id, 'cancelled', error_code='cancelled',
                           message="Cancelled")
             return _task_view(connection.execute('SELECT * FROM tasks WHERE user_id = ? AND task_id = ?',
-                                                 (self.user_id, task_id)).fetchone())
+                                                 (self.user_id, task_id)).fetchone(), connection)
 
     def dismiss_task(self, task_id: str) -> None:
         """Hide a finished task's note from the job page."""
@@ -2261,26 +2524,55 @@ class UserWorkspace:
                 raise NotFound("Task not found")
 
     def usage_today(self) -> dict[str, Any]:
+        """This account's model use and quota today (UTC), as its page shows them (_account_usage).
+        ``used`` and ``limit`` are in the active mode's measure: legacy units or tokens."""
         with self._transaction() as connection:
-            settings = _settings(connection)
-            row = connection.execute('SELECT units FROM quota_usage WHERE scope = ? AND day = ?',
-                                     (self.user_id, _today())).fetchone()
-            return {'used': row['units'] if row else 0, 'limit': _positive(settings.get('user_daily_units'))}
+            return _account_usage(connection, self.user_id, _today())
 
 
-def _reserve(connection: sqlite3.Connection, user_id: str, units: int, settings: dict[str, str]) -> str:
-    """Reserve today's units for a user and the whole site, or refuse: quotas must be set."""
+def _short_of(scope: str, unit: str, needed: int, left: int, limit: int, day: str) -> Refused:
+    """A refusal that says what the work needs against what is left (a site refusal names no
+    site numbers: they would show other accounts' use)."""
+    detail: dict[str, Any] = {"scope": scope, "unit": unit, "needed": needed, "resets_at": _resets_at(day)}
+    model, about = ("model ", "about ") if unit == "tokens" else ("", "")
+    if scope == "user":
+        detail.update(remaining=max(0, left), limit=limit)
+        return Refused(f"Not enough of today's {model}allowance (needed: {about}{needed:,} {unit}; "
+                       f"left: {max(0, left):,}). {RESETS}", "quota_exhausted", detail)
+    return Refused(f"The site's shared {model}allowance for today cannot cover this (needed: {about}{needed:,} {unit}). "
+                   f"{RESETS}", "quota_exhausted", detail)
+
+
+def _reserve(connection: sqlite3.Connection, user_id: str, units: int, settings: dict[str, str], *,
+             model: bool) -> str | None:
+    """Check today's quota for new work, or refuse; limits must be configured. Legacy mode
+    reserves the work's units for the user and the site, returning the day reserved on. Tokens
+    mode reserves nothing here (each model call reserves its own tokens as it starts), but
+    refuses ``model`` work when the day could not start even one call. A test account
+    (quota_exemptions) is never refused for a limit, and its units are still counted."""
     day = _today()
+    if _quota_mode(settings) == "tokens":
+        if model:
+            user_limit, site_limit = _daily_limits(settings, "tokens")
+            if user_limit is None or site_limit is None:
+                raise Refused("Daily limits are not configured, so no work can start", "quota_unconfigured")
+            if not _exempt(connection, user_id):
+                own = user_limit - _charged(connection, day, user_id)
+                site = site_limit - _charged(connection, day)
+                if min(own, site) < MIN_START_TOKENS:
+                    raise _short_of("user" if own <= site else "site", "tokens", MIN_START_TOKENS, own, user_limit, day)
+        return None
     if units == 0:  # Public job reads use the bounded queue without reserving paid work.
         return day
-    user_limit, site_limit = _positive(settings.get("user_daily_units")), _positive(settings.get("site_daily_units"))
+    user_limit, site_limit = _daily_limits(settings, "legacy")
     if user_limit is None or site_limit is None:
         raise Refused("Daily limits are not configured, so no work can start", "quota_unconfigured")
-    for scope, limit in ((user_id, user_limit), ("*", site_limit)):
-        row = connection.execute('SELECT units FROM quota_usage WHERE scope = ? AND day = ?', (scope, day)).fetchone()
-        if (row['units'] if row else 0) + units > limit:
-            raise Refused("Today's limit is used up; try again tomorrow" if scope != "*"
-                          else "The site's daily limit is used up; try again tomorrow", "quota_exhausted")
+    if not _exempt(connection, user_id):
+        for scope, limit in ((user_id, user_limit), ("*", site_limit)):
+            row = connection.execute('SELECT units FROM quota_usage WHERE scope = ? AND day = ?', (scope, day)).fetchone()
+            used = row['units'] if row else 0
+            if used + units > limit:
+                raise _short_of("site" if scope == "*" else "user", "units", units, limit - used, limit, day)
     for scope in (user_id, "*"):
         connection.execute('''INSERT INTO quota_usage VALUES (?, ?, ?) ON CONFLICT(scope, day)
             DO UPDATE SET units = units + excluded.units''', (scope, day, units))
@@ -2369,13 +2661,22 @@ def _scrub_request(connection: sqlite3.Connection, user_id: str, task_id: str) -
                             user_id, task_id))
 
 
-def _task_view(row: sqlite3.Row) -> dict[str, Any]:
-    """What the page may see of a task: never its stored input (it can hold CV lines)."""
-    return {'task_id': row['task_id'], 'operation': row['operation'], 'status': row['status'],
+def _task_view(row: sqlite3.Row, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
+    """What the page may see of a task: never its stored input (it can hold CV lines). With the
+    connection it was read on, also the model use of its metered calls, every attempt's
+    (``model_use``), and what it reported before calls were metered (``earlier_reported``,
+    incomplete: no retries or unusable answers)."""
+    view = {'task_id': row['task_id'], 'operation': row['operation'], 'status': row['status'],
             'stage': row['stage'], 'job_id': row['job_id'], 'attempts': row['attempts'], 'cost': row['cost'],
             'result': json.loads(row['result']) if row['result'] else None, 'error_code': row['error_code'],
             'message': row['error_message'], 'created_at': row['created_at'], 'started_at': row['started_at'],
             'finished_at': row['finished_at']}
+    if connection is not None:
+        use = _call_summary(connection, 'user_id = ? AND task_id = ?', (row['user_id'], row['task_id']))
+        earlier = {name: count for name, count in _usage_state(row['usage'])["tokens"].items()
+                   if name in ("prompt_tokens", "completion_tokens")}
+        view['model_use'] = {**use, **({"earlier_reported": earlier} if earlier else {})}
+    return view
 
 
 def _refs(values: Any) -> list[tuple[str, int]]:
@@ -2622,8 +2923,139 @@ def claim_tasks(path: Path, *, total: int, pdf: int, deadline: timedelta) -> lis
     return claimed
 
 
+def begin_call(path: Path, user_id: str, task_id: str, token: str, *, prompt_tokens: int,
+               max_output: int) -> tuple[str, int]:
+    """Start one model call (one transport call) of a running task, in one write transaction,
+    so concurrent calls never pass a limit together. Raises LateResult when the task no longer
+    holds this execution or its time (no call may start after it was cancelled, timed out or
+    retried), NotFound for a disabled account, and Refused when new work is paused or, in tokens
+    mode, the day's tokens left to the account and to the site (deleted accounts' use counted)
+    cannot cover ``prompt_tokens`` plus MIN_OUTPUT_TOKENS: nothing is recorded and nothing may be
+    sent. The output budget is cut to what fits, up to ``max_output``; a test account's never is.
+    Records the call as pending, reserving the prompt estimate plus that budget on today's date,
+    and returns (call_id, output budget). The task's cost is unknown until the call settles."""
+    for value in (prompt_tokens, max_output):
+        if type(value) is not int or not 0 < value <= MAX_REPORTED_TOKENS:
+            raise StoreError("Invalid call estimate")
+    with transaction(path, write=True) as connection:
+        row = _running_task(connection, user_id, task_id, token)
+        account = connection.execute('SELECT active FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        if account is None or not account['active']:
+            raise NotFound("Account unavailable")
+        if row['heavy'] != 'model' or row['units'] == 0:
+            raise StoreError("This task does not allow paid calls")
+        settings = _settings(connection)
+        if settings.get("tasks_enabled") != "1":
+            raise Refused("New work was paused on this site; nothing more was sent to the model", "tasks_paused")
+        exempt, day, output = _exempt(connection, user_id), _today(), max_output
+        if _quota_mode(settings) == "tokens" and not exempt:
+            user_limit, site_limit = _daily_limits(settings, "tokens")
+            if user_limit is None or site_limit is None:
+                raise Refused("Daily limits are not configured, so no work can start", "quota_unconfigured")
+            own = user_limit - _charged(connection, day, user_id)
+            site = site_limit - _charged(connection, day)
+            room = min(own, site) - prompt_tokens
+            if room < MIN_OUTPUT_TOKENS:
+                raise _short_of("user" if own <= site else "site", "tokens", prompt_tokens + MIN_OUTPUT_TOKENS, own,
+                                user_limit, day)
+            output = min(max_output, room)
+        call_id = secrets.token_hex(16)
+        connection.execute('''INSERT INTO model_calls(call_id, user_id, task_id, attempt, execution_sha256, day, reserved,
+            max_output, exempt, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)''',
+                           (call_id, user_id, task_id, row['attempts'], _hash(token), day, prompt_tokens + output, output,
+                            int(exempt), _now()))
+        state = _usage_state(row['usage'])
+        state["calls"] += 1
+        state["open_calls"] += 1
+        state["attempt_calls"] += 1
+        connection.execute('UPDATE tasks SET cost = ?, usage = ? WHERE user_id = ? AND task_id = ?',
+                           (_task_cost(state), _json(state), user_id, task_id))
+        return call_id, output
+
+
+def _reported(usage: Any) -> dict[str, int | None]:
+    """What a provider reported for one call, checked. prompt_tokens and completion_tokens are
+    whole numbers from 0 (a missing or malformed one is None, never 0). DeepSeek's cache counts
+    are optional parts of prompt_tokens (hit + miss = prompt): kept only while they fit it, None
+    when absent or not fitting, and never added to the total."""
+    def count(name: str) -> int | None:
+        value = usage.get(name) if isinstance(usage, dict) else None
+        return value if type(value) is int and 0 <= value <= MAX_REPORTED_TOKENS else None
+
+    prompt, completion = count("prompt_tokens"), count("completion_tokens")
+    hit, miss = count("prompt_cache_hit_tokens"), count("prompt_cache_miss_tokens")
+    if prompt is None or (hit or 0) > prompt or (miss or 0) > prompt or (
+            hit is not None and miss is not None and hit + miss != prompt):
+        hit = miss = None
+    return {"prompt": prompt, "completion": completion, "hit": hit, "miss": miss}
+
+
+def _ended_late(connection: sqlite3.Connection, call: sqlite3.Row) -> tuple[sqlite3.Row | None, bool]:
+    """The call's task, and whether the call ended after its execution did (cancelled, timed out,
+    interrupted or retried under a new token)."""
+    task = connection.execute('SELECT * FROM tasks WHERE user_id = ? AND task_id = ?',
+                              (call['user_id'], call['task_id'])).fetchone()
+    current = (task is not None and task['status'] == 'running' and task['execution_token'] is not None
+               and secrets.compare_digest(_hash(task['execution_token']), call['execution_sha256']))
+    return task, not current
+
+
+def settle_call(path: Path, user_id: str, call_id: str, usage: Any) -> str:
+    """Record what the provider reported for one call, whenever the answer comes: a late answer
+    settles its own call, on the day that call was reserved, and never touches a later attempt.
+    With both counts valid the call is settled at prompt plus completion tokens, even past its
+    reservation (the overage is charged, not hidden, and the next call sees it); otherwise it is
+    unknown, charged at least its reservation and any part that was reported. Only a pending call
+    changes: a duplicate report changes nothing. Returns the call's status ("gone" once its
+    account was deleted)."""
+    reported = _reported(usage)
+    with transaction(path, write=True) as connection:
+        call = connection.execute('SELECT * FROM model_calls WHERE call_id = ? AND user_id = ?',
+                                  (call_id, user_id)).fetchone()
+        if call is None:
+            return "gone"
+        if call['status'] != 'pending':
+            return call['status']
+        settled = reported["prompt"] is not None and reported["completion"] is not None
+        task, late = _ended_late(connection, call)
+        connection.execute('''UPDATE model_calls SET status = ?, prompt_tokens = ?, completion_tokens = ?,
+            cache_hit_tokens = ?, cache_miss_tokens = ?, error = ?, late = ?, ended_at = ? WHERE call_id = ?''',
+                           ("settled" if settled else "unknown", reported["prompt"], reported["completion"],
+                            reported["hit"], reported["miss"], None if settled else "bad_usage", int(late), _now(), call_id))
+        if task is not None:
+            state = _usage_state(task['usage'])
+            if settled:
+                state["open_calls"] = max(0, state["open_calls"] - 1)
+            if late:
+                state["late_calls"] += 1
+            connection.execute('UPDATE tasks SET usage = ?, cost = ? WHERE user_id = ? AND task_id = ?',
+                               (_json(state), _task_cost(state), user_id, call['task_id']))
+        return "settled" if settled else "unknown"
+
+
+def fail_call(path: Path, user_id: str, call_id: str, reason: str) -> str:
+    """End a call that brought no usage back (an HTTP error, no answer, an unreadable body). It
+    may still have been billed, so it is unknown: charged its reservation, its task's cost
+    unknown. ``reason`` is a short code, never response text. Only a pending call changes."""
+    reason = reason[:64] if isinstance(reason, str) and reason else "failed"
+    with transaction(path, write=True) as connection:
+        call = connection.execute('SELECT * FROM model_calls WHERE call_id = ? AND user_id = ?',
+                                  (call_id, user_id)).fetchone()
+        if call is None:
+            return "gone"
+        if call['status'] != 'pending':
+            return call['status']
+        _task, late = _ended_late(connection, call)
+        connection.execute("UPDATE model_calls SET status = 'unknown', error = ?, late = ?, ended_at = ? WHERE call_id = ?",
+                           (reason, int(late), _now(), call_id))
+        return "unknown"
+
+
 def mark_spending(path: Path, user_id: str, task_id: str, token: str, stage: str) -> None:
-    """Record, before a paid call starts, that the task may now cost money: the call stays open,
+    """The task-level accounting from before calls were metered, kept for callers that use it
+    (tests); TaskContext.chat meters each call instead (begin_call).
+
+    Record, before a paid call starts, that the task may now cost money: the call stays open,
     and the task's cost unknown, until its usage is reported (record_usage), in this attempt or
     any later one. If the process stops or the answer is lost, it stays unknown and this
     attempt's units are not given back. A task that no longer holds its token or its time raises
@@ -2641,7 +3073,10 @@ def mark_spending(path: Path, user_id: str, task_id: str, token: str, stage: str
 
 
 def record_usage(path: Path, user_id: str, task_id: str, token: str, usage: dict[str, int] | None) -> None:
-    """Add a call's reported token counts to the task. A call is settled only if it reported
+    """mark_spending's counterpart, from before calls were metered (settle_call replaces it): its
+    counts become the task's ``earlier_reported`` tokens, never part of a daily total.
+
+    Add a call's reported token counts to the task. A call is settled only if it reported
     some; the task's cost is known only once every call of every attempt is settled, so a call
     that failed or reported nothing keeps it unknown, whatever this or a later attempt reports.
     An answer for an execution that has ended (cancelled, timed out, interrupted, or since
@@ -2687,12 +3122,17 @@ def finish_task(path: Path, user_id: str, task_id: str, token: str, status: str,
 def recover_tasks(path: Path) -> int:
     """At start: a task still marked running belonged to a process that is gone, so it is
     interrupted, never silently rerun. Its cost stays as recorded (unknown if a call was under
-    way); the user can run it again."""
+    way); the user can run it again. A model call still pending can never be settled now (the
+    process that waited for its answer is gone): it becomes unknown and keeps its reservation on
+    its own day, through every later attempt."""
     with transaction(path, write=True) as connection:
+        _add_tables(connection)  # a backup restored from before them has none yet
         rows = connection.execute("SELECT user_id, task_id FROM tasks WHERE status = 'running'").fetchall()
         for row in rows:
             _end_task(connection, row['user_id'], row['task_id'], 'interrupted', error_code='interrupted',
                       message="The service restarted while this was running")
+        connection.execute("UPDATE model_calls SET status = 'unknown', error = 'interrupted', late = 1, ended_at = ? "
+                           "WHERE status = 'pending'", (_now(),))
         return len(rows)
 
 

@@ -41,6 +41,18 @@ class AdminTests(unittest.TestCase):
         self.assertEqual((code, settings["registration_open"]), (0, "1"))
         self.assertEqual(self.admin("set", "queue_limit", "-1")[0], 2)
 
+    def test_token_mode_and_explicit_test_account_flags(self) -> None:
+        self.assertEqual(self.admin('quota', 'tokens', '--user-daily', '200000', '--site-daily', '2000000')[0], 0)
+        self.assertEqual(self.admin('test-unlimited', 'enable', self.alice)[0], 0)
+        self.assertTrue(UserWorkspace(self.database, self.alice).usage_today()['test_unlimited'])
+        self.assertFalse(UserWorkspace(self.database, self.bob).usage_today()['test_unlimited'])
+        self.assertEqual(self.admin('test-unlimited', 'disable', self.alice)[0], 0)
+        self.assertFalse(UserWorkspace(self.database, self.alice).usage_today()['test_unlimited'])
+        UserWorkspace(self.database, self.alice).submit_task('check_gaps', key='queued', request={}, units=1, heavy='model')
+        self.assertEqual(self.admin('quota', 'legacy')[0], 2)
+        self.assertEqual(self.admin('set', 'quota_mode', 'legacy')[0], 2)
+        self.assertEqual(self.admin('quota', 'tokens', '--user-daily', '300000', '--site-daily', '3000000')[0], 0)
+
     def test_the_kill_switch_stops_new_work(self) -> None:
         for key, value in (("user_daily_units", "40"), ("site_daily_units", "2000"), ("tasks_enabled", "0")):
             self.assertEqual(self.admin("set", key, value)[0], 0)

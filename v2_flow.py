@@ -5,7 +5,7 @@ token and its inputs have not been replaced. Nothing here decides who the user i
 fact on a model's word or approves a CV.
 
 A handler takes a task_runner.TaskContext: ``ctx.user`` (that user's UserWorkspace),
-``ctx.request`` (what the task was asked), ``ctx.chat`` (the model, metered per task) and the
+``ctx.request`` (what the task was asked), ``ctx.chat`` (the model, metered per call) and the
 succeed/fail/stage calls that end or annotate the task.
 """
 
@@ -18,19 +18,22 @@ from cv import CVError, build_draft, export_pdf, print_with_chrome, tailor_draft
 from cv_import import CVImportError, structure_cv
 from cv_plan import plan_draft
 from cv_status import STAGE_FAILED, STAGES, adjusted, job_language, reason, reworded, stage_entry, stage_failure
-from gaps import find_gaps
+from deepseek_client import CallRefused
+from gaps import find_gaps, suggest_gap
 from job_search import SearchError, fetch_selected, prepare_review_input
 from job_url import fetch_job_url
 from requirement_flow import RequirementError, apply_requirement_decisions, propose_requirements
 
 
-# Model calls each operation may make at most (the quota it reserves); a PDF counts as one.
+# The legacy quota units each operation reserves when it is submitted (quota_mode legacy; a PDF
+# counts as one). 0 also marks work that makes no model call. In tokens mode no units are
+# reserved: each model call reserves its own estimated tokens as it starts (tenant_store.begin_call).
 UNITS = {"upload_cv": 1, "prepare_job": 3, "job_from_url": 3, "start_listing": 3, "prepare_cv": 2,
-         "tailor_cv": 1, "plan_cv": 1, "check_gaps": 2, "export_pdf": 1, "read_job_url": 0, "read_listing": 0}
+         "tailor_cv": 1, "plan_cv": 1, "check_gaps": 2, "suggest_gap": 1, "export_pdf": 1, "read_job_url": 0, "read_listing": 0}
 # The data flow each operation needs the user's agreement to (tenant_store.CONSENT_STAGES).
 CONSENT = {"upload_cv": "upload_parsing", "prepare_job": "job_processing", "job_from_url": "job_processing",
            "start_listing": "job_processing", "prepare_cv": "job_processing", "tailor_cv": "job_processing",
-           "plan_cv": "job_processing", "check_gaps": "job_processing"}
+           "plan_cv": "job_processing", "check_gaps": "job_processing", "suggest_gap": "job_processing"}
 HEAVY = {"export_pdf": "pdf"}
 
 
@@ -263,6 +266,8 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         try:
             proposal = structure_cv(request["lines"], ctx.chat, links=request["links"])
         except CVImportError as exc:
+            if isinstance(exc.__cause__, CallRefused):  # not DeepSeek's doing: say what the site refused
+                raise TaskFailed(str(exc.__cause__), exc.__cause__.reason) from exc
             raise TaskFailed(str(exc), reason(exc)) from exc
         proposal["language"] = request["language"]
         proposal["source_sha256"] = request["source_sha256"]
@@ -314,6 +319,27 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
                               checked_head=inputs["head"]["material_id"],
                               requirements_version=inputs["requirements"]["version"])
 
+    def run_suggest_gap(ctx: Any) -> None:
+        request = ctx.request
+        inputs = ctx.user.gaps_inputs(request['job_id'], request['language'])
+        if (not inputs['head'] or not inputs['requirements'] or not inputs['gaps']
+                or inputs['gaps']['version'] != request['base_gaps_version']
+                or inputs['head']['material_id'] != request['checked_head']
+                or inputs['requirements']['version'] != request['requirements_version']):
+            ctx.finish('superseded', error_code='inputs_changed', message='The inputs changed. Check again.')
+            return
+        ctx.stage('suggesting')
+        try:
+            gaps = suggest_gap(inputs['gaps']['gaps'], inputs['requirements']['decided'],
+                               inputs['head']['draft'], inputs['facts'], request['requirement_id'],
+                               ctx.chat, private=inputs['private'])
+        except ValueError as exc:
+            raise TaskFailed(str(exc), 'inputs_changed') from exc
+        ctx.user.publish_gaps(task_id=ctx.task_id, token=ctx.token, job_id=request['job_id'],
+                              base_version=request['base_gaps_version'], gaps=gaps,
+                              checked_head=inputs['head']['material_id'],
+                              requirements_version=inputs['requirements']['version'])
+
     def run_export(ctx: Any) -> None:
         request = ctx.request
         inputs = ctx.user.export_inputs(request["job_id"], request["language"])
@@ -337,5 +363,5 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         "read_job_url": lambda ctx: run_job_from_url(ctx, review_only=True),
         "read_listing": lambda ctx: run_start_listing(ctx, review_only=True),
         "tailor_cv": lambda ctx: _redo_stage(ctx, "rewording"), "plan_cv": lambda ctx: _redo_stage(ctx, "layout"),
-        "check_gaps": run_check_gaps, "export_pdf": run_export,
+        "check_gaps": run_check_gaps, "suggest_gap": run_suggest_gap, "export_pdf": run_export,
     }
