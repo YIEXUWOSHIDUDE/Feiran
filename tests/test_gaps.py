@@ -65,7 +65,7 @@ class FakeDeepSeek:
             if self.error:
                 raise self.error
             return {"model": "deepseek-flash", "content": {"requirements": self.evidence(request)}, "usage": {}}
-        assert messages[0]["content"] == SUGGEST_RULES
+        assert messages[0]["content"].startswith(SUGGEST_RULES)
         ids = {item["text"]: item["id"] for item in request["gaps"]}
         return {"model": "deepseek-flash", "usage": {}, "content": {"suggestions": resume_ids(self.suggestions(ids), request)}}
 
@@ -611,7 +611,7 @@ class TargetedSuggestionTests(unittest.TestCase):
         for private in ("Alex Example", "Example Corp", "Example University", *(f["id"] for f in FACTS)):
             self.assertNotIn(private, chat.sent[0])
 
-    def test_years_cannot_be_patched_with_a_model_claim_and_none_is_cached(self):
+    def test_years_get_an_editable_template_even_when_a_model_cannot_supply_a_claim(self):
         rid = self.ids["3+ years of backend experience"]
         chat = FakeDeepSeek(lambda ids: [{"requirement": rid, "kind": "bullet", "entry": "s1e0",
             "text": "Applied extensive backend experience to production services.", "tags": []}])
@@ -619,10 +619,43 @@ class TargetedSuggestionTests(unittest.TestCase):
         row = next(r for r in result["requirements"] if r["requirement_id"] == rid)
         self.assertIsNone(row["suggestion"])
         self.assertTrue(row["ai_needs_details"])
+        visible = coverage(result, self.cv, [(f['id'], f['version']) for f in list_facts(self.db)
+                                             if f['status'] == 'confirmed'])
+        guide = next(r for r in visible['requirements'] if r['requirement_id'] == rid)['guidance']
+        self.assertIn('[', guide['template'])
+        self.assertTrue(guide['questions'])
+        before = list_facts(self.db)
+        place = next(p['id'] for p in places(self.cv) if p['kind'] == 'bullet')
+        with self.assertRaisesRegex(ValueError, 'placeholder'):
+            write_line(result, rid, place, guide['template'], self.cv, self.db, copy.deepcopy(PROFILE))
+        self.assertEqual(list_facts(self.db), before)
         suggest_gap(result, self.decided, self.cv, self.db, rid, chat)
         self.assertEqual(len(chat.sent), 1)
         with self.assertRaises(ValueError):
             accept_gap(result, rid, self.db, copy.deepcopy(PROFILE))
+
+    def test_old_cached_empty_answers_get_templates_without_a_new_call(self):
+        rid = self.ids['3+ years of backend experience']
+        cached = copy.deepcopy(self.checked)
+        row = next(r for r in cached['requirements'] if r['requirement_id'] == rid)
+        row.update(ai_checked=True, ai_needs_details=True)
+        confirmed = [(f['id'], f['version']) for f in list_facts(self.db) if f['status'] == 'confirmed']
+        shown = coverage(cached, self.cv, confirmed)
+        guide = next(r for r in shown['requirements'] if r['requirement_id'] == rid)['guidance']
+        self.assertIn('[[start date]]', guide['template'])
+        self.assertEqual(guide['source'], 'reference')
+        self.assertNotIn('guidance', row)  # Viewing does not rewrite the saved check.
+
+    def test_model_can_suggest_a_template_for_experience_not_previously_recorded(self):
+        rid = self.ids['3+ years of backend experience']
+        chat = FakeDeepSeek(lambda ids: [{'requirement': rid, 'kind': 'template',
+            'template': '[[start]]–[[end]]: [[role]], implementing [[backend responsibility]].',
+            'questions': ['Which backend roles have you not listed yet?']}])
+        result = suggest_gap(self.checked, self.decided, self.cv, self.db, rid, chat)
+        row = next(r for r in result['requirements'] if r['requirement_id'] == rid)
+        self.assertEqual(row['guidance']['source'], 'ai')
+        self.assertIn('backend responsibility', row['guidance']['template'])
+        self.assertIsNone(row['suggestion'])
 
     def test_changed_requirements_and_invalid_response_do_not_save_success(self):
         rid = self.ids["Writing integration tests for services"]

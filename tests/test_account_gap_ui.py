@@ -28,21 +28,29 @@ assert.equal(sandbox.__calls[0].path,"/api/jobs/j/gaps/r/write");
 assert.equal(JSON.parse(sandbox.__calls[0].body).text,"SQL, SQLite");
 ''')
 
-    def test_generating_does_not_erase_manual_text_or_make_an_unsupported_claim(self):
+    def test_missing_facts_still_give_an_editable_template_without_erasing_manual_text(self):
         self.check_js(r'''
 run(`__view={job_id:"j",gaps:{places:[{id:"entry:k",kind:"bullet",where:"Test project"}]}};
 __item={requirement_id:"r",text:"3 years",status:"related",evidence:[],suggestion_status:"open",suggestion:null};
 api = async (path, options={}) => { __calls.push({path,...options});
-return options.method ? {} : {...__view,gaps:{...__view.gaps,requirements:[{...__item,ai_checked:true,ai_needs_details:true}]}}; };`);
+return options.method ? {} : {...__view,gaps:{...__view.gaps,requirements:[{...__item,ai_checked:true,ai_needs_details:true,
+ guidance:{source:"reference",questions:["What were the dates of your relevant roles?"],template:"[[start date]]–[[end date]]: [[role]]."}}]}}; };`);
 const row=run('coverageRow(__view,"en",__item,async()=>{},()=>{})');
 const manual=find(row,n=>n.tagName==="input"); manual.value="My unfinished entry";
 await button(row,"AI suggested entry").fire("click");
 assert.equal(manual.value,"My unfinished entry");
-assert(row.textContent.includes("If you do not have that experience, leave the gap open."));
-assert(!button(row,"Confirm this is true — add to my CV"));
+assert(row.textContent.includes("What were the dates of your relevant roles?"));
+const template=nodes(row).find(n=>n.tagName==="input" && n!==manual);
+assert.equal(template.value,"[[start date]]–[[end date]]: [[role]].");
+await button(row,"Confirm this is true — add to my CV").fire("click");
+assert(!sandbox.__calls.some(c=>c.path.endsWith("/write")));
 assert.equal(sandbox.__calls.filter(c=>c.method==="POST").length,1);
 await button(row,"AI suggested entry").fire("click");
 assert.equal(sandbox.__calls.length,2);
+template.value="June–August: backend intern, writing service tests.";
+await button(row,"Confirm this is true — add to my CV").fire("click");
+assert.equal(JSON.parse(sandbox.__calls.at(-1).body).text,template.value);
+assert.equal(manual.value,"My unfinished entry");
 ''')
 
     def test_quota_modes_unknown_usage_and_fetch_failure_are_distinct(self):

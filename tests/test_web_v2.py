@@ -554,6 +554,25 @@ class MoreRouteTests(V2Case):
         self.assertEqual(row["suggestion"]["items"], ["SQL"])
         self.assertEqual(row["suggestion_status"], "open")
 
+    def test_empty_suggestion_is_an_editable_template_on_repeated_requests(self):
+        client, headers = self.ready_user()
+        job_id = self.new_job(client, headers)
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        before = client.get('/api/facts', headers=headers).json()
+        rid = next(r['requirement_id'] for r in self.job(client, headers, job_id)['gaps']['requirements']
+                   if r['text'] == '熟悉Python，了解SQL')
+        url = f'/api/jobs/{job_id}/gaps/{rid}/suggest'
+        self.assertEqual(self.settle(client, headers, client.post(url, headers=headers))['status'], 'succeeded')
+        usage = client.get('/api/me', headers=headers).json()['usage']['tokens']['calls']
+        for _ in range(2):
+            response = client.post(url, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            row = next(r for r in response.json()['gaps']['requirements'] if r['requirement_id'] == rid)
+            self.assertIn('[[', row['guidance']['template'])
+            self.assertTrue(row['guidance']['questions'])
+        self.assertEqual(client.get('/api/me', headers=headers).json()['usage']['tokens']['calls'], usage)
+        self.assertEqual(client.get('/api/facts', headers=headers).json(), before)
+
     def test_targeted_suggestion_is_not_published_after_inputs_change(self):
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)

@@ -1,5 +1,7 @@
 # Feiran · 斐然
 
+When adding related experience, **AI suggested entry** can propose experiences not yet recorded. Missing details get an editable template and specific questions, without requiring facts to be entered first. Replace every `[[placeholder]]` before confirming an addition. Previously cached empty answers also show reference templates, labelled separately from model-generated suggestions.
+
 > What oft was thought, but ne’er so well express’d.
 
 English | [简体中文](README.zh-CN.md)

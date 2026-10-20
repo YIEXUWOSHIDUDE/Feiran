@@ -87,6 +87,56 @@ Reply as {"suggestions": [{"requirement": "<gap id>", "kind": "skill", "line": "
 "items": ["..."]}, {"requirement": "<gap id>", "kind": "bullet", "entry": "<entry id>",
 "text": "...", "tags": ["..."]}, {"requirement": "<gap id>", "kind": "none"}]}"""
 
+GUIDANCE_RULES = """
+For this explicitly requested suggestion, do not stop at "none" because the resume lacks facts.
+The user wants ideas for experiences they may have omitted, not only paraphrases of known facts.
+For any gap that cannot be expressed as a concrete skill/bullet proposal, return "kind":"template",
+"template": a useful editable CV line (at most 300 characters), and "questions": 1-3 specific
+questions that help the user supply missing details. Put EVERY unknown activity, qualification,
+date, duration, result or responsibility in [[double bracket placeholders]]. This is a proposal,
+not evidence that the applicant meets the requirement. Do not copy a required number of years
+into a claim. For years, ask for relevant roles and their actual start/end dates, including overlap;
+provide a chronology template without asserting a total. For degrees or work permission, ask for
+the actual status and provide a status template. Do not require an existing related fact before
+offering a template. Use the resume's language. Include the requirement id as for other kinds.
+Example: {"suggestions":[{"requirement":"r1","kind":"template",
+"template":"[[start date]]–[[end date]]: [[role]], working on [[relevant responsibilities]].",
+"questions":["Which relevant roles have you held, and on what dates?"]}]}.
+"""
+
+PLACEHOLDER = re.compile(r"\[\[.*?\]\]")
+
+
+def _guidance(value: Any) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    template, questions = value.get('template'), value.get('questions')
+    if (not isinstance(template, str) or not template.strip() or len(template) > MAX_LINE_CHARACTERS
+            or not PLACEHOLDER.search(template) or not isinstance(questions, list)):
+        return None
+    questions = [q.strip() for q in questions if isinstance(q, str) and q.strip() and len(q) <= 300][:3]
+    return {'template': template.strip(), 'questions': questions, 'source': 'ai'} if questions else None
+
+
+def gap_guidance(text: str, language: str) -> dict:
+    """Useful reference templates for saved empty answers; not presented as model output.
+
+    Keeping this a view fallback also upgrades old cached 'none' answers without changing facts,
+    charging another call, or making users rerun the entire job check.
+    """
+    years = bool(re.search(r'\byears?\b|年.{0,8}(?:经验|经历)', text, re.I))
+    if language == 'zh':
+        template = ('[[起始年月]]至[[结束年月]]，担任[[岗位]]，负责[[相关职责]]。' if years else
+                    '在[[项目或工作场景]]中，使用[[工具或方法]]完成[[具体任务]]，通过[[验证方式]]检查结果。')
+        questions = (['还有哪些相关工作未写进简历？分别从何时开始、何时结束？', '哪些经历时间重叠？按实际工作时间填写，不直接套用岗位要求的年限。']
+                     if years else ['针对这条要求，你可以回想哪些课程、实习、项目或工作？', '你具体做了什么、用了什么方法，以及怎样验证结果？'])
+    else:
+        template = ('[[start date]]–[[end date]]: [[role]], working on [[relevant responsibilities]].' if years else
+                    'In [[project or work setting]], used [[tools or methods]] to complete [[specific task]] and checked the result with [[validation method]].')
+        questions = (['Which relevant roles are missing from your CV, and what were their start and end dates?', 'Which periods overlap? Use actual dates rather than copying the required number of years.']
+                     if years else ['What coursework, internships, projects or work could relate to this requirement?', 'What did you do, which methods did you use, and how did you check the result?'])
+    return {'template': template, 'questions': questions, 'source': 'reference'}
+
 
 NEAR_COPY = 0.85  # how alike, word by word in order, a new line may be to one already there
 
@@ -328,7 +378,7 @@ def _suggest(
         "resume": resume,
     }
     messages = [
-        {"role": "system", "content": SUGGEST_RULES},
+        {"role": "system", "content": SUGGEST_RULES + (GUIDANCE_RULES if strict else '')},
         {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
     ]
     try:
@@ -340,7 +390,7 @@ def _suggest(
     by_requirement: dict[str, Any] = {}
     if strict and (not isinstance(picks, list) or not all(
             any(isinstance(pick, dict) and pick.get('requirement') == gap['requirement_id']
-                and pick.get('kind') in ('skill', 'bullet', 'none') for pick in picks) for gap in gaps)):
+                and pick.get('kind') in ('skill', 'bullet', 'none', 'template') for pick in picks) for gap in gaps)):
         if suggesting.get('fallback_reason'):
             raise DeepSeekError(suggesting['fallback_reason'], reason=suggesting.get('fallback_code', 'bad_response'))
         raise DeepSeekError('DeepSeek returned no usable suggestion response.')
@@ -350,6 +400,11 @@ def _suggest(
             by_requirement[requirement] = _suggestion(pick, skills, entries, _existing_lines(cv))
     for gap in gaps:
         gap["suggestion"] = by_requirement.get(gap["requirement_id"])
+        if strict:
+            guide = next((_guidance(pick) for pick in picks if isinstance(pick, dict)
+                          and pick.get('requirement') == gap['requirement_id'] and pick.get('kind') == 'template'), None)
+            if guide:
+                gap['guidance'] = guide
     return suggesting
 
 
@@ -402,6 +457,8 @@ def suggest_gap(gaps: dict, decided: dict, cv: dict, facts_db: Any, requirement_
         item['suggestion'] = None
     item['ai_checked'] = True
     item['ai_needs_details'] = not bool(item['suggestion'])
+    if not item['suggestion'] and not item.get('guidance'):
+        item['guidance'] = gap_guidance(item['text'], cv['language'])
     return updated
 
 
@@ -589,6 +646,8 @@ def coverage(gaps: dict[str, Any], cv: dict[str, Any], confirmed: Iterable[tuple
             "status": status, "evidence": [described(ref) for ref in refs], "missing": record["missing"],
             "suggestion": record["suggestion"], "suggestion_status": record["status"],
             "ai_checked": bool(record.get("ai_checked")), "ai_needs_details": bool(record.get("ai_needs_details")),
+            "guidance": (record.get('guidance') or gap_guidance(record['text'], gaps['language']))
+                if record.get('ai_checked') and not record.get('suggestion') else None,
         })
     return {
         "stale": stale,
@@ -739,6 +798,8 @@ def line_to_write(gaps: dict[str, Any], requirement_id: str, place_id: str, text
     if place is None:
         raise ValueError("这个位置已不在简历中，请刷新页面后重试")
     text = " ".join(text.split()) if isinstance(text, str) else ""
+    if '[[' in text or ']]' in text:
+        raise ValueError('Replace every [[placeholder]] with your own details before adding this line.')
     gap = _gap(gaps, requirement_id)
     if place["kind"] == "skill":
         known = {item.strip().casefold() for item in SKILL_SEPARATORS.split(_skill_items(place["where"]))}
