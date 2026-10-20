@@ -318,7 +318,7 @@ def _verdicts(content: Any, wanted: set[str], items: dict[str, Any]) -> dict[str
 
 def _suggest(
     decided: dict[str, Any], cv: dict[str, Any], gaps: list[dict[str, Any]], chat: Callable[..., dict[str, Any]],
-    effort: str, private: list[str],
+    effort: str, private: list[str], *, strict: bool = False,
 ) -> dict[str, Any]:
     """Ask for one honest line per gap and keep the ones that pass; returns how it went."""
     resume, skills, entries = _resume(cv, private)
@@ -338,6 +338,12 @@ def _suggest(
     except DeepSeekError as exc:
         picks, suggesting = [], {"fallback_reason": str(exc), "fallback_code": exc.reason}
     by_requirement: dict[str, Any] = {}
+    if strict and (not isinstance(picks, list) or not all(
+            any(isinstance(pick, dict) and pick.get('requirement') == gap['requirement_id']
+                and pick.get('kind') in ('skill', 'bullet', 'none') for pick in picks) for gap in gaps)):
+        if suggesting.get('fallback_reason'):
+            raise DeepSeekError(suggesting['fallback_reason'], reason=suggesting.get('fallback_code', 'bad_response'))
+        raise DeepSeekError('DeepSeek returned no usable suggestion response.')
     for pick in picks if isinstance(picks, list) else []:
         requirement = pick.get("requirement") if isinstance(pick, dict) else None
         if isinstance(requirement, str) and requirement not in by_requirement:
@@ -354,6 +360,49 @@ def _suggestion_key(requirement: str, suggestion: dict[str, Any]) -> str:
     else:
         claim = [suggestion.get("text"), suggestion.get("entry_key") or suggestion.get("where")]
     return json.dumps([requirement, suggestion.get("kind"), claim], ensure_ascii=False)
+
+
+def suggestion_target(gaps: dict, decided: dict, cv: dict, confirmed: Iterable[tuple[str, int]],
+                      requirement_id: str) -> dict:
+    """Validate the saved check before reusing or requesting a row's suggestion."""
+    expected = [(r['id'], r['text'], r.get('strength') or 'unclear') for r in decided['selected_requirements']]
+    actual = [(r['requirement_id'], r['text'], r['strength']) for r in gaps.get('requirements', [])]
+    if (gaps.get('gaps_version') != GAPS_VERSION or expected != actual
+            or gaps.get('language') != cv['language'] or coverage(gaps, cv, confirmed)['stale']):
+        raise ValueError('The CV, facts or requirements changed. Check again before requesting a suggestion.')
+    item = _gap(gaps, requirement_id)
+    if item['evidence'] not in ('related', 'none'):
+        raise ValueError('Only a missing or related requirement needs a suggested entry.')
+    return item
+
+
+def suggest_gap(gaps: dict, decided: dict, cv: dict, facts_db: Any, requirement_id: str,
+                chat: Callable[..., dict], private: Iterable[str] = ()) -> dict:
+    """Generate only the selected missing entry. Saved answers, including no suitable answer,
+    are reused. The returned check contains proposals only; no fact or CV is changed."""
+    confirmed = [(f['id'], f['version']) for f in fact_source(facts_db).listed() if f['status'] == 'confirmed']
+    updated = copy.deepcopy(gaps)
+    item = suggestion_target(updated, decided, cv, confirmed, requirement_id)
+    if item.get('suggestion') or item.get('ai_checked') or item['status'] in ('added', 'declined'):
+        return updated
+    private = sorted({*private_terms(cv), *private}, key=len, reverse=True)
+    result = _suggest(decided, cv, [item], chat, 'none', private, strict=True)
+    if result.get('fallback_reason'):
+        # No cached success on a transport or quota failure: the user's next click can retry.
+        raise DeepSeekError(result['fallback_reason'], reason=result.get('fallback_code', 'bad_response'))
+    # These gaps cannot be repaired by adding a tool or a hypothetical bullet. Leave a
+    # request for the user's own evidence even if a model tries to propose a qualification.
+    qualification = re.search(r'\b(?:years?|seniority|leadership|degree|bachelor|master|ph\.?d|'
+                              r'citizenship|authorization|clearance|sponsorship)\b|'
+                              r'年.{0,8}(?:经验|经历)|学历|学位|本科|硕士|博士|工作许可|签证|管理经验',
+                              item['text'], re.I)
+    if qualification or _leadership(item['text']):
+        item['suggestion'] = None
+    if item['suggestion'] and _suggestion_key(item['text'], item['suggestion']) in _declined(gaps):
+        item['suggestion'] = None
+    item['ai_checked'] = True
+    item['ai_needs_details'] = not bool(item['suggestion'])
+    return updated
 
 
 def _declined(previous: Any) -> set[str]:
@@ -539,6 +588,7 @@ def coverage(gaps: dict[str, Any], cv: dict[str, Any], confirmed: Iterable[tuple
             "requirement_id": record["requirement_id"], "text": record["text"], "strength": record["strength"],
             "status": status, "evidence": [described(ref) for ref in refs], "missing": record["missing"],
             "suggestion": record["suggestion"], "suggestion_status": record["status"],
+            "ai_checked": bool(record.get("ai_checked")), "ai_needs_details": bool(record.get("ai_needs_details")),
         })
     return {
         "stale": stale,
