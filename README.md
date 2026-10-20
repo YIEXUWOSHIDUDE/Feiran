@@ -150,4 +150,6 @@ For your own AWS deployment, see [AWS public deployment](docs/aws-public.md).
 
 ## Development
 
+V2 quota metering and per-requirement AI entry suggestions are documented in [the V2 implementation notes](docs/v2-plan.md). Existing deployments keep their current quota mode until an operator changes it.
+
 Offline tests live in `tests/`. See [local setup, test commands and development notes](docs/development.md#本地开发入口); deployment files are in `deploy/` and deployment guides in `docs/`.

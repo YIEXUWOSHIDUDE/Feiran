@@ -69,13 +69,16 @@ async function api(path, options = {}) {
 // Waits for a task the server queued (V2): the page keeps working, and a reload does not start it again.
 async function followTask(task) {
   let current = task;
+  let polls = 0;
   while (!TERMINAL.has(current.status)) {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const { response, body } = await request(`/api/tasks/${encodeURIComponent(task.task_id)}`);
     if (response.status === 401) return api(`/api/tasks/${encodeURIComponent(task.task_id)}`);
     if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
     current = body.task;
+    if (++polls % 5 === 0) void refreshUsage();
   }
+  await refreshUsage();
   if (current.status !== "succeeded") throw new Error(taskMessage(current));
   return current.result || {};
 }
@@ -144,6 +147,8 @@ async function run(action) {
     await action();
   } catch (error) {
     show(I18n.serverText(error.message));
+  } finally {
+    await refreshUsage();
   }
   if (pendingWarning) {
     show(pendingWarning, "warning");
@@ -992,9 +997,9 @@ function suggestionBlock(item, post) {
 
 // The user's own words for a requirement: skills for one of the skills lines, or a new line under
 // an entry, prefilled with DeepSeek's suggestion when there is one. On a refusal the text stays.
-function writeOwn(view, item, places, refresh) {
+function writeOwn(view, item, places, refresh, ai = false) {
   if (item.suggestion_status === "added" || !places.length) return null;
-  const suggestion = item.suggestion || {};
+  const suggestion = ai ? item.suggestion || {} : {};
   const chosen = suggestion.kind === "skill" ? `skill:${suggestion.fact_id}`
     : suggestion.kind === "bullet" ? `entry:${suggestion.entry_key}` : null;
   const select = el("select", {}, places.map((place) => el("option", { value: place.id, selected: place.id === chosen },
@@ -1005,16 +1010,49 @@ function writeOwn(view, item, places, refresh) {
   };
   select.addEventListener("change", hint);
   hint();
-  const add = actionButton(t("Add to my CV"), async () => {
+  const add = actionButton(ai ? t("Confirm this is true — add to my CV") : t("Add to my CV"), async () => {
     await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/write`, {
       method: "POST", body: JSON.stringify({ place: select.value, text: input.value }),
     });
     await refresh();
   });
-  return el("details", { class: "write-own" },
-    el("summary", {}, suggestion.kind ? t("Edit it, or write your own") : t("Write your own line")),
+  return el("details", { class: "write-own", open: ai },
+    el("summary", {}, ai ? t("Review the suggested entry") : t("Write your own line")),
     el("p", { class: "muted" }, t("Only what is true for you. It is added as you write it, as a confirmed fact, and the CV is prepared again.")),
     el("div", { class: "write-row" }, select, input, add));
+}
+
+// Reuse a saved proposal; generate only on an explicit click. Replace this panel alone so
+// requesting AI help never erases text the user has already typed into the manual editor.
+function aiEntry(view, item, refresh) {
+  if (item.suggestion_status === "added" || item.suggestion_status === "declined") return suggestionBlock(item, () => {});
+  const content = el("div", {});
+  let opened = false;
+  const result = (currentView, currentItem) => {
+    opened = true;
+    content.replaceChildren(currentItem.suggestion
+      ? writeOwn(currentView, currentItem, currentView.gaps.places || [], refresh, true)
+        || el("p", {}, t("No place is available for this entry. Update your CV first."))
+      : el("p", { class: "muted" }, t("AI could not suggest an honest line from this information. In Write your own line, describe a real project, what you did, and the tools or dates that support this requirement. If you do not have that experience, leave the gap open.")));
+  };
+  const button = actionButton(t("AI suggested entry"), async () => {
+    if (opened) { content.hidden = !content.hidden; return; }
+    if (item.suggestion || item.ai_checked) {
+      result(view, item);
+      return;
+    }
+    await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/suggest`, { method: "POST" });
+    const latest = await api(`/api/jobs/${view.job_id}`);
+    const found = latest.gaps && !latest.gaps.stale && !latest.gaps.outdated
+      && latest.gaps.requirements.find((row) => row.requirement_id === item.requirement_id);
+    if (!found) throw new Error(t("Your CV or facts changed since this check. Choose Check again to update the result."));
+    // Cached in the page as well as on the server, including an answer that needs more facts.
+    item = found;
+    view = latest;
+    result(view, item);
+  });
+  button.disabled = Boolean(view.gaps.stale);
+  return el("div", { class: "ai-entry" }, button, content);
 }
 
 function coverageRow(view, language, item, refresh, post) {
@@ -1028,7 +1066,8 @@ function coverageRow(view, language, item, refresh, post) {
   const gap = item.status === "related" || item.status === "none";
   return el("div", { class: `requirement ${item.status} ${gap ? item.suggestion_status : ""}` },
     el("div", { class: "requirement-text" }, item.status === "none" ? t`Missing: ${item.missing || item.text}` : item.text, strength), lines, notes,
-    gap ? suggestionBlock(item, post) : null, gap ? writeOwn(view, item, view.gaps.places || [], refresh) : null);
+    gap ? (MODE === "v2" ? aiEntry(view, item, refresh) : suggestionBlock(item, post)) : null,
+    gap ? writeOwn(view, item, view.gaps.places || [], refresh) : null);
 }
 
 function gapsPanel(view, refresh) {
@@ -1041,7 +1080,7 @@ function gapsPanel(view, refresh) {
   const heading = el("h2", {}, t("3. What this CV shows for each requirement"));
   const intro = el("p", { class: "muted" },
     t("DeepSeek compares each requirement with your confirmed facts and with this CV as it is shown now, after cuts and rewording. "),
-    t("A line that is only about the same thing does not count as showing it. Nothing is added until you click True for me; "),
+    t("A line that is only about the same thing does not count as showing it. Review the suggestion and confirm it is true before adding it; "),
     t("then it becomes a confirmed fact and the CV is prepared again."));
   if (!gaps) {
     return el("section", { class: "panel step-panel gaps-panel" }, heading, intro,
@@ -1210,6 +1249,7 @@ const TASK_NAMES = {
   prepare_job: t("finding requirements and preparing the CV"), job_from_url: t("reading the job and preparing the CV"),
   start_listing: t("reading the job and preparing the CV"), prepare_cv: t("preparing your CV"),
   tailor_cv: t("rewording your CV"), plan_cv: t("adjusting your CV"), check_gaps: t("checking what your CV shows"),
+  suggest_gap: t("suggesting a related experience entry"),
   export_pdf: t("creating the final PDF"), upload_cv: t("reading your CV"),
 };
 
@@ -1239,6 +1279,36 @@ function tokenQuery(separator) {
 }
 
 // V2: sign out (this server's session first, then Cognito's) and delete the account.
+// Account-scoped usage is refreshed without api(), which may itself be following a task.
+let usageRequest = 0;
+async function refreshUsage() {
+  if (MODE !== "v2") return;
+  const ticket = ++usageRequest;
+  const box = document.getElementById("account-usage");
+  if (!box) return;
+  try {
+    const { response, body } = await request("/api/me");
+    if (!response.ok || !body.usage || !body.usage.tokens) throw new Error("unavailable");
+    if (ticket !== usageRequest) return;
+    const usage = body.usage, tokens = usage.tokens;
+    const number = (value) => Number(value).toLocaleString();
+    const unit = usage.mode === "tokens" ? t("tokens") : t("legacy units");
+    const allowance = usage.test_unlimited ? t("Test account · unlimited daily allowance")
+      : !usage.configured || usage.limit === null ? t("Daily allowance is not configured")
+      : t`Remaining today: ${number(usage.remaining)} / ${number(usage.limit)} ${unit}`;
+    const details = el("details", { open: Boolean(box.querySelector("details[open]")) },
+      el("summary", {}, allowance),
+      el("p", {}, t`Reported tokens: ${number(tokens.total)} · input ${number(tokens.input)} · output ${number(tokens.output)}`),
+      el("p", {}, t`Reserved tokens: ${number(tokens.reserved)} · running calls ${tokens.pending_calls} · usage unknown ${tokens.unknown_calls}`),
+      el("p", { class: "muted" }, t("Reservations count toward the allowance until usage is reported. Unknown usage keeps its reservation; token counts are not a bill.")),
+      usage.mode === "legacy" ? el("p", { class: "muted" }, t("This server still uses task units for its allowance. Token totals include only calls recorded by the new meter.")) : null,
+      el("p", { class: "muted" }, t`Daily allowance resets at ${new Date(usage.resets_at).toLocaleString()} (your local time; midnight UTC).`));
+    box.replaceChildren(details);
+  } catch (_) {
+    if (ticket === usageRequest) box.replaceChildren(el("span", {}, t("Usage is temporarily unavailable. This does not mean zero usage.")));
+  }
+}
+
 function accountTools() {
   if (MODE !== "v2") return;
   const signOut = el("button", { class: "secondary", type: "button" }, t("Sign out"));
@@ -1247,6 +1317,8 @@ function accountTools() {
     location.href = next;
   }));
   document.querySelector(".header-actions").append(signOut);
+  document.querySelector("header.top").after(el("aside", { id: "account-usage", class: "account-usage", "aria-label": t("Daily model usage") }, t("Loading usage…")));
+  window.addEventListener("focus", () => { void refreshUsage(); });
 }
 
 function accountPanel() {

@@ -79,6 +79,32 @@ def _without_sessions(path: Path) -> None:
         connection.close()
 
 
+def _metering_problems(connection: sqlite3.Connection, counts: dict[str, Any]) -> list[str]:
+    """The model-call ledger and test-account marks, where the database has them (a backup from
+    before has not): counted, and checked against the rules the rest of V2 relies on. Rows an
+    older release left of accounts it deleted are not problems; the next start clears them."""
+    present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if not set(tenant_store.METER_TABLES) <= present:
+        return []
+    counts["model_calls"] = {row[0]: row[1] for row in connection.execute(
+        "SELECT status, COUNT(*) FROM model_calls GROUP BY status")}
+    counts["test_unlimited_accounts"] = connection.execute(
+        "SELECT COUNT(*) FROM quota_exemptions e JOIN users u ON u.user_id = e.user_id WHERE u.deleted_at IS NULL").fetchone()[0]
+    problems = []
+    for row in connection.execute("""SELECT c.call_id, c.status, c.prompt_tokens, c.completion_tokens,
+            c.cache_hit_tokens, c.cache_miss_tokens, c.reserved, c.day,
+            EXISTS(SELECT 1 FROM tasks t WHERE t.user_id = c.user_id AND t.task_id = c.task_id) AS has_task
+            FROM model_calls c JOIN users u ON u.user_id = c.user_id WHERE u.deleted_at IS NULL"""):
+        whole = (row["has_task"] and row["status"] in ("pending", "settled", "unknown") and row["reserved"] > 0
+                 and len(row["day"]) == 10
+                 and (row["status"] != "settled" or (row["prompt_tokens"] is not None and row["completion_tokens"] is not None))
+                 and all(part is None or (row["prompt_tokens"] is not None and 0 <= part <= row["prompt_tokens"])
+                         for part in (row["cache_hit_tokens"], row["cache_miss_tokens"])))
+        if not whole:
+            problems.append(f"model call {row['call_id']} is incomplete or belongs to no task")
+    return problems
+
+
 def verify_database(path: Path) -> dict[str, Any]:
     """Whether V2 can use this database: whole, its links consistent, every stored PDF matching
     its hash and every approval matching the CV it approves. Problems name tables and IDs only."""
@@ -102,6 +128,7 @@ def verify_database(path: Path) -> dict[str, Any]:
         for table in ("facts", "jobs", "materials", "approvals", "artifacts", "uploads"):
             counts[table] = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         counts["tasks"] = {row[0]: row[1] for row in connection.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status")}
+        problems += _metering_problems(connection, counts)
         for row in connection.execute("SELECT artifact_id, data, sha256 FROM artifacts"):
             if _sha256(bytes(row["data"])) != row["sha256"]:
                 problems.append(f"final PDF {row['artifact_id']} does not match its hash")

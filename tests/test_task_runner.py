@@ -231,8 +231,13 @@ class FailureTests(RunnerCase):
         self.assertEqual(self.users[1].get_task(cancelled["task_id"])["status"], "cancelled")
         with tenant_store.transaction(self.database) as connection:
             usage = connection.execute("SELECT usage FROM tasks WHERE task_id = ?", (paid["task_id"],)).fetchone()[0]
-        self.assertEqual(json.loads(usage), {"tokens": {"completion_tokens": 2, "prompt_tokens": 7}, "calls": 1,
-                                             "open_calls": 0, "attempt_calls": 1, "late_calls": 0})
+            calls = [dict(row) for row in connection.execute(
+                "SELECT status, prompt_tokens, completion_tokens FROM model_calls WHERE task_id = ?", (paid["task_id"],))]
+        # The task keeps its call counters; the tokens are the call's, in the ledger (never the task's own).
+        self.assertEqual(json.loads(usage), {"tokens": {}, "calls": 1, "open_calls": 0, "attempt_calls": 1,
+                                             "late_calls": 0})
+        self.assertEqual(calls, [{"status": "settled", "prompt_tokens": 7, "completion_tokens": 2}])
+        self.assertEqual(self.users[0].get_task(paid["task_id"])["model_use"]["total"], 9)
         self.assertFalse(cancel_first.is_set())
 
 
