@@ -150,7 +150,7 @@ flowchart LR
 
 - **问题**：以前只能一次搜一个 Greenhouse 招聘板或逐条粘贴 JD，用户没有“岗位库”可看。
 - **选择**：新增 `listings.py` 和独立的 `.local/listings.db`（sources、listings 两张表）。岗位是公开数据的本地副本，和权威的事实库分开：删掉它不影响事实和已开始的岗位。每家公司刷新时整体替换其岗位，记录首次看到时间；读取失败时保留上次成功的副本并记录错误，不把旧数据说成最新。起始公司只在数据库第一次创建时加入，用户删掉的公司不会在下次启动时回来。
-- **排序**：命中的不同已确认标签数（与 `rank_jobs` 同一词面规则，pending 事实不算），同分按发布时间新到旧；各招聘系统的发布时间统一换成 UTC 再比较。同一公司、同标题、同正文的多个城市发布合并为一行。“Hide senior roles” 按标题排除 Senior/Staff/Principal/Lead/Manager/Director 等，但保留 OpenAI、Anthropic、Cohere 给所有工程师用的 “Member of Technical Staff”。
+- **排序**：命中的不同已确认标签数（与 `rank_jobs` 同一词面规则，pending 事实不算），同分按发布时间新到旧；各招聘系统的发布时间统一换成 UTC 再比较。同一公司、同标题、同正文的多个城市发布合并为一行。标题筛选要求每个词都出现在标题里，顺序不限。“Hide senior roles” 按标题排除 Senior/Staff/Principal/Lead/Manager/Director 等（OpenAI、Anthropic、Cohere 给所有工程师用的 “Member of Technical Staff” 不算），另外排除 JD 明确要求 5 年以上经验的岗位：`requires_senior_experience` 只认几种固定写法，偏好/加分部分的年限不算，看不出的岗位保留。
 - **速度**：30 家公司约 8,800 个岗位，逐个正则匹配 83 个标签约 25 秒。`facts.tag_finder` 先在折叠大小写的文本里做子串检查，只有可能命中的标签才跑正则，结果与只用 `tag_pattern` 完全相同（测试逐一比较，包括 Python 正则把土耳其语 ı/İ 视为 i 的情况），快约 6 倍。匹配结果按“标签集合的哈希”保存在每个岗位上；标题或正文变化、或已确认标签变化时才重算。实测首次约 5 秒，之后约 0.05 秒。
 - **刷新**：没有后台定时任务。打开 Find jobs 时，超过 24 小时未更新的公司由浏览器每次 4 家并行刷新（实测 30 家约 6 秒）；一家失败不影响其他家。
 - **开始岗位**：Start 会按岗位 ID 重新读取官方接口（Ashby 没有单岗位接口，就重读整个招聘板再取该岗位），生成与粘贴 JD 相同的审核输入；Lever、Ashby 不返回公司名，用关注列表里的名称补上。以官方链接识别同一岗位，加锁防止并发点击，所以同一岗位只会有一个 My jobs 条目。

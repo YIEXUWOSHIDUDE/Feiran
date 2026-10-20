@@ -2035,10 +2035,11 @@ class UserWorkspace:
         return dict(row)
 
     def ranking_rows(self, terms: list[str], find: Callable[[str], list[str]]) -> list[dict[str, Any]]:
-        """Public postings of the boards this user follows, each with the user's confirmed skill
-        words it mentions and the stored sponsor answer for its words (read only: one not yet
-        assessed shows as such). Matches are this user's own cache: redone for a posting whose
-        text changed or when the user's confirmed skills change; never shared with another user."""
+        """Public postings of the boards this user follows, each with its stored text (for the
+        listing filters to read), the user's confirmed skill words it mentions and the stored
+        sponsor answer for its words (read only: one not yet assessed shows as such). Matches are
+        this user's own cache: redone for a posting whose text changed or when the user's
+        confirmed skills change; never shared with another user."""
         key = hashlib.sha256(json.dumps(terms, ensure_ascii=False).encode("utf-8")).hexdigest()
         with self._transaction() as connection:
             rows = connection.execute('''SELECT p.provider, p.board, p.job_id, p.title, p.location, p.source,
@@ -2062,8 +2063,8 @@ class UserWorkspace:
                               json.dumps(matched, ensure_ascii=False)) + (row['provider'], row['board'],
                                                                           row['job_id'], row['text_hash']))
             result.append({**{name: row[name] for name in ('provider', 'board', 'job_id', 'title', 'location',
-                                                            'source', 'posted_at', 'text_hash', 'last_seen_at',
-                                                            'company')}, 'matched': matched,
+                                                            'source', 'posted_at', 'text', 'text_hash',
+                                                            'last_seen_at', 'company')}, 'matched': matched,
                            'sponsorship': sponsorship.shown(_answer(row if row['status'] else None),
                                                             source=row['source'], captured_at=row['last_seen_at'])})
         if found:
