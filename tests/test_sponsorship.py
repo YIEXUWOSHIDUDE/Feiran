@@ -13,6 +13,64 @@ class SponsorshipTests(unittest.TestCase):
             self.assertEqual(text[item["start"]:item["end"]], item["text"])
         return result
 
+    def test_missed_employer_policy_forms(self):
+        for text, status in (
+            ("We do sponsor visas!", "supported"),
+            ("We do sponsor visas! However, we aren't able to successfully sponsor visas for every role and every candidate.", "conditional"),
+            ("ExampleCo does not provide sponsorship for employment visa status for this position.", "not_supported"),
+            ("ExampleCo does not currently offer visa sponsorship for this role.", "not_supported"),
+            ("Acme Systems does not anticipate providing sponsorship for employment visa status for this position.", "not_supported"),
+            ("Visa Sponsorship: We are not currently able to sponsor visas for fellows.", "not_supported"),
+            ("ExampleCo is unable to provide sponsorship for employment visas for this position.", "not_supported"),
+        ):
+            with self.subTest(text=text):
+                self.assert_status(text, status)
+
+    def test_refusing_every_role_is_a_condition(self):
+        # Dogfood 2026-10-20: the second sentence was read as a refusal, so the job showed "conflicting".
+        result = self.assert_status(
+            "Visa sponsorship: We do sponsor visas! However, sponsorship is not available for every role "
+            "and depends on eligibility.", "conditional")
+        self.assertEqual([item["signal"] for item in result["evidence"]], ["supported", "conditional"])
+        for text in (
+            "Sponsorship is not available for every role.",
+            "We cannot sponsor visas for every role.",
+            "We are not able to sponsor visas for every role.",
+            "We do not offer visa sponsorship for all of our roles.",
+            "We cannot sponsor every candidate.",
+            "Visa sponsorship is available, but not for every role.",
+            "We do sponsor visas, but sponsorship is not available for every role.",
+        ):
+            with self.subTest(text=text):
+                self.assert_status(text, "conditional")
+
+    def test_every_role_scope_keeps_refusals_and_contradictions(self):
+        for text in (
+            "Sponsorship is not available for any role.",
+            "We do not sponsor visas at all.",
+            "We do not sponsor visas, for all roles.",
+            "Visa sponsorship is not available for this role.",
+            # Not for every role, and this role is one of them.
+            "This position is not eligible for visa sponsorship. Sponsorship is not available for every role.",
+            "Visa sponsorship is available, but not for every role. This position is not eligible for visa sponsorship.",
+            "We are not able to sponsor visas for every role, and this position is not eligible for visa sponsorship.",
+        ):
+            with self.subTest(text=text):
+                self.assert_status(text, "not_supported")
+        for text in (
+            "We do sponsor visas! However, sponsorship is not available for this role.",
+            "We do sponsor visas! Sponsorship is not available for every role. "
+            "This position is not eligible for visa sponsorship.",
+        ):
+            with self.subTest(text=text):
+                self.assert_status(text, "conflicting")
+        self.assert_status("No visa sponsorship; H-1B transfers only. Sponsorship is not available for every role.",
+                           "conditional")
+        for text in ("We provide visa sponsorship. Not all candidates need it.",
+                     "Not every role is eligible for visa sponsorship."):
+            with self.subTest(text=text):
+                self.assert_status(text, "unknown")
+
     def test_explicit_support_in_whole_document(self):
         for text in (
             "Benefits\nVisa sponsorship available.",
@@ -180,7 +238,7 @@ class SponsorshipTests(unittest.TestCase):
         result = assess_sponsorship(text, source="https://example.test/jobs/1", captured_at="2026-10-18")
         self.assertEqual(result["status"], "supported")
         self.assertEqual(result["basis"], "job_text")
-        self.assertEqual(result["rule_version"], 1)
+        self.assertEqual(result["rule_version"], RULE_VERSION)
         self.assertEqual(result["source"], "https://example.test/jobs/1")
         self.assertEqual(result["captured_at"], "2026-10-18")
         item = result["evidence"][0]

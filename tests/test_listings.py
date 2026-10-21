@@ -1,5 +1,9 @@
+import json
 import tempfile
 import unittest
+from contextlib import closing
+from unittest.mock import patch
+import sqlite3
 from pathlib import Path
 
 from facts import confirm_facts, import_facts
@@ -124,7 +128,70 @@ class ListingsTests(unittest.TestCase):
         ranked = ranked_listings(self.listings_db, self.facts_db, **filters)
         return [(item["title"], item["matched"]) for item in ranked["listings"]]
 
-    def test_jobs_mentioning_more_confirmed_skills_come_first(self):
+    def test_seniority_reads_reuse_text_but_recheck_changed_description(self):
+        import listings
+        text = "Required: 7 years of software engineering experience. Unique cache test."
+        with patch("listings._YEAR_WORD", wraps=listings._YEAR_WORD) as words:
+            self.assertTrue(listings.requires_senior_experience(text))
+            first = words.finditer.call_count
+            listings.requires_senior_experience(text)
+            self.assertEqual(words.finditer.call_count, first, "same JD must not be parsed twice")
+            self.assertFalse(listings.requires_senior_experience(text.replace("7 years", "2 years")))
+            self.assertGreater(words.finditer.call_count, first)
+
+    def test_old_listing_database_upgrades_without_losing_jobs(self):
+        add_source(self.listings_db, "greenhouse", "example", fetch=FakeBoards([
+            posting("1", "Engineer", "We provide visa sponsorship.")]))
+        with sqlite3.connect(self.listings_db) as connection:
+            connection.execute("DROP TABLE sponsorship_cache")
+            connection.execute("PRAGMA user_version = 1")
+        result = ranked_listings(self.listings_db, self.facts_db)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["listings"][0]["sponsorship"]["status"], "supported")
+        self.assertEqual(len(list_sources(self.listings_db)), 1)
+
+    def test_sponsor_cache_survives_reads_refresh_and_rule_changes(self):
+        from sponsorship import assess_sponsorship, RULE_VERSION
+        boards = FakeBoards([posting("1", "Engineer", "We provide visa sponsorship.")])
+        add_source(self.listings_db, "greenhouse", "example", fetch=boards)
+        with patch("listings.assess_sponsorship", wraps=assess_sponsorship) as assess:
+            first = ranked_listings(self.listings_db, self.facts_db)
+            calls = assess.call_count
+            ranked_listings(self.listings_db, self.facts_db, title="engineer")
+            self.assertEqual(assess.call_count, calls, "unchanged list must reuse stored sponsor answer")
+            refresh_source(self.listings_db, "greenhouse", "example", fetch=boards)
+            ranked_listings(self.listings_db, self.facts_db)
+            self.assertEqual(assess.call_count, calls)
+            boards.jobs[0]["text"] = "We cannot sponsor visas."
+            refresh_source(self.listings_db, "greenhouse", "example", fetch=boards)
+            changed = ranked_listings(self.listings_db, self.facts_db)
+            self.assertEqual(changed["listings"][0]["sponsorship"]["status"], "not_supported")
+            self.assertEqual(assess.call_count, calls + 1)
+            with patch("listings.SPONSOR_RULE_VERSION", RULE_VERSION + 1):
+                ranked_listings(self.listings_db, self.facts_db)
+            self.assertEqual(assess.call_count, calls + 2)
+        self.assertEqual(first["listings"][0]["sponsorship"]["status"], "supported")
+
+    def test_answer_cached_by_older_rules_is_worked_out_again(self):
+        from sponsorship import RULE_VERSION
+        text = ("We do sponsor visas! However, sponsorship is not available for every role "
+                "and depends on eligibility.")
+        add_source(self.listings_db, "greenhouse", "example", fetch=FakeBoards([posting("1", "Engineer", text)]))
+        with closing(sqlite3.connect(self.listings_db)) as connection, connection:
+            (text_hash,) = connection.execute("SELECT text_hash FROM listings").fetchone()
+            connection.execute("DELETE FROM sponsorship_cache")
+            # What the version before this one found in the same words.
+            connection.execute("INSERT INTO sponsorship_cache VALUES (?, ?, ?)", (
+                text_hash, RULE_VERSION - 1, json.dumps({"status": "conflicting", "evidence": [],
+                                                         "rule_version": RULE_VERSION - 1})))
+        result = ranked_listings(self.listings_db, self.facts_db)
+        self.assertEqual(result["listings"][0]["sponsorship"]["status"], "conditional")
+        self.assertEqual(result["listings"][0]["sponsorship"]["rule_version"], RULE_VERSION)
+        with closing(sqlite3.connect(self.listings_db)) as connection:
+            self.assertEqual(connection.execute("SELECT rule_version FROM sponsorship_cache").fetchall(),
+                             [(RULE_VERSION,)])
+
+    def test_jobs_mentioning_more_saved_skills_come_first(self):
         boards = FakeBoards([
             posting("1", "Designer", "Figma and user research."),
             posting("2", "Platform Engineer", "Kubernetes and Python."),
@@ -133,7 +200,7 @@ class ListingsTests(unittest.TestCase):
         add_source(self.listings_db, "greenhouse", "example", fetch=boards)
         self.assertEqual(self.titles(), [
             ("Data Engineer", ["Python", "SQL"]),
-            ("Platform Engineer", ["Python"]),
+            ("Platform Engineer", ["Kubernetes", "Python"]),
             ("Designer", []),
         ])
 
@@ -234,10 +301,10 @@ class ListingsTests(unittest.TestCase):
         self.assertEqual(found("   "), (6, ["1", "2", "3", "4", "5", "6"]))
         self.assertEqual(found("software designer"), (0, []))
 
-    def test_newly_confirmed_skills_and_changed_postings_are_matched_again(self):
+    def test_pending_skills_and_changed_postings_are_matched(self):
         boards = FakeBoards([posting("1", "Platform Engineer", "Kubernetes clusters."), posting("2", "Data Engineer", "Python.")])
         add_source(self.listings_db, "greenhouse", "example", fetch=boards)
-        self.assertEqual(self.titles(), [("Data Engineer", ["Python"]), ("Platform Engineer", [])])
+        self.assertEqual(self.titles(), [("Data Engineer", ["Python"]), ("Platform Engineer", ["Kubernetes"])])
         confirm_facts(self.facts_db, [("fact-k8s", 1)])
         self.assertEqual(self.titles(), [("Data Engineer", ["Python"]), ("Platform Engineer", ["Kubernetes"])])
         boards.jobs = [posting("1", "Platform Engineer", "Kubernetes with Python and SQL."), posting("2", "Data Engineer", "Python.")]

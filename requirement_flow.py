@@ -20,7 +20,9 @@ MODEL_METHOD = "deepseek-lines-v1"
 MAX_MODEL_LINES = 400
 FIND_RULES = """You read one job posting given as numbered lines and reply in json only.
 Pick every line that states something an applicant must have or should have: requirements,
-qualifications, skills, experience, education, work eligibility and nice-to-haves.
+qualifications, skills, experience, education, work eligibility and nice-to-haves. A line listed
+under a requirements or qualifications heading is one of these even when it is worded as a task,
+such as "Build Python REST APIs".
 Do not pick headings or sub-headings (short title-like lines that introduce a group of lines,
 such as "Technical Leadership & Systems Architecture"), duties or responsibilities (what the
 person will do), locations, benefits, pay, company or team descriptions, legal or

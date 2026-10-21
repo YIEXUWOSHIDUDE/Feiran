@@ -153,13 +153,13 @@ class GapTests(unittest.TestCase):
             self.assertNotIn(fact["id"], chat.sent[-1])
         self.assertEqual(listed["Hands-on Docker and Kubernetes"]["fact_id"], "fact-skills-languages")
 
-    def test_suggestions_that_claim_numbers_or_leadership_are_dropped(self):
+    def test_suggestions_may_add_numbers_and_leadership(self):
         def overclaiming(ids):
             requirement = ids["Writing integration tests for services"]
             return [{"requirement": requirement, "kind": "bullet", "entry": "s1e0",
                      "text": "Led a team of 5 writing integration tests.", "tags": []}]
         gaps, _ = self.gaps(overclaiming)
-        self.assertEqual({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"], None)
+        self.assertIsNotNone({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"])
 
     def test_a_new_line_that_copies_one_already_there_but_a_word_is_dropped(self):
         # Seen on a real posting: an existing bullet came back with only its first verb changed.
@@ -170,13 +170,13 @@ class GapTests(unittest.TestCase):
                      "text": "Documented REST APIs for the internal tool with OpenAPI.", "tags": ["OpenAPI"]}]
         gaps, _ = self.gaps(copying)
         suggestions = {item["text"]: item["suggestion"] for item in gaps["requirements"]}
-        self.assertIsNone(suggestions["Writing integration tests for services"])
+        self.assertIsNotNone(suggestions["Writing integration tests for services"])
         # Found in review by Codex: in a short line one changed verb weighs too much for the ratio.
         def verb(ids):
             return [{"requirement": ids["Writing integration tests for services"], "kind": "bullet", "entry": "s1e0",
                      "text": "Added unit tests for billing code.", "tags": ["testing"]}]
         gaps, _ = self.gaps(verb)
-        self.assertIsNone({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"])
+        self.assertIsNotNone({item["text"]: item["suggestion"] for item in gaps["requirements"]}["Writing integration tests for services"])
         # Found in review by Codex: naming the same work while adding a tool is not a copy.
         self.assertEqual(suggestions["Hands-on Docker and Kubernetes"]["text"], "Documented REST APIs for the internal tool with OpenAPI.")
 
@@ -259,15 +259,15 @@ class GapTests(unittest.TestCase):
         self.assertEqual((skills["version"], skills["status"]), (2, "confirmed"))
         self.assertEqual({item["requirement_id"]: item["status"] for item in updated["requirements"]}[skill], "added")
 
-    def test_accepting_never_confirms_a_version_the_user_has_not_seen(self):
+    def test_accepting_existing_text_preserves_legacy_pending_status_without_blocking(self):
         # Found in review by Codex: a pending version with the suggested text may carry other,
         # unreviewed tags, so it is left for the Facts page instead of being confirmed here.
         gaps, _ = self.gaps()
         skill = next(item["requirement_id"] for item in gaps["requirements"] if "Docker" in item["text"])
         revise_fact(self.database, "fact-skills-languages", text="Languages: Python, Java, Docker, Kubernetes",
                     tags=["Python", "Java", "Docker", "Kubernetes", "AWS"])
-        with self.assertRaisesRegex(ValueError, "Facts"):
-            accept_gap(gaps, skill, self.database, PROFILE)
+        updated, _ = accept_gap(gaps, skill, self.database, PROFILE)
+        self.assertEqual(next(r for r in updated["requirements"] if r["requirement_id"] == skill)["status"], "added")
         skills = next(fact for fact in list_facts(self.database) if fact["id"] == "fact-skills-languages")
         self.assertEqual(skills["status"], "pending")
 
@@ -364,12 +364,13 @@ class GapTests(unittest.TestCase):
         _, again = write_line(rechecked, tests, entry["id"], line, self.draft, self.database, saved)
         self.assertIsNone(again)  # the saved profile already lists it
         self.assertEqual([fact["text"] for fact in list_facts(self.database)].count(line), 1)
-        # The same line waiting for confirmation under that entry is left for the Facts page.
+        # A legacy pending row is reusable without creating a duplicate or confirming it.
         pending, _ = add_fact(self.database, "Deployed the billing code.", "experience", [])
         waiting = copy.deepcopy(saved)
         waiting["sections"][1]["entries"][0]["facts"].append(pending["id"])
-        with self.assertRaisesRegex(ValueError, "Facts"):
-            write_line(rechecked, tests, entry["id"], "Deployed the billing code.", self.draft, self.database, waiting)
+        reused, changed = write_line(rechecked, tests, entry["id"], "Deployed the billing code.", self.draft, self.database, waiting)
+        self.assertIsNone(changed)
+        self.assertEqual(next(r for r in reused["requirements"] if r["requirement_id"] == tests)["status"], "added")
         self.assertEqual(next(fact for fact in list_facts(self.database) if fact["id"] == pending["id"])["status"], "pending")
 
     def test_skills_are_added_in_the_style_of_a_chinese_line(self):
@@ -406,8 +407,36 @@ class GapTests(unittest.TestCase):
         self.assertEqual(next(item for item in declined["requirements"] if item["requirement_id"] == docker)["status"], "declined")
         with self.assertRaisesRegex(ValueError, "没有可添加的建议"):
             accept_gap(gaps, years, self.database, PROFILE)
-        with self.assertRaisesRegex(ValueError, "已标记为不属实"):
+        with self.assertRaisesRegex(ValueError, "已被跳过"):
             accept_gap(declined, docker, self.database, PROFILE)
+
+    def test_once_a_suggestion_is_adopted_no_verdict_of_the_old_check_reads_as_current(self):
+        # Dogfood 2026-10-20, retest: after the 3+ years entry was adopted, the old check still said
+        # "Not covered" and "Missing: 3+ years" beside "Added to your profile and this CV", and kept
+        # offering the Docker skills the new CV already listed.
+        def confirmed():
+            return [(fact["id"], fact["version"]) for fact in list_facts(self.database)]
+
+        gaps, _ = self.gaps()
+        ids = {item["text"]: item["requirement_id"] for item in gaps["requirements"]}
+        before = coverage(gaps, self.draft, confirmed())
+        self.assertEqual(({item["text"]: item["status"] for item in before["requirements"]}, before["stale"]), ({
+            "Experience with Python": "shown", "Hands-on Docker and Kubernetes": "none",
+            "3+ years of backend experience": "related", "Writing integration tests for services": "related"}, False))
+        updated, profile = accept_gap(gaps, ids["Writing integration tests for services"], self.database, PROFILE)
+        updated, _ = accept_gap(updated, ids["Hands-on Docker and Kubernetes"], self.database, profile)
+        cv = build_draft(profile, self.database, "en")  # the CV prepared again with both
+        for _ in range(2):  # and the same when the page is opened again
+            shown = coverage(updated, cv, confirmed())
+            self.assertTrue(shown["stale"])
+            rows = {item["text"]: item for item in shown["requirements"]}
+            self.assertEqual({text: (row["status"], row["verdict"], row["suggestion_status"]) for text, row in rows.items()}, {
+                "Experience with Python": ("recheck", "supported", "open"),
+                "Hands-on Docker and Kubernetes": ("recheck", "none", "added"),
+                "3+ years of backend experience": ("recheck", "related", "open"),
+                "Writing integration tests for services": ("recheck", "related", "added")})
+            self.assertEqual({name: count for name, count in shown["counts"].items() if count}, {"recheck": 4})
+            self.assertEqual([line["undo"] for row in rows.values() for line in row["evidence"]], [[], [], []])
 
 
 def verdicts_for(requirement, *groups):
@@ -577,6 +606,40 @@ class CoverageTests(unittest.TestCase):
         revise_fact(self.database, "fact-intern-tests", text="Wrote unit tests for the billing code.")
         self.assertTrue(self.shown(gaps, self.draft)["stale"])
 
+    def test_a_check_older_than_the_wording_claims_nothing_left_out_and_offers_no_undo(self):
+        # Dogfood 2026-10-20: the CV prepared again after adopting a suggestion still said
+        # "3+ years" and Docker in new words, yet the old check called them "reworded in a way
+        # that no longer shows it" and offered the saved wording, which it had never judged.
+        def planned(rewording):
+            tailored = tailor_draft(self.draft, self.database, chat=FakeChat({"fact-intern-tests": rewording}))
+            return plan_draft(tailored, decided_job(), chat=FakePlanner(KEEP_ALL))
+
+        def answer(request):
+            lines = sent_lines(request)
+            ids = {item["text"]: item["id"] for item in request["requirements"]}
+            return [{"id": ids[TESTS], "verdict": "supported", "sets": [[lines["Wrote unit tests for the billing code."]]]},
+                    {"id": ids[PYTHON], "verdict": "supported", "sets": [[lines["Languages: Python, Java"]]]},
+                    {"id": ids["3+ years of backend experience"], "verdict": "related",
+                     "lines": [lines["Wrote unit tests for the billing code."]], "missing": "3+ years"}]
+
+        first = planned("Wrote unit tests for the billing code.")
+        gaps = self.check(first, answer)
+        self.assertEqual(self.requirement(gaps, first, TESTS)["status"], "shown")
+        again = planned("Wrote unit tests covering the billing code.")
+        shown = self.shown(gaps, again)
+        self.assertTrue(shown["stale"])
+        checked = {"text": "Wrote unit tests for the billing code.", "shown": False, "why": "changed", "undo": []}
+        rows = {item["text"]: item for item in shown["requirements"]}
+        self.assertEqual((rows[TESTS]["status"], rows[TESTS]["evidence"]), ("recheck", [checked]))
+        self.assertEqual((rows["3+ years of backend experience"]["status"], rows["3+ years of backend experience"]["verdict"],
+                          rows["3+ years of backend experience"]["evidence"]), ("recheck", "related", [checked]))
+        self.assertEqual(rows[PYTHON]["status"], "shown")  # the words it judged are still there
+        self.assertEqual((shown["counts"]["recheck"], shown["counts"]["not_shown"], shown["counts"]["related"]), (2, 0, 0))
+        # Not stale, the same rewording is judged and can be undone, as before.
+        fresh = self.check(again, verdicts_for(TESTS, ["Wrote unit tests for billing code."]))
+        self.assertEqual(self.requirement(fresh, again, TESTS)["evidence"], [
+            {"text": "Wrote unit tests for billing code.", "shown": False, "why": "reworded", "undo": ["reword:fact-intern-tests"]}])
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -611,51 +674,84 @@ class TargetedSuggestionTests(unittest.TestCase):
         for private in ("Alex Example", "Example Corp", "Example University", *(f["id"] for f in FACTS)):
             self.assertNotIn(private, chat.sent[0])
 
-    def test_years_get_an_editable_template_even_when_a_model_cannot_supply_a_claim(self):
+    def test_years_get_complete_proposed_content_without_fact_or_template_gate(self):
         rid = self.ids["3+ years of backend experience"]
+        before = list_facts(self.db)
+        text = "Developed backend services over 3 years, building REST APIs and integration tests."
         chat = FakeDeepSeek(lambda ids: [{"requirement": rid, "kind": "bullet", "entry": "s1e0",
-            "text": "Applied extensive backend experience to production services.", "tags": []}])
+            "text": text, "tags": ["REST APIs"]}])
         result = suggest_gap(self.checked, self.decided, self.cv, self.db, rid, chat)
         row = next(r for r in result["requirements"] if r["requirement_id"] == rid)
-        self.assertIsNone(row["suggestion"])
-        self.assertTrue(row["ai_needs_details"])
-        visible = coverage(result, self.cv, [(f['id'], f['version']) for f in list_facts(self.db)
-                                             if f['status'] == 'confirmed'])
-        guide = next(r for r in visible['requirements'] if r['requirement_id'] == rid)['guidance']
-        self.assertIn('[', guide['template'])
-        self.assertTrue(guide['questions'])
-        before = list_facts(self.db)
-        place = next(p['id'] for p in places(self.cv) if p['kind'] == 'bullet')
-        with self.assertRaisesRegex(ValueError, 'placeholder'):
-            write_line(result, rid, place, guide['template'], self.cv, self.db, copy.deepcopy(PROFILE))
+        self.assertIsNotNone(row["suggestion"])
+        self.assertEqual(row["suggestion"]["text"], text)
+        self.assertNotIn("[[", row["suggestion"]["text"])
+        self.assertNotIn("guidance", row)
         self.assertEqual(list_facts(self.db), before)
-        suggest_gap(result, self.decided, self.cv, self.db, rid, chat)
+        self.assertEqual(suggest_gap(result, self.decided, self.cv, self.db, rid, chat), result)
         self.assertEqual(len(chat.sent), 1)
-        with self.assertRaises(ValueError):
-            accept_gap(result, rid, self.db, copy.deepcopy(PROFILE))
 
-    def test_old_cached_empty_answers_get_templates_without_a_new_call(self):
-        rid = self.ids['3+ years of backend experience']
-        cached = copy.deepcopy(self.checked)
-        row = next(r for r in cached['requirements'] if r['requirement_id'] == rid)
-        row.update(ai_checked=True, ai_needs_details=True)
-        confirmed = [(f['id'], f['version']) for f in list_facts(self.db) if f['status'] == 'confirmed']
-        shown = coverage(cached, self.cv, confirmed)
-        guide = next(r for r in shown['requirements'] if r['requirement_id'] == rid)['guidance']
-        self.assertIn('[[start date]]', guide['template'])
-        self.assertEqual(guide['source'], 'reference')
-        self.assertNotIn('guidance', row)  # Viewing does not rewrite the saved check.
+    def test_old_empty_and_template_results_generate_complete_content_on_click(self):
+        rid = self.ids["3+ years of backend experience"]
+        for guide in (None, {"template": "[[start]]–[[end]]: [[role]].", "questions": ["Dates?"]}):
+            with self.subTest(guide=guide):
+                cached = copy.deepcopy(self.checked)
+                row = next(r for r in cached["requirements"] if r["requirement_id"] == rid)
+                row.update(ai_checked=True, ai_needs_details=True)
+                if guide:
+                    row["guidance"] = guide
+                chat = FakeDeepSeek(lambda ids: [{"requirement": rid, "kind": "bullet", "entry": "s1e0",
+                    "text": "Built backend services and automated API integration tests.", "tags": []}])
+                result = suggest_gap(cached, self.decided, self.cv, self.db, rid, chat)
+                updated = next(r for r in result["requirements"] if r["requirement_id"] == rid)
+                self.assertIsNotNone(updated["suggestion"])
+                self.assertEqual(len(chat.sent), 1)
+                self.assertNotIn("guidance", updated)
 
-    def test_model_can_suggest_a_template_for_experience_not_previously_recorded(self):
-        rid = self.ids['3+ years of backend experience']
-        chat = FakeDeepSeek(lambda ids: [{'requirement': rid, 'kind': 'template',
-            'template': '[[start]]–[[end]]: [[role]], implementing [[backend responsibility]].',
-            'questions': ['Which backend roles have you not listed yet?']}])
+    def test_none_and_fill_in_templates_are_failed_responses_not_cached_success(self):
+        rid = self.ids["Writing integration tests for services"]
+        for output in ({"kind": "none"}, {"kind": "template", "template": "[[task]]", "questions": ["Task?"]},
+                       {"kind": "bullet", "entry": "s1e0", "text": "Built [[system]].", "tags": []}):
+            with self.subTest(output=output):
+                chat = FakeDeepSeek(lambda ids: [{"requirement": rid, **output}])
+                with self.assertRaises(DeepSeekError):
+                    suggest_gap(self.checked, self.decided, self.cv, self.db, rid, chat)
+                self.assertNotIn("ai_checked", next(r for r in self.checked["requirements"] if r["requirement_id"] == rid))
+
+    def test_a_dropped_pick_leaves_room_for_the_next_pick_for_the_same_requirement(self):
+        # Dogfood round 3, real answer: skills the CV already listed came first and were dropped, and
+        # the complete bullet after them was ignored, so the requirement never got a suggestion.
+        rid = self.ids["Writing integration tests for services"]
+        text = "Wrote integration tests for the billing services."
+        chat = FakeDeepSeek(lambda ids: [
+            {"requirement": rid, "kind": "skill", "line": "fact-skills-languages", "items": ["Python", "Java"]},
+            {"requirement": rid, "kind": "bullet", "entry": "s1e0", "text": text, "tags": ["integration tests"]}])
         result = suggest_gap(self.checked, self.decided, self.cv, self.db, rid, chat)
-        row = next(r for r in result['requirements'] if r['requirement_id'] == rid)
-        self.assertEqual(row['guidance']['source'], 'ai')
-        self.assertIn('backend responsibility', row['guidance']['template'])
-        self.assertIsNone(row['suggestion'])
+        self.assertEqual(next(r for r in result["requirements"] if r["requirement_id"] == rid)["suggestion"]["text"], text)
+        checked = find_gaps(self.decided, self.cv, self.db, FakeDeepSeek(lambda ids: [
+            {"requirement": ids["Writing integration tests for services"], "kind": "skill", "line": "fact-skills-languages",
+             "items": ["Python"]},
+            {"requirement": ids["Writing integration tests for services"], "kind": "bullet", "entry": "s1e0", "text": text,
+             "tags": []}]))
+        self.assertEqual(next(r for r in checked["requirements"] if r["requirement_id"] == rid)["suggestion"]["text"], text)
+
+    def test_after_adopting_one_line_another_suggestion_needs_no_new_check(self):
+        # Dogfood round 3: once a line was adopted the check was out of date, and a suggestion for
+        # the next requirement was refused until the user paid for a new check.
+        written = "Wrote integration tests for internal services."
+        entry = next(place["id"] for place in places(self.cv) if place["kind"] == "bullet")
+        updated, profile = write_line(self.checked, self.ids["Writing integration tests for services"],
+                                      entry, written, self.cv, self.db, PROFILE)
+        cv = build_draft(profile, self.db, "en")  # the CV prepared again with the new line
+        confirmed = [(fact["id"], fact["version"]) for fact in list_facts(self.db)]
+        self.assertTrue(coverage(updated, cv, confirmed)["stale"])
+        rid = self.ids["3+ years of backend experience"]
+        chat = FakeDeepSeek(lambda ids: [{"requirement": rid, "kind": "bullet", "entry": "s1e0",
+            "text": "Built backend services over 3 years with REST APIs.", "tags": []}])
+        result = suggest_gap(updated, self.decided, cv, self.db, rid, chat)
+        self.assertEqual(next(r for r in result["requirements"] if r["requirement_id"] == rid)["suggestion"]["text"],
+                         "Built backend services over 3 years with REST APIs.")
+        self.assertIn(written, chat.sent[0])  # asked with the CV as it is now
+        self.assertEqual(len(chat.sent), 1)
 
     def test_changed_requirements_and_invalid_response_do_not_save_success(self):
         rid = self.ids["Writing integration tests for services"]

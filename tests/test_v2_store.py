@@ -11,14 +11,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import tenant_store
-from cv import build_draft_from_facts, content_fingerprint
+from cv import build_draft_from_facts, content_fingerprint, tailor_draft
 from cv_plan import plan_draft
 from tenant_store import (Conflict, FactSnapshot, LateResult, NotFound, Refused, StoreError, UserWorkspace,
                           apply_deletions, claim_tasks, create_session, delete_account, expire_tasks, finish_task,
                           initialize_store, mark_spending, provision_user, read_deletions, record_usage,
                           recover_tasks, resolve_session, revoke_session, save_login_attempt, set_setting,
                           set_user_active, sign_in, store_public_board, take_login_attempt)
-from tests.test_cv import FACTS, PROFILE
+from tests.test_cv import FACTS, PROFILE, FakeChat
 from tests.test_cv_plan import CUT_API, FakePlanner
 from tests.test_gaps import FakeDeepSeek, decided_job, suggestions
 
@@ -295,6 +295,34 @@ class MaterialTests(StoreCase):
         document, final = self.a.preview(job, "en")
         self.assertTrue(final)
         self.assertEqual(content_fingerprint(document), head["content_sha256"])
+
+    def test_pending_material_expansion_can_publish_approve_and_export(self):
+        self.a.import_facts(FACTS)
+        self.a.save_profile("en", copy.deepcopy(PROFILE), expected_version=0)
+        decided = decided_job()
+        job = self.a.create_job(decided["jd"], request_id="pending-job")["job_id"]
+        self.a.save_requirements(job, decided, decided, expected_version=0)
+        inputs = self.a.cv_inputs(job, "en")
+        draft = build_draft_from_facts(PROFILE, inputs["facts"].current([f["id"] for f in FACTS]), "en")
+        expanded = "Led 4 engineers for 3 years, adding AWS and reducing latency by 40%."
+        tailored = tailor_draft(draft, inputs["facts"], chat=FakeChat({"fact-intern-api": expanded}))
+        task, token = run_task(self.database, self.a_id, "prepare_cv", key="pending", job_id=job)
+        result = self.a.publish_cv(task_id=task, token=token, job_id=job, language="en", base_head=None,
+                                  documents=[("draft", draft), ("tailored", tailored)], profile_version=1,
+                                  requirements_version=1, stages=[])
+        self.assertNotIn("superseded", result)
+        snapshot = self.a.job_snapshot(job)
+        self.assertEqual(len(snapshot["confirmed"]), len(FACTS))  # legacy field contains all current versions
+        head = snapshot["cv"]["en"]["material"]
+        self.assertTrue(head["inputs_current"])
+        self.a.approve(job, "en", head["content_sha256"])
+        exported = self.a.export_inputs(job, "en")
+        task, token = run_task(self.database, self.a_id, "export_pdf", heavy="pdf", job_id=job)
+        self.a.publish_pdf(task_id=task, token=token, approval_id=exported["approval_id"], data=PDF, pages=1)
+        self.assertEqual(self.a.final_pdf(job, "en"), PDF)
+        self.assertTrue(all(f["status"] == "pending" for f in self.a.list_facts()))
+        with self.assertRaises(NotFound):
+            self.b.final_pdf(job, "en")
 
     def test_changed_inputs_stop_approval_and_final_pdf_and_old_page_cannot_approve(self):
         job = self.ready(self.a)

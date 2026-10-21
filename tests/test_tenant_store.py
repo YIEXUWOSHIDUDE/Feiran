@@ -156,11 +156,13 @@ class TenantStoreTests(unittest.TestCase):
             self.a.confirm_facts([('fact-shared', 1)])
         with self.assertRaises(Conflict):
             self.draft(self.a, a_job, 'stale')
-        with self.assertRaises(CVError):
-            self.draft(self.a, a_job, 'pending', fact_version=2)
-        self.assertEqual(len(self.a.list_materials(a_job)), 1)
+        new = self.draft(self.a, a_job, 'pending', fact_version=2)
+        self.assertEqual(len(self.a.list_materials(a_job)), 2)
+        self.assertEqual(self.a.get_fact('fact-shared')['status'], 'pending')
+        self.assertEqual(self.b.get_material(b_draft['material_id'])['draft'], b_draft['draft'])
+        self.assertEqual(len(self.b.list_materials(b_job)), 1)
         self.a.confirm_facts([('fact-shared', 2)])
-        new = self.draft(self.a, a_job, 'new-request', fact_version=2)
+        self.assertTrue(self.a.get_material(new['material_id'])['inputs_current'])
         self.assertEqual(new['version'], 2)
         self.assertTrue(new['inputs_current'])
         self.assertEqual(new['draft']['status'], 'draft')
@@ -182,15 +184,17 @@ class TenantStoreTests(unittest.TestCase):
             self.a.save_profile('en', profile('Wrong'), expected_version=1)
         self.assertEqual(self.a.get_profile('en')['version'], 2)
 
-    def test_profile_can_wait_for_confirmation_but_cannot_generate_until_confirmed(self):
+    def test_profile_can_generate_with_pending_material_before_optional_confirmation(self):
         self.a.import_facts([one_fact()])
         self.a.save_profile('en', profile(), expected_version=0)
         job = self.a.create_job(JD, request_id='j')['job_id']
-        with self.assertRaises(CVError):
-            self.draft(self.a, job)
-        self.assertEqual(self.a.list_materials(job), [])
+        draft = self.draft(self.a, job)
+        self.assertTrue(draft['inputs_current'])
+        self.assertEqual(len(self.a.list_materials(job)), 1)
+        self.assertEqual(self.a.get_fact('fact-shared')['status'], 'pending')
         self.a.confirm_facts([('fact-shared', 1)])
-        self.assertTrue(self.draft(self.a, job)['inputs_current'])
+        self.assertTrue(self.a.get_material(draft['material_id'])['inputs_current'])
+        self.assertEqual(self.draft(self.a, job)['material_id'], draft['material_id'])
 
     def test_profile_and_expected_fact_validation_reject_injected_or_missing_refs(self):
         job = self.prepare(self.a)
@@ -385,5 +389,9 @@ class DraftReuseTests(unittest.TestCase):
                 self.assertEqual(render_html(legacy), render_html(pure))
             pending = copy.deepcopy(scoped)
             pending[FACTS[0]['id']]['status'] = 'pending'
-            with self.assertRaises(CVError):
-                build_draft_from_facts(PROFILE, pending)
+            for language in ['en', 'zh']:
+                before = build_draft_from_facts(PROFILE, scoped, language)
+                after = build_draft_from_facts(PROFILE, pending, language)
+                before.pop('created_at'); after.pop('created_at')
+                self.assertEqual(after, before)
+                self.assertEqual(render_html(after), render_html(before))

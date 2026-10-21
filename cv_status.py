@@ -28,7 +28,7 @@ REASONS = {
     "nothing_found": "DeepSeek found no requirement lines.",
     "no_profile": "There is no CV yet. Upload your CV on the Facts page.",
     "no_facts": "There are no facts yet. Upload your CV on the Facts page.",
-    "facts_not_confirmed": "Some lines of your CV are not confirmed yet. Confirm them on the Facts page.",
+    "facts_not_confirmed": "An earlier run required confirmation. Prepare the CV again to use all saved material.",
     "facts_missing": "Your CV lists facts that are no longer stored. Upload your CV again on the Facts page.",
     "profile_unreadable": "Your CV layout file could not be read, so it is not clear what must stay private. "
                           "Nothing was sent to DeepSeek. Upload your CV again on the Facts page.",
@@ -38,7 +38,7 @@ REASONS = {
 }
 STAGES = ("draft", "rewording", "layout")
 STAGE_FAILED = {"draft": "Not prepared", "rewording": "Not reworded", "layout": "Not adjusted for this job"}
-STAGE_KEPT = {"rewording": "Your confirmed wording is used.", "layout": "Your usual layout is used."}
+STAGE_KEPT = {"rewording": "Your saved wording is used.", "layout": "Your usual layout is used."}
 STAGE_KEPT_EARLIER = {"rewording": "The earlier rewording below is kept.", "layout": "The earlier adjusted layout below is kept."}
 
 
@@ -68,7 +68,7 @@ def stage_failure(stage: str, exc: Exception, earlier: bool = False) -> dict:
 
 def reworded(head: dict) -> dict:
     changed, kept = len(rewritten_lines(head)), head["tailoring"]["rejected"]
-    note = f"; {kept} kept as confirmed because the rewording failed the fact check" if kept else ""
+    note = f"; {kept} kept because the generated text had an invalid format" if kept else ""
     return stage_entry("rewording", "done", f"Reworded for this job: {changed} line(s) changed{note}.")
 
 

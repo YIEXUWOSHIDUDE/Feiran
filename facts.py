@@ -650,7 +650,7 @@ def find_confirmed_facts(
                FROM facts AS f JOIN fact_versions AS v
                  ON v.fact_id = f.fact_id AND v.version = f.current_version
                JOIN fact_tags AS t ON t.fact_id = v.fact_id AND t.version = v.version
-               WHERE v.status = 'confirmed'"""
+               """
         ).fetchall()
         matched_by_id: dict[str, list[str]] = {}
         for row in tag_rows:
@@ -683,7 +683,7 @@ def find_confirmed_facts(
                        v.created_at, v.confirmed_at
                 FROM facts AS f JOIN fact_versions AS v
                   ON v.fact_id = f.fact_id AND v.version = f.current_version
-                WHERE v.status = 'confirmed' AND ({' OR '.join(where_parts)})
+                WHERE ({' OR '.join(where_parts)})
                 ORDER BY {matched_order}, {preferred_order}, v.confirmed_at DESC, v.fact_id
                 LIMIT ?""",
             [*where_parameters, *order_parameters, limit],
@@ -704,7 +704,7 @@ def find_confirmed_facts(
 
 
 def load_confirmed_fact(path: Path, fact_id: str, version: int) -> dict[str, Any]:
-    """Load one version only when it is still current and confirmed."""
+    """Load one version only when it is still current."""
     fact_id = _fact_id(fact_id)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise FactStoreError("事实版本必须是正整数")
@@ -715,11 +715,11 @@ def load_confirmed_fact(path: Path, fact_id: str, version: int) -> dict[str, Any
                       v.created_at, v.confirmed_at
                FROM facts AS f JOIN fact_versions AS v
                  ON v.fact_id = f.fact_id AND v.version = f.current_version
-               WHERE v.fact_id = ? AND v.version = ? AND v.status = 'confirmed'""",
+               WHERE v.fact_id = ? AND v.version = ?""",
             (fact_id, version),
         ).fetchone()
         if row is None:
-            raise FactStoreError(f"事实 {fact_id} 版本 {version} 已不是当前已确认版本")
+            raise FactStoreError(f"事实 {fact_id} 版本 {version} 已不是当前版本")
         return _row_to_fact(connection, row)
     except sqlite3.Error as exc:
         raise FactStoreError("无法读取指定事实版本") from exc
@@ -750,7 +750,7 @@ def load_current_facts(path: Path, fact_ids: Iterable[str]) -> dict[str, dict[st
 
 
 def load_search_terms(path: Path) -> list[dict[str, Any]]:
-    """Return only confirmed current tag metadata for local job-list ranking."""
+    """Return current tag metadata for local job-list ranking."""
     connection = _open_store(path)
     try:
         rows = connection.execute(
@@ -758,7 +758,7 @@ def load_search_terms(path: Path) -> list[dict[str, Any]]:
                FROM facts AS f JOIN fact_versions AS v
                  ON v.fact_id = f.fact_id AND v.version = f.current_version
                JOIN fact_tags AS t ON t.fact_id = v.fact_id AND t.version = v.version
-               WHERE v.status = 'confirmed' ORDER BY t.tag_key, v.fact_id"""
+               ORDER BY t.tag_key, v.fact_id"""
         ).fetchall()
         return [
             {
@@ -778,7 +778,7 @@ def load_confirmed_fact_texts(
     path: Path,
     fact_refs: Iterable[tuple[str, int]],
 ) -> dict[tuple[str, int], str]:
-    """Load text only when the selected fact version is still current and confirmed."""
+    """Load text only when the selected fact version is still current."""
     refs: dict[tuple[str, int], None] = {}
     for fact_id, version in fact_refs:
         fact_id = _fact_id(fact_id)
@@ -794,8 +794,7 @@ def load_confirmed_fact_texts(
             f"""SELECT v.fact_id, v.version, v.text
                 FROM facts AS f JOIN fact_versions AS v
                   ON v.fact_id = f.fact_id AND v.version = f.current_version
-                WHERE v.status = 'confirmed'
-                  AND v.fact_id IN ({','.join('?' for _ in ids)})""",
+                WHERE v.fact_id IN ({','.join('?' for _ in ids)})""",
             ids,
         ).fetchall()
         return {
@@ -816,8 +815,8 @@ class FactFile:
     store (tenant_store) can hand them one user's facts instead: a snapshot read in one short
     transaction, or its open transaction when a user's decision writes. Nothing here decides
     who the user is. ``revise_confirmed`` and ``add_confirmed`` exist only for wording the user
-    has just accepted as true (a gap they said is true for them); no model output reaches them
-    without that decision.
+    has chosen to adopt; their legacy names and stored status do not assert authenticity.
+    Model output is saved only after that adoption.
     """
 
     def __init__(self, path: Path) -> None:
@@ -899,7 +898,7 @@ def main(argv: list[str] | None = None) -> int:
                 "existing_count": sum(not created for _, created in imported),
                 "facts": [{"created": created, **fact} for fact, created in imported],
                 "next_step": (
-                    "逐条核对原文、分类和标签，只保留确实无误的 ID 后运行："
+                    "资料已可用于匹配和生成；可选的历史确认操作："
                     + shlex.join(command) if pending_refs else "没有待确认的事实"
                 ),
             }

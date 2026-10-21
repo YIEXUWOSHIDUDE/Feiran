@@ -358,7 +358,7 @@ def _move_cv(connection, owner, folder, language, facts, current_facts, versions
         else:
             verify_draft(approved, current_facts)
     except CVError:
-        reason = reason or "the approved CV no longer rests on the current confirmed facts"
+        reason = reason or "the approved CV no longer matches the current saved material"
     if reason:
         report["approvals_not_carried"].append({**where, "reason": reason})
         return

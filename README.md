@@ -1,19 +1,19 @@
 # Feiran · 斐然
 
-When adding related experience, **AI suggested entry** can propose experiences not yet recorded. Missing details get an editable template and specific questions, without requiring facts to be entered first. Replace every `[[placeholder]]` before confirming an addition. Previously cached empty answers also show reference templates, labelled separately from model-generated suggestions.
+**AI suggested entry** produces complete, editable CV sentences or skills for each requirement, including content beyond the saved profile. Adopt a suggestion directly or edit it first. Historical empty suggestions are generated again on the next click; there are no fill-in templates or per-line truth confirmations. Saved profile content is immediately available for matching and generation, including older pending entries.
 
 > What oft was thought, but ne’er so well express’d.
 
 English | [简体中文](README.zh-CN.md)
 
-An AI-powered workspace that helps you turn real experience into clearer, job-specific resumes. Understand what a role asks for, refine how you present your experience, and review every change before exporting.
+An AI-powered workspace that helps you prepare competitive, job-specific resumes. Understand what a role asks for, refine how you present your experience, and review every change before exporting.
 
-![Feiran — real experience, clearer stories, brighter next steps](web/feiran-brand.png)
+![Feiran — relevant content, clearer stories, brighter next steps](web/feiran-brand.png)
 
-## Real experience. Clearer stories. Brighter next steps.
+## Relevant content. Clearer stories. Brighter next steps.
 
 - **Understand the role** — identify requirements in the job description and review anything missed or misclassified.
-- **Present relevant experience** — use your confirmed facts to prepare a CV for each job.
+- **Present relevant experience** — use your profile and AI additions to prepare a CV for each job.
 - **Refine the wording and structure** — review AI suggestions for phrasing, ordering and what to leave out.
 - **Stay in control** — inspect changes, undo them individually, and approve the exact version you want.
 - **Export your CV** — download the PDF after reviewing and approving it.
@@ -34,9 +34,9 @@ The V2 sponsor hints and review-before-generation flow below are implemented on 
 
 Once you have access to a running workspace:
 
-1. **Bring your experience.** Choose Chinese or English when uploading a PDF; both CVs are kept separately. Check and confirm the extracted facts. Editing a fact saves a new version that needs confirmation.
-2. **Choose a job.** In V2, paste a public job URL or description, or browse followed companies, to review the job first. Greenhouse, Lever, Ashby and Tencent use public APIs; other URLs use page content, preferring JobPosting data. Login, CAPTCHA, JavaScript-only or incomplete pages may require pasting the description. Review the sponsor label, original evidence, source and capture time, plus skill words paired with confirmed experience. Unknown sponsor policies remain visible by default. Click **Prepare CV** when ready to extract requirements and generate a draft. Reading a job uses no model calls or generation allowance. Saved URLs reopen the existing job. V1 local mode keeps its previous read-and-prepare flow.
-3. **Review your tailored CV.** Check the job requirements, proposed wording and layout changes. See which requirements your CV supports, which evidence was left out, and where information is missing. Add suggested experience only when it is true for you.
+1. **Bring your experience.** Choose Chinese or English when uploading a PDF; both CVs are kept separately. Save the extracted content to use it immediately. Editing saves a new usable version and preserves earlier text in history.
+2. **Choose a job.** In V2, paste a public job URL or description, or browse followed companies, to review the job first. Greenhouse, Lever, Ashby and Tencent use public APIs; other URLs use page content, preferring JobPosting data. Login, CAPTCHA, JavaScript-only or incomplete pages may require pasting the description. Review the sponsor label, original evidence, source and capture time, plus skill words paired with saved experience. Unknown sponsor policies remain visible by default. Click **Prepare CV** when ready to extract requirements and generate a draft. Reading a job uses no model calls or generation allowance. Saved URLs reopen the existing job. V1 local mode keeps its previous read-and-prepare flow.
+3. **Review your tailored CV.** Check the job requirements, proposed wording and layout changes. See which requirements your CV supports, which evidence was left out, and where information is missing. Adopt or edit complete AI suggestions to add relevant content.
 4. **Approve and export.** Read the CV and every change, approve that version, and download the final PDF. Changed content needs a new review.
 
 Switch between **English** and **简体中文** at the top of the page. The interface remembers your choice; changing the interface language does not translate your job descriptions, experience statements or CV. CV languages depend on the information in your profile.
@@ -49,18 +49,18 @@ All regions share one listings database; Mainland China, other regions and unkno
 
 - Your experience and saved materials stay in the private data directory of your Feiran instance. In a cloud workspace, this is on the cloud host; local operation stores it on your computer.
 - AI features send relevant job and experience text to DeepSeek. The application filters known identifying details and uses temporary references for experience statements. Filtering does not guarantee anonymity; experience text can still be identifying.
-- Suggestions are not new facts. You decide whether an addition is true and which wording to approve.
+- Suggestions can extend beyond the saved profile. You choose which content to adopt and which version to approve.
 - Approval belongs to the version you reviewed. Changing the content or relevant facts can require you to review and approve again.
 
 ## Current limits
 
-AI can misunderstand a requirement or change the meaning of a sentence. Automated checks catch some unsupported changes, but they cannot verify your real experience or replace your review.
+AI can misunderstand a requirement or change the meaning of a sentence. Content review remains available before final export; generation does not require per-line authenticity confirmation.
 
-Sponsor labels use finite English/Chinese text rules; unrecognized wording stays unknown. In V2, each description is checked once, when a job is saved or a followed company is read, and the result is stored with its check time and rules version. Opening pages reuses it; an unchanged re-read updates only the capture time, and changed wording gets a new check while saved jobs keep theirs. **Wording not checked yet** means no result exists under the current rules (saved before results were kept, a failed check, or new rules): use the job's **Check the sponsor wording** button or refresh the company. V1 local mode checks again on every read and stores nothing. Employer sponsorship history does not establish the policy of this role, and these labels do not decide a candidate's visa eligibility.
+Sponsor labels use finite English/Chinese text rules; unrecognized wording stays unknown. In V2, each description is checked once, when a job is saved or a followed company is read, and the result is stored with its check time and rules version. Opening pages reuses it; an unchanged re-read updates only the capture time, and changed wording gets a new check while saved jobs keep theirs. **Wording not checked yet** means no result exists under the current rules (saved before results were kept, a failed check, or new rules): use the job's **Check the sponsor wording** button or refresh the company. V1 local listings also persist answers by text digest and rules version, reusing them across browsing and filtering; the first read of an old database fills the cache. Saved V1 job views reuse an in-process answer for unchanged wording. In both modes, opening a job never starts a paid coverage check; use Check now or Check again when needed. Employer sponsorship history does not establish the policy of this role, and these labels do not decide a candidate's visa eligibility.
 
 Job ordering and pre-generation hints are based on skill-word overlap, not eligibility or the probability of an offer. Missing evidence does not mean you lack a qualification, and a saved job description does not prove a role is still open.
 
-Feiran prepares and reviews materials. It does not submit applications, track applications or predict hiring outcomes. Optional semantic review remains an unvalidated experiment and is not part of the normal web workflow.
+Feiran prepares and reviews materials. It does not submit applications, track applications or predict hiring outcomes.
 
 ## Local deployment (optional)
 

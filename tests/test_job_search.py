@@ -183,7 +183,7 @@ class JobSearchTests(unittest.TestCase):
         self.assertEqual([job["job_id"] for job in ranked], ["1"])
         self.assertEqual(ranked[0]["location_filter_status"], "未知")
 
-    def test_unconfirmed_profile_facts_are_not_used(self):
+    def test_pending_profile_material_is_used(self):
         profile = {"facts": [
             {"id": "f1", "text": "使用 Python 编写脚本。", "confirmed": True, "terms": ["Python"]},
             {"id": "f2", "text": "使用 Java。", "confirmed": False, "terms": ["Java"]},
@@ -192,7 +192,7 @@ class JobSearchTests(unittest.TestCase):
             path = Path(directory) / "profile.json"
             path.write_text(json.dumps(profile), encoding="utf-8")
             terms = load_profile(path)
-        self.assertEqual([(item["fact_id"], item["term"]) for item in terms], [("f1", "Python")])
+        self.assertEqual([(item["fact_id"], item["term"]) for item in terms], [("f1", "Python"), ("f2", "Java")])
 
     def test_selected_jd_becomes_a_reviewable_pending_input(self):
         selected = {"jd": {"text": "Python experience", "source": "https://example.test/jobs/1", "captured_at": CAPTURED}}

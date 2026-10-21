@@ -526,7 +526,7 @@ def load_profile_data(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
             if not isinstance(term, str) or not term.strip() or term.casefold() not in text.casefold():
                 raise SearchError(f"事实 {fact_id} 的词面线索必须出现在事实原文中")
             key = (fact_id, term.casefold())
-            if confirmed and key not in seen:
+            if key not in seen:
                 seen.add(key)
                 terms.append({"term": term, "fact_id": fact_id, "fact_quote": text})
     return normalized_facts, terms

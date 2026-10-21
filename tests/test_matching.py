@@ -71,7 +71,7 @@ class MatchingTests(unittest.TestCase):
         confirm_fact(database, degree["id"], 1)
         return python, degree, pending
 
-    def test_deepseek_links_only_confirmed_facts_it_names(self):
+    def test_deepseek_links_current_material_including_pending_entries(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "workbench.db"
             python, degree, pending = self.facts_for_model(database)
@@ -86,11 +86,11 @@ class MatchingTests(unittest.TestCase):
         sent = json.loads(matcher.messages[-1]["content"])
         self.assertEqual(
             [(item["requirement_id"], item["fact_id"]) for item in proposed["match_candidates"]],
-            [(ids[0], python["id"])],
+            [(ids[0], python["id"]), (ids[0], pending["id"])],
         )
         self.assertEqual(proposed["fact_matching"]["method"], "deepseek-facts-v1")
-        # Pending facts are never offered, so they are never sent either; nor is any fact ID.
-        self.assertEqual(sorted(fact["text"] for fact in sent["facts"]), sorted([python["text"], degree["text"]]))
+        # All current material is offered, using stand-ins rather than local IDs.
+        self.assertEqual(sorted(fact["text"] for fact in sent["facts"]), sorted([python["text"], degree["text"], pending["text"]]))
         for fact in (python, degree, pending):
             self.assertNotIn(fact["id"], matcher.messages[-1]["content"])
         self.assertEqual(
@@ -101,7 +101,7 @@ class MatchingTests(unittest.TestCase):
     def test_an_answer_in_the_wrong_shape_is_ignored_not_a_crash(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "workbench.db"
-            python, _, _ = self.facts_for_model(database)
+            python, _, pending = self.facts_for_model(database)
             data, ids = decided_requirements()
             matcher = FakeMatcher([{"requirement": [ids[0]], "facts": [python["id"]]},
                                    {"requirement": ids[0], "facts": [{"id": python["id"]}, python["id"]]}], database=database)
@@ -112,13 +112,13 @@ class MatchingTests(unittest.TestCase):
     def test_word_matching_takes_over_when_deepseek_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "workbench.db"
-            python, _, _ = self.facts_for_model(database)
+            python, _, pending = self.facts_for_model(database)
             data, ids = decided_requirements()
             matcher = FakeMatcher(error=DeepSeekError("DeepSeek API 返回 HTTP 503"))
             proposed = propose_matches(data, database, chat=matcher)
         self.assertEqual(proposed["fact_matching"]["fallback_reason"], "DeepSeek API 返回 HTTP 503")
         self.assertEqual(proposed["fact_matching"]["method"], "versioned-tags-and-type-v1")
-        self.assertEqual([item["fact_id"] for item in proposed["match_candidates"]], [python["id"]])
+        self.assertEqual([item["fact_id"] for item in proposed["match_candidates"]], [python["id"], pending["id"]])
 
     def test_cli_propose_writes_candidates_without_copying_all_facts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -158,9 +158,9 @@ class MatchingTests(unittest.TestCase):
             data, ids = decided_requirements()
             result = propose_matches(data, database, limit=5)
         self.assertEqual(result["facts"], [])
-        self.assertEqual({item["fact_id"] for item in result["match_candidates"]}, {python["id"]})
+        self.assertEqual({item["fact_id"] for item in result["match_candidates"]}, {python["id"], pending["id"]})
         self.assertNotIn(degree["id"], {item["fact_id"] for item in result["match_candidates"]})
-        self.assertNotIn(pending["id"], {item["fact_id"] for item in result["match_candidates"]})
+        self.assertIn(pending["id"], {item["fact_id"] for item in result["match_candidates"]})
         self.assertEqual(result["match_candidates"][0]["requirement_id"], ids[0])
         self.assertEqual(result["match_candidates"][0]["status"], "pending")
 
@@ -185,7 +185,7 @@ class MatchingTests(unittest.TestCase):
             data, ids = decided_requirements()
             proposed = propose_matches(data, database)
             revise_fact(database, fact["id"], text="熟练使用 Python。")
-            with self.assertRaisesRegex(FactStoreError, "已不是当前已确认版本"):
+            with self.assertRaisesRegex(FactStoreError, "已不是当前版本"):
                 apply_match_decisions(proposed, database, {ids[0]: fact["id"]}, set())
 
     def test_no_match_is_an_explicit_unknown_decision(self):

@@ -1,11 +1,11 @@
 """B6 evaluation on synthetic, hand-labelled samples (examples/v2_eval_samples.json).
 
-    python eval_v2.py offline       # the word-level claim checks on the rewrite samples; no model
+    python eval_v2.py offline       # candidate content format checks; no model
     python eval_v2.py live --max-calls 9 --confirm-paid --out report.json   # paid; needs authorization
 
-``offline`` is a regression gate: every overclaim the rules are built to catch must be flagged
-and every supported line must pass; overclaims they cannot see are reported as known gaps, never
-as passes. ``live`` asks the model to judge the evidence samples through gaps.find_gaps (the
+``offline`` checks that candidate content is usable as a CV line. Source text and old
+truthfulness labels do not limit skills, numbers, responsibility or other content suggestions.
+``live`` asks the model to judge the evidence samples through gaps.find_gaps (the
 app's own prompt and answer checks), one call per sample under a hard limit; the suggestion step
 is stopped locally so it never reaches the model. It reports agreement with the labels next to a
 keyword baseline, with the model, prompt fingerprint and sample version. A run's numbers describe
@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from claims import check_rewrite
+from cv import _valid_line
 
 SAMPLES = Path(__file__).parent / "examples" / "v2_eval_samples.json"
 MAX_LIVE_CALLS = 100
@@ -34,22 +34,25 @@ def load(path: Path = SAMPLES) -> dict[str, Any]:
 
 
 def offline(samples: dict[str, Any]) -> dict[str, Any]:
-    """The claim checks on every labelled rewrite."""
+    """Check line format using the product validator, without source-claim comparison.
+
+    Historical rewrite labels are retained in the fixture for context only. A format case
+    can set ``expected_usable`` to False; other candidate lines are expected to be usable.
+    """
     results = []
     for case in samples["rewrites"]:
-        reasons = check_rewrite(case["rewrite"], case["fact"], case["tags"], case.get("vocabulary", case["tags"]))
-        results.append({"id": case["id"], "label": case["label"], "rules": case["rules"],
-                        "category": case["category"], "flagged": bool(reasons)})
-    regressions = [item["id"] for item in results
-                   if item["rules"] == "must_catch" and item["flagged"] != (item["label"] == "overclaim")]
+        usable = _valid_line(case["rewrite"])
+        results.append({"id": case["id"], "category": case["category"],
+                        "usable": usable, "expected_usable": case.get("expected_usable", True)})
+    regressions = [item["id"] for item in results if item["usable"] != item["expected_usable"]]
     by_category: dict[str, dict[str, int]] = {}
     for item in results:
-        counts = by_category.setdefault(item["category"], {"cases": 0, "flagged": 0})
+        counts = by_category.setdefault(item["category"], {"cases": 0, "usable": 0})
         counts["cases"] += 1
-        counts["flagged"] += item["flagged"]
-    return {"sample_version": samples["version"], "cases": len(results), "regressions": regressions,
-            "known_gaps_missed": [item["id"] for item in results if item["rules"] == "known_gap" and not item["flagged"]],
-            "known_gaps_caught": [item["id"] for item in results if item["rules"] == "known_gap" and item["flagged"]],
+        counts["usable"] += item["usable"]
+    return {"sample_version": samples["version"], "evaluation": "candidate-line-format",
+            "cases": len(results), "regressions": regressions,
+            "unusable": [item["id"] for item in results if not item["usable"]],
             "by_category": by_category}
 
 
@@ -136,7 +139,7 @@ def live(samples: dict[str, Any], limit: int, chat: Callable[..., dict[str, Any]
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("offline", help="the claim checks on the labelled rewrites (no model)")
+    commands.add_parser("offline", help="candidate content format checks (no model)")
     paid = commands.add_parser("live", help="the model on the evidence samples (paid; needs --confirm-paid)")
     paid.add_argument("--max-calls", type=int, required=True)
     paid.add_argument("--confirm-paid", action="store_true")

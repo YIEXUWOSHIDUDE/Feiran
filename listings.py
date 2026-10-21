@@ -5,6 +5,8 @@ and downloaded postings; facts and work on a job live in other files.
 """
 
 import hashlib
+from collections import OrderedDict
+from threading import Lock
 import json
 import re
 import sqlite3
@@ -15,7 +17,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 from facts import load_search_terms, tag_finder
 from job_search import SearchError, check_board, fetch_board
-from sponsorship import STATUSES, assess_sponsorship, shown
+from sponsorship import RULE_VERSION as SPONSOR_RULE_VERSION, STATUSES, assess_sponsorship, shown
 
 
 DEFAULT_DATABASE = Path(".local/listings.db")
@@ -30,7 +32,11 @@ SENIOR_TITLE = re.compile(
 # OpenAI, Anthropic and Cohere call every engineer this, new graduates included.
 ANY_LEVEL_TITLE = re.compile(r"\bmember of (the )?technical staff\b", re.IGNORECASE)
 MAX_PAGE_SIZE = 200
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SPONSOR_CACHE_SCHEMA = """CREATE TABLE sponsorship_cache (
+    text_hash TEXT NOT NULL, rule_version INTEGER NOT NULL, answer TEXT NOT NULL,
+    PRIMARY KEY (text_hash, rule_version)
+)"""
 SCHEMA = (
     """CREATE TABLE sources (
         provider TEXT NOT NULL,
@@ -96,8 +102,15 @@ def _open(path: Path, starter: Iterable[dict[str, str]] = ()) -> sqlite3.Connect
             with _transaction(connection):
                 for statement in SCHEMA:
                     connection.execute(statement)
+                connection.execute(SPONSOR_CACHE_SCHEMA)
                 _add_starter(connection, starter)
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif version == 1:
+            with _transaction(connection):
+                # Another request may have completed the upgrade while this one waited.
+                if connection.execute("PRAGMA user_version").fetchone()[0] == 1:
+                    connection.execute(SPONSOR_CACHE_SCHEMA)
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif version != SCHEMA_VERSION:
             raise ListingsError(f"不支持的岗位库版本：{version}")
     except BaseException:
@@ -381,7 +394,29 @@ def _section(unit: str, first_years: int) -> bool | None:
     return False if _REQUIRED_HEADING.search(head) else None
 
 
+# Store only digests and booleans, not thousands of full descriptions. Public JD analysis
+# is independent of the requesting user; process restart or changed wording recomputes it.
+_SENIOR_CACHE: OrderedDict[tuple[int, str], bool] = OrderedDict()
+_SENIOR_CACHE_LOCK = Lock()
+_SENIOR_CACHE_LIMIT = 32768
+
+
 def requires_senior_experience(text: str) -> bool:
+    key = (SENIOR_YEARS, hashlib.sha256(text.encode("utf-8")).hexdigest())
+    with _SENIOR_CACHE_LOCK:
+        if key in _SENIOR_CACHE:
+            _SENIOR_CACHE.move_to_end(key)
+            return _SENIOR_CACHE[key]
+    result = _parse_senior_experience(text)
+    with _SENIOR_CACHE_LOCK:
+        _SENIOR_CACHE[key] = result
+        _SENIOR_CACHE.move_to_end(key)
+        while len(_SENIOR_CACHE) > _SENIOR_CACHE_LIMIT:
+            _SENIOR_CACHE.popitem(last=False)
+    return result
+
+
+def _parse_senior_experience(text: str) -> bool:
     """Whether the JD states that the role requires at least SENIOR_YEARS years of experience.
 
     It reads only this wording: "5+ years", "5 or more years", "at least / a minimum of five
@@ -482,9 +517,8 @@ def ranked_listings(
     newest posting. A location filter keeps postings whose location is unknown. Filters work
     as group_postings describes.
 
-    This single-owner copy works the local sponsor rules out again on each read and stores no
-    answer, so a rule change shows at once and there is nothing to backfill (V2 stores them:
-    tenant_store). A paid analysis could never run here.
+    Sponsor answers are persisted by text digest and rule version, shared across identical
+    descriptions. Changed text or rules get a new answer; reads never call a paid model.
     """
     if isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE or offset < 0:
         raise ListingsError(f"每页岗位数必须在 1 到 {MAX_PAGE_SIZE} 之间")
@@ -518,10 +552,22 @@ def ranked_listings(
                    FROM listings AS l JOIN sources AS s USING (provider, board)
                    ORDER BY l.provider, l.board, l.job_id"""
             ).fetchall()
+            answers = {row["text_hash"]: json.loads(row["answer"]) for row in connection.execute(
+                "SELECT text_hash, answer FROM sponsorship_cache WHERE rule_version = ?",
+                (SPONSOR_RULE_VERSION,))}
+            for row in rows:
+                if row["text_hash"] not in answers:
+                    answer = {**assess_sponsorship(row["text"]), "assessed_at": _now()}
+                    answers[row["text_hash"]] = answer
+                    connection.execute("INSERT OR REPLACE INTO sponsorship_cache VALUES (?, ?, ?)",
+                                       (row["text_hash"], SPONSOR_RULE_VERSION, json.dumps(answer)))
+            # The cache contains only current descriptions under the current rules.
+            connection.execute("DELETE FROM sponsorship_cache WHERE rule_version != ? OR text_hash NOT IN "
+                               "(SELECT text_hash FROM listings)", (SPONSOR_RULE_VERSION,))
     finally:
         connection.close()
     postings = [{**dict(row), "matched": json.loads(row["matched_tags"]),
-                 "sponsorship": shown(assess_sponsorship(row["text"]), source=row["source"],
+                 "sponsorship": shown(answers[row["text_hash"]], source=row["source"],
                                       captured_at=row["last_seen_at"])} for row in rows]
     return group_postings(postings, len({tag.casefold() for tag in tags}), title, location, limit, offset,
                           hide_senior, region, sponsorship)

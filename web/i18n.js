@@ -41,14 +41,14 @@ window.WorkbenchI18n = (() => {
   // Unrecognized diagnostics remain verbatim so useful failure details are never hidden.
   function serverText(value) {
     if (Object.hasOwn(translations, value)) return text(value);
-    let match = /^Reworded for this job: (\d+) line\(s\) changed(?:; (\d+) kept as confirmed because the rewording failed the fact check)?\.$/.exec(value);
-    if (match) return text`Reworded for this job: ${match[1]} line(s) changed${match[2] ? text`; ${match[2]} kept as confirmed because the rewording failed the fact check` : ""}.`;
+    let match = /^Reworded for this job: (\d+) line\(s\) changed(?:; (\d+) kept because the generated text had an invalid format)?\.$/.exec(value);
+    if (match) return text`Reworded for this job: ${match[1]} line(s) changed${match[2] ? text`; ${match[2]} kept because the generated text had an invalid format` : ""}.`;
     match = /^Adjusted for this job: (\d+) change\(s\), listed below\.$/.exec(value);
     if (match) return text`Adjusted for this job: ${match[1]} change(s), listed below.`;
     match = /^(Not prepared|Not reworded|Not adjusted for this job)( again)?: (.*)$/.exec(value);
     if (match) return match[2] ? text`${text(match[1])} again: ${serverText(match[3])}`
       : text`${text(match[1])}: ${serverText(match[3])}`;
-    for (const suffix of ["Your confirmed wording is used.", "Your usual layout is used.",
+    for (const suffix of ["Your saved wording is used.", "Your usual layout is used.",
       "The earlier rewording below is kept.", "The earlier adjusted layout below is kept.",
       " since the last change; use the button below.", ": the CV could not be drafted.",
       " The CV below is from the last time it could be prepared."]) {

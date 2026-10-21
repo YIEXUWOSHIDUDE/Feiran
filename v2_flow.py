@@ -77,7 +77,7 @@ def _stages_after(status: dict | None, draft_id: str | None, stage: dict, not_ru
     """How the preparation stands after one stage was redone: that stage replaced, the stages
     built on its old result marked not run (as the single-user page shows it)."""
     earlier = status["stages"] if status and status.get("draft_material_id") == draft_id else [
-        stage_entry("draft", "done", "Built from your confirmed facts.")]
+        stage_entry("draft", "done", "Built from your saved material.")]
     kept = [item for item in earlier if item["stage"] not in (stage["stage"], *not_run)]
     again = [stage_entry(name, "skipped", f"{STAGE_FAILED[name]} since the last change; use the button below.")
              for name in not_run]
@@ -123,7 +123,7 @@ def prepare_cv(ctx: Any, job_id: str, language: str, *, explicit: bool, result: 
             ctx.finish("succeeded", result={**(result or {}), "cv": "not_prepared", "reason": reason(exc)})
         return
     documents = [("draft", draft)]
-    stages = [stage_entry("draft", "done", "Built from your confirmed facts.")]
+    stages = [stage_entry("draft", "done", "Built from your saved material.")]
     head_document = draft
     ctx.stage("rewording")
     started = time.monotonic()
@@ -338,7 +338,8 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         ctx.user.publish_gaps(task_id=ctx.task_id, token=ctx.token, job_id=request['job_id'],
                               base_version=request['base_gaps_version'], gaps=gaps,
                               checked_head=inputs['head']['material_id'],
-                              requirements_version=inputs['requirements']['version'])
+                              requirements_version=inputs['requirements']['version'],
+                              facts_read=sorted([fact['id'], fact['version']] for fact in inputs['facts'].listed()))
 
     def run_export(ctx: Any) -> None:
         request = ctx.request

@@ -288,7 +288,7 @@ class FailureTests(SavedAnswerCase):
             self.assertEqual(self.answer(client, headers, job)["status"], "not_assessed")
             broken["on"] = False
             checked = client.post(f"/api/jobs/{job}/sponsorship", headers=headers).json()["review"]["sponsorship"]
-            self.assertEqual((checked["status"], checked["rule_version"]), ("supported", 1))
+            self.assertEqual((checked["status"], checked["rule_version"]), ("supported", sponsorship.RULE_VERSION))
             self.assertEqual(client.post(f"/api/jobs/{job}/sponsorship", headers=headers).json()["review"]["sponsorship"],
                              checked)
             self.assertEqual(len(spy.calls), 3)  # the failure, the failure again, the recovery; never the repeat
@@ -530,15 +530,16 @@ class RuleVersionTests(SavedAnswerCase):
         client, headers = self.browser()
         client.post("/api/sources", json={"link": BOARD}, headers=headers)
         job = self.paste(client, headers, "We provide visa sponsorship. Kotlin.")
-        with patch.object(sponsorship, "RULE_VERSION", 2), Analyser().watching() as spy:
+        old_version = sponsorship.RULE_VERSION
+        with patch.object(sponsorship, "RULE_VERSION", old_version + 1), Analyser().watching() as spy:
             listed = self.listing(client, headers)
             self.assertEqual({value["status"] for value in listed.values()}, {"not_assessed"})
             self.assertEqual(self.answer(client, headers, job)["status"], "not_assessed")
             self.assertEqual(spy.calls, [])
-            self.assertEqual({row["rule_version"] for row in rows(self.database, "public_sponsor_assessments")}, {1})
+            self.assertEqual({row["rule_version"] for row in rows(self.database, "public_sponsor_assessments")}, {old_version})
             first = tenant_store.backfill_sponsorship(self.database, limit=1)
             self.assertEqual((first["rule_version"], first["public"]["assessed"], first["public"]["remaining"],
-                              first["private"]["remaining"]), (2, 1, 1, 1))
+                              first["private"]["remaining"]), (old_version + 1, 1, 1, 1))
             rest = tenant_store.backfill_sponsorship(self.database, limit=100)
             self.assertEqual((rest["public"]["assessed"], rest["private"]["assessed"],
                               rest["public"]["remaining"], rest["private"]["remaining"]), (1, 1, 0, 0))
@@ -547,11 +548,11 @@ class RuleVersionTests(SavedAnswerCase):
             self.assertEqual((again["public"]["assessed"], again["private"]["assessed"]), (0, 0))
             self.assertEqual(len(spy.calls), 3)
             listed = self.listing(client, headers)
-            self.assertEqual({value["rule_version"] for value in listed.values()}, {2})
-            self.assertEqual(self.answer(client, headers, job)["rule_version"], 2)
+            self.assertEqual({value["rule_version"] for value in listed.values()}, {old_version + 1})
+            self.assertEqual(self.answer(client, headers, job)["rule_version"], old_version + 1)
         # The newer answers replaced the older ones for the same words.
-        self.assertEqual({row["rule_version"] for row in rows(self.database, "public_sponsor_assessments")}, {2})
-        self.assertEqual({row["rule_version"] for row in rows(self.database, "user_sponsor_assessments")}, {2})
+        self.assertEqual({row["rule_version"] for row in rows(self.database, "public_sponsor_assessments")}, {old_version + 1})
+        self.assertEqual({row["rule_version"] for row in rows(self.database, "user_sponsor_assessments")}, {old_version + 1})
 
 
 class UpgradeTests(unittest.TestCase):
@@ -658,9 +659,9 @@ class UpgradeTests(unittest.TestCase):
 
 
 class V1CompatibilityTests(unittest.TestCase):
-    """The single-owner app keeps no answers: it works the local rules out on each read."""
+    """Local listings persist answers; saved V1 job views still use the local rules."""
 
-    def test_v1_pages_show_answers_worked_out_on_reading_and_store_none(self):
+    def test_v1_lists_store_answers_and_job_views_keep_working(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "cv-profile.json").write_text(json.dumps(PROFILE), encoding="utf-8")
@@ -674,11 +675,14 @@ class V1CompatibilityTests(unittest.TestCase):
                 ranked = client.get("/api/listings").json()["listings"]
                 job = client.post("/api/jobs", json={"title": "Engineer", "text": REFUSED}).json()["job_id"]
                 review = client.get(f"/api/jobs/{job}").json()["review"]["sponsorship"]
+                count = len(spy.calls)
+                self.assertEqual(client.get(f"/api/jobs/{job}").status_code, 200)
+                self.assertEqual(len(spy.calls), count, "reopening a saved JD must reuse its analysis")
             statuses = {item["postings"][0]["job_id"]: item["sponsorship"] for item in ranked}
             self.assertEqual({key: value["status"] for key, value in statuses.items()},
                              {"1": "supported", "2": "not_supported"})
-            self.assertEqual({value["assessed_at"] for value in statuses.values()}, {None})
-            self.assertEqual((review["status"], review["rule_version"]), ("not_supported", 1))
+            self.assertTrue(all(value["assessed_at"] for value in statuses.values()))
+            self.assertEqual((review["status"], review["rule_version"]), ("not_supported", sponsorship.RULE_VERSION))
             self.assertGreaterEqual(len(spy.calls), 3)  # worked out while reading, as before
             self.assertFalse(set(SPONSOR_TABLES) & table_names(root / "listings.db"))
 

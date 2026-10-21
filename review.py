@@ -44,8 +44,6 @@ def build_report(data: Any) -> dict[str, Any]:
             raise ValueError(f"facts[{index}] 必须是对象")
         fact_id = _text(fact.get("id"), f"facts[{index}].id")
         fact_text = _text(fact.get("text"), f"facts[{index}].text")
-        if not isinstance(fact.get("confirmed"), bool):
-            raise ValueError(f"facts[{index}].confirmed 必须是布尔值")
         fact_version = fact.get("version")
         if fact_version is not None and (
             isinstance(fact_version, bool) or not isinstance(fact_version, int) or fact_version < 1
@@ -55,7 +53,7 @@ def build_report(data: Any) -> dict[str, Any]:
             raise ValueError(f"重复的事实 ID：{fact_id}")
         facts_by_id[fact_id] = {
             "text": fact_text,
-            "confirmed": fact["confirmed"],
+            "confirmed": fact.get("confirmed", False),
             "version": fact_version,
         }
 
@@ -88,8 +86,6 @@ def build_report(data: Any) -> dict[str, Any]:
         fact = facts_by_id.get(fact_id)
         if fact is None:
             raise ValueError(f"事实 ID 不存在：{fact_id}")
-        if not fact["confirmed"]:
-            raise ValueError(f"事实尚未确认：{fact_id}")
         selected_version = selection.get("fact_version")
         if fact["version"] is not None:
             if selected_version != fact["version"]:
@@ -102,7 +98,7 @@ def build_report(data: Any) -> dict[str, Any]:
             "fact_id": fact_id,
             "fact_version": fact["version"],
             "fact_quote": fact["text"],
-            "draft_suggestion": f"可考虑引用已确认事实：{fact['text']}",
+            "draft_suggestion": f"可考虑引用资料：{fact['text']}",
         })
 
     return {

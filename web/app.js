@@ -208,7 +208,7 @@ function uploadReview(proposal, onSaved, onCancel) {
     found.other.length ? el("p", { class: "muted" }, t("Also at the top of your CV, not used: "), found.other.join(" · ")) : "",
     el("h3", {}, t`2. What was found: ${facts.length} lines`),
     el("p", { class: "muted" },
-      t("Copied word for word from your PDF. After saving, each line waits in the list below until you confirm it"),
+      t("Extracted from your PDF. Save to use these lines for job matching and CV preparation"),
       known ? t`; ${known} already match facts you have.` : "."),
     layout,
     proposal.not_imported.length
@@ -229,7 +229,7 @@ function uploadPanel(languages) {
   const saved = async (result) => {
     await renderFacts();
     if (!result.imported) show(t`Saved your CV. All ${result.reused} lines match facts you already had.`, "ok");
-    else show(t`Saved your CV. ${result.imported} new line(s) wait below for you to confirm${result.reused ? t`; ${result.reused} matched facts you already had.` : "."}`, "ok");
+    else show(t`Saved your CV. ${result.imported} new line(s) are ready to use${result.reused ? t`; ${result.reused} matched facts you already had.` : "."}`, "ok");
   };
   input.addEventListener("change", () => run(async () => {
     const file = input.files[0];
@@ -252,7 +252,7 @@ function uploadPanel(languages) {
   return el("section", { class: "panel cv-upload-panel" },
     el("h2", {}, t("Your CV")),
     el("p", { class: "muted" },
-      t("Upload your CV as a PDF: each line becomes a fact for you to confirm, and its layout is the base of every job's CV. "),
+      t("Upload your CV as a PDF: saved content and its layout become the starting point for each job's CV. "),
       MODE === "v2"
         ? t("Your name, email, phone and links stay on the Feiran server; DeepSeek sees the other lines to tell sections, entries and bullets apart.")
         : t("Your name, email, phone and links stay on this computer; DeepSeek sees the other lines to tell sections, entries and bullets apart.")),
@@ -264,18 +264,18 @@ function uploadPanel(languages) {
 }
 
 function factEditor(fact) {
-  const text = el("textarea", { class: "fact-edit-text", "aria-label": t("Fact text") }, fact.text);
+  const text = el("textarea", { class: "fact-edit-text", "aria-label": t("Profile text") }, fact.text);
   const tags = el("input", { type: "text", value: fact.tags.join(", "), "aria-label": t("Skill tags") });
   const details = el("details", { class: "fact-editor" },
     el("summary", {}, t("Edit this line")),
-    el("p", { class: "muted" }, t("Saving creates a new version pending confirmation. Earlier text stays in history; affected CVs need review again.")),
-    field(t("Fact text"), text), field(t("Skill tags"), tags));
+    el("p", { class: "muted" }, t("Saving creates a new usable version. Earlier text stays in history; affected CVs need review again.")),
+    field(t("Profile text"), text), field(t("Skill tags"), tags));
   const save = actionButton(t("Save changes"), async () => {
     await api(`/api/facts/${encodeURIComponent(fact.id)}/edit`, { method: "POST", body: JSON.stringify({
       expected_version: fact.version, text: text.value.trim(), tags: tags.value.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
     }) });
     await renderFacts();
-    show(t("Saved. Confirm the changed line before preparing the CV again."), "ok");
+    show(t("Saved. This content is ready to use."), "ok");
   });
   const cancel = el("button", { class: "secondary", onclick: () => {
     text.value = fact.text; tags.value = fact.tags.join(", "); details.open = false;
@@ -286,69 +286,27 @@ function factEditor(fact) {
 
 async function renderFacts() {
   const [{ facts, interrupted }, { languages }] = await Promise.all([api("/api/facts"), api("/api/cv/languages")]);
-  const pending = facts.filter((fact) => fact.status !== "confirmed");
-  const selected = new Set();
-  const confirmButton = el("button", { disabled: true }, t("Confirm selected"));
-  const updateButton = () => {
-    confirmButton.disabled = selected.size === 0;
-    I18n.setText(confirmButton, selected.size ? t`Confirm ${selected.size} selected` : t("Confirm selected"));
-  };
-  confirmButton.addEventListener("click", () => run(async () => {
-    const result = await api("/api/facts/confirm", {
-      method: "POST",
-      body: JSON.stringify({ refs: [...selected] }),
-    });
-    const { facts: after } = await api("/api/facts");
-    if (after.some((fact) => fact.status !== "confirmed")) {
-      await renderFacts();
-      show(t`Confirmed ${result.changed_count} fact(s).`, "ok");
-    } else {
-      flash = [t`Confirmed ${result.changed_count} fact(s). These are the jobs that mention your skills.`, "ok"];
-      location.hash = "#find";
-    }
-  }));
-  const selectAll = el("input", { type: "checkbox", title: t("Select all pending") });
-  selectAll.addEventListener("change", () => {
-    for (const box of app.querySelectorAll("input[data-ref]")) {
-      box.checked = selectAll.checked;
-      box.dispatchEvent(new Event("change"));
-    }
-  });
-  const rows = facts.map((fact) => {
-    const ref = `${fact.id}@${fact.version}`;
-    let box = "";
-    if (fact.status !== "confirmed") {
-      box = el("input", { type: "checkbox", "data-ref": ref });
-      box.addEventListener("change", () => {
-        if (box.checked) selected.add(ref); else selected.delete(ref);
-        updateButton();
-      });
-    }
-    return el("tr", { class: `fact-row ${fact.status}` },
-      el("td", {}, box),
-      el("td", {}, el("code", {}, fact.id), el("div", { class: "muted" }, t`v${fact.version} · ${t(fact.fact_type)}`)),
-      el("td", {}, fact.text, el("div", { class: "tags" }, fact.tags.map((tag) => el("span", { class: "tag" }, tag))), factEditor(fact)),
-      el("td", {}, el("span", { class: `status ${fact.status}` }, t(fact.status))),
-    );
-  });
-  app.replaceChildren(
+  const rows = facts.map((fact) => el("tr", { class: "fact-row" },
+    el("td", {}, el("code", {}, fact.id), el("div", { class: "muted" }, t`v${fact.version} · ${t(fact.fact_type)}`)),
+    el("td", {}, fact.text, el("div", { class: "tags" }, fact.tags.map((tag) => el("span", { class: "tag" }, tag))), factEditor(fact)),
+  ));
+  // The DOM writes a null child out as the text "null", and there is no account panel outside V2.
+  app.replaceChildren(...[
     uploadPanel(languages),
     el("section", { class: "panel facts-panel" },
-      el("h2", {}, t("Facts")),
+      el("h2", {}, t("Personal profile")),
       (interrupted || []).map((notice) => unfinishedNote(notice, renderFacts)),
-      el("p", { class: "muted" },
-        t`${facts.length} facts, ${pending.length} pending. Only confirmed facts can be matched or used in a CV. `,
-        t("Read each one carefully before confirming.")),
+      el("p", { class: "muted" }, t`${facts.length} saved lines, available for matching and CV preparation.`),
       facts.length === 0
-        ? el("p", {}, t("No facts yet. Upload your CV above: each of its lines becomes a fact to confirm here."))
+        ? el("p", {}, t("No profile content yet. Upload your CV above to begin."))
         : el("div", {},
-          el("div", { class: "toolbar" }, confirmButton),
+          el("a", { href: "#find", class: "button" }, t("Find jobs")),
           el("table", {},
-            el("thead", {}, el("tr", {}, el("th", {}, pending.length ? selectAll : ""), el("th", {}, t("Fact")), el("th", {}, t("Text and tags")), el("th", {}, t("Status")))),
+            el("thead", {}, el("tr", {}, el("th", {}, t("Profile entry")), el("th", {}, t("Text and tags")))),
             el("tbody", {}, rows))),
     ),
     accountPanel(),
-  );
+  ].filter(Boolean));
 }
 
 function localDate(iso) {
@@ -510,8 +468,11 @@ function sponsorshipSummary(sponsorship, compact = false, check = null) {
   // A status this page does not know is never shown as "unknown": that would say the rules found nothing.
   const status = Object.hasOwn(SPONSORSHIP_LABELS, data.status) ? data.status : "not_assessed";
   const evidence = Array.isArray(data.evidence) ? data.evidence : [];
+  const label = status === "unknown"
+    ? (evidence.length ? t("Policy unclear in JD") : t("No sponsorship wording in JD"))
+    : SPONSORSHIP_LABELS[status];
   return el("div", { class: `sponsorship ${compact ? "compact" : ""}` },
-    el("span", { class: `sponsor-badge sponsor-${status}` }, t("Visa sponsorship"), ": ", SPONSORSHIP_LABELS[status]),
+    el("span", { class: `sponsor-badge sponsor-${status}` }, t("Visa sponsorship"), ": ", label),
     status === "not_assessed" ? check : null,
     el("details", { class: "sponsor-evidence" },
       el("summary", {}, t("Check the wording and source")),
@@ -574,6 +535,14 @@ function listingRow(item, rank) {
 }
 
 async function renderFind() {
+  let sourcesRequest = null;
+  const readSources = () => {
+    if (!sourcesRequest) sourcesRequest = api("/api/sources").catch(error => {
+      sourcesRequest = null;
+      throw error;
+    });
+    return sourcesRequest;
+  };
   const status = el("p", { class: "muted", id: "find-status" });
   const listBox = el("div", {}, el("p", { class: "muted" }, t("Loading…")));
   const companiesBox = el("div");
@@ -618,7 +587,7 @@ async function renderFind() {
   const filterButton = el("button", { class: "secondary" }, t("Filter"));
   filterButton.addEventListener("click", apply);
   const refreshAll = actionButton(t("Refresh all"), async () => {
-    const { sources } = await api("/api/sources");
+    const { sources } = await readSources();
     await refreshNow(sources);
   }, true);
 
@@ -626,13 +595,13 @@ async function renderFind() {
     const params = new URLSearchParams({
       title: find.title, location: find.location, region: find.region, sponsorship: find.sponsorship, limit: String(find.limit), hide_senior: String(find.hideSenior),
     });
-    const [data, { sources }] = await Promise.all([api(`/api/listings?${params}`), api("/api/sources")]);
+    const [data, { sources }] = await Promise.all([api(`/api/listings?${params}`), readSources()]);
     const newest = sources.map((source) => source.fetched_at).filter(Boolean).sort().pop();
     if (!find.refreshing) I18n.setText(status, t`${data.total} roles from ${sources.length} companies · updated ${ago(newest)}`);
     const notes = [];
     if (data.skill_count === 0) {
-      notes.push(el("p", { class: "warning" }, t("No confirmed skills yet, so nothing can be matched. "),
-        el("a", { href: "#facts" }, t("Confirm your facts first."))));
+      notes.push(el("p", { class: "warning" }, t("No skill tags in your profile yet. "),
+        el("a", { href: "#facts" }, t("Edit your profile."))));
     }
     let body;
     if (sources.length === 0) body = el("p", {}, t("You are not following any company. Add one under Companies below."));
@@ -655,11 +624,12 @@ async function renderFind() {
   }
 
   async function drawCompanies() {
-    const { sources } = await api("/api/sources");
+    const { sources } = await readSources();
     const link = el("input", { type: "text", placeholder: t("Paste a job board link, e.g. https://jobs.lever.co/palantir") });
     const add = actionButton(t("Add company"), async () => {
       const { added } = await api("/api/sources", { method: "POST", body: JSON.stringify({ link: link.value }) });
       show(t`Following ${added.company}: ${added.open} open jobs.`, "ok");
+      sourcesRequest = null;
       await Promise.all([drawCompanies(), drawList()]);
     });
     const rows = sources.map((source) => {
@@ -667,6 +637,7 @@ async function renderFind() {
       remove.addEventListener("click", () => run(async () => {
         if (!window.confirm(t`Stop following ${source.company}? Its downloaded jobs are removed from this list.`)) return;
         await api(`/api/sources/${source.provider}/${encodeURIComponent(source.board)}`, { method: "DELETE" });
+        sourcesRequest = null;
         await Promise.all([drawCompanies(), drawList()]);
       }));
       return el("tr", {},
@@ -693,6 +664,7 @@ async function renderFind() {
     }
     if (!find.refreshing) return;
     const failures = await find.refreshing;
+    sourcesRequest = null;
     if (!listBox.isConnected) return;
     findStatus(t("Ranking…"));
     if (failures.length) show(t`${failures.length} company(ies) could not be updated. Details are under Companies.`);
@@ -703,8 +675,8 @@ async function renderFind() {
     el("section", { class: "panel find-panel" },
       el("h2", {}, t("Jobs that match your skills")),
       el("p", { class: "muted" },
-        t("Most matched first: how many of your confirmed skills each posting mentions. "),
-        t("It counts words; it is not a fit score or your chance of an offer. Pending facts never count.")),
+        t("Most matched first: how many of your saved skills each posting mentions. "),
+        t("It counts words; it is not a fit score or your chance of an offer.")),
       el("div", { class: "toolbar" }, region, sponsorship, inputs.title, inputs.location, filterButton,
         el("label", { class: "check", title: t("Hides roles titled Senior, Staff, Principal, Lead, Manager, Director… (\"Member of Technical Staff\" does not count) and roles whose JD explicitly requires 5+ years of experience. Roles whose level is unclear stay visible.") }, hideSenior, t(" Hide senior roles")),
         refreshAll),
@@ -714,7 +686,7 @@ async function renderFind() {
     el("section", { class: "panel companies-panel" }, companiesBox),
   );
   await Promise.all([drawList(), drawCompanies()]);
-  const { sources } = await api("/api/sources");
+  const { sources } = await readSources();
   await refreshNow(sources.filter((source) => source.stale));
 }
 
@@ -889,7 +861,7 @@ function cvBlock(view, language, refresh) {
     notes.push(el("p", { class: "muted" }, t("DeepSeek kept your usual CV unchanged for this job.")));
   }
   if ((cv.rejected || []).length) {
-    notes.push(el("details", {}, el("summary", {}, t`${cv.rejected.length} rewording(s) failed the fact check, so your own wording is kept`),
+    notes.push(el("details", {}, el("summary", {}, t`${cv.rejected.length} earlier rewording(s) were not applied; previous wording is retained`),
       el("table", {}, el("tbody", {}, cv.rejected.map((line) => el("tr", {},
         el("td", {}, line.rejected_text), el("td", { class: "bad-text" }, line.reasons.join("; "))))))));
   }
@@ -923,8 +895,8 @@ function cvPanel(view, refresh) {
   return el("section", { class: "panel step-panel cv-panel" },
     el("h2", {}, t("2. Your CV for this job")),
     el("p", { class: "muted" },
-      t("Made from your confirmed facts and adjusted for this job: the most relevant parts first, what does not help cut, "),
-      t("and wording that follows the job's requirements. Nothing is added, and every reworded line is fact-checked. "),
+      t("Prepared for this job using your profile: relevant content first, with suggested additions "),
+      t("and wording that follows the job's requirements. You choose which changes to adopt. "),
       t("DeepSeek sees only your CV lines and this job's requirements, never your name, contact details, schools or employers.")),
     field(t("CV language for this job"), language),
     cvBlock(view, main, refresh),
@@ -947,21 +919,38 @@ function suggestionText(suggestion) {
       beside.flatMap((line, index) => [index ? " · " : "", `“${line}”`])) : null);
 }
 
+// A suggestion to offer as it is: complete wording, not an empty or template answer.
+function completeSuggestion(suggestion) {
+  return Boolean(suggestion && (suggestion.text || suggestion.items?.length));
+}
+
+// Where a suggestion goes and its words, as the line editor sends them. Adopting sends what the
+// page shows, so a tab left open never adopts a newer suggestion it has not shown.
+function suggestedLine(suggestion) {
+  return suggestion.kind === "skill"
+    ? { place: `skill:${suggestion.fact_id}`, text: suggestion.items.join(", ") }
+    : { place: `entry:${suggestion.entry_key}`, text: suggestion.text };
+}
+
 // What the CV shows for each requirement, most useful to act on first. Worked out on the
 // server from the CV as it is shown now, so undoing a cut changes it at once.
 const COVERAGE_GROUPS = [
-  ["not_shown", t("Your facts show it, but this CV leaves it out")],
+  ["recheck", t("Changed since this check")],
+  ["not_shown", t("Your profile includes it, but this CV leaves it out")],
   ["related", t("Related only")],
-  ["none", t("No evidence in your confirmed facts")],
+  ["none", t("Not covered in your profile")],
   ["unchecked", t("Not checked")],
 ];
-const COVERAGE_COUNTS = { shown: t("shown"), not_shown: t("left out"), related: t("related only"), none: t("no evidence"), unchecked: t("not checked") };
+const COVERAGE_COUNTS = { shown: t("shown"), recheck: t("to check again"), not_shown: t("left out"), related: t("related only"), none: t("no evidence"), unchecked: t("not checked") };
 const LEFT_OUT = {
   cut: t("cut for this job"),
   reworded: t("reworded in a way that no longer shows it"),
-  not_on_cv: t("in your confirmed facts, but not on your CV"),
+  not_on_cv: t("in your profile, but not on your CV"),
+  changed: t("as it read when last checked"),
 };
 const WAY_BACK = { cut: t("Put it back"), reworded: t("Use your own wording") };
+// What the last check found, beside a requirement to check again.
+const LAST_CHECK = { supported: t("shown"), related: t("related only"), none: t("no evidence") };
 
 // Undoes every change that hides the quoted words: a cut, and a rewording when the line would
 // otherwise come back reworded.
@@ -985,46 +974,39 @@ function evidenceLine(view, language, line, refresh) {
 }
 
 function suggestionBlock(item, post) {
-  if (item.suggestion_status === "added") return el("p", { class: "ok-text" }, t("Added to your facts and to this CV."));
-  if (item.suggestion_status === "declined") return el("p", { class: "muted" }, t("Not true for you — kept off your CV."));
-  if (!item.suggestion) return null;
+  if (item.suggestion_status === "added") return el("p", { class: "ok-text" }, t("Added to your profile and this CV."));
+  if (item.suggestion_status === "declined") return el("p", { class: "muted" }, t("Not adopted — kept off your CV."));
+  if (!completeSuggestion(item.suggestion)) return null;
   return el("div", {},
     el("p", {}, suggestionText(item.suggestion)),
     el("div", { class: "toolbar" },
-      actionButton(t("True for me — add it"), post(`/${item.requirement_id}/accept`)),
-      actionButton(t("Not true"), post(`/${item.requirement_id}/decline`), true)));
+      actionButton(t("Adopt and add to my CV"), post(`/${item.requirement_id}/write`, suggestedLine(item.suggestion))),
+      actionButton(t("Skip this suggestion"), post(`/${item.requirement_id}/decline`), true)));
 }
 
 // The user's own words for a requirement: skills for one of the skills lines, or a new line under
 // an entry, prefilled with DeepSeek's suggestion when there is one. On a refusal the text stays.
 function writeOwn(view, item, places, refresh, ai = false) {
   if (item.suggestion_status === "added" || !places.length) return null;
-  const suggestion = ai ? item.suggestion || {} : {};
-  const guidance = ai && !item.suggestion ? item.guidance : null;
-  const chosen = suggestion.kind === "skill" ? `skill:${suggestion.fact_id}`
-    : suggestion.kind === "bullet" ? `entry:${suggestion.entry_key}`
-      : guidance ? places.find(place => place.kind === "bullet")?.id : null;
-  const select = el("select", {}, places.map((place) => el("option", { value: place.id, selected: place.id === chosen },
+  const suggested = ai && completeSuggestion(item.suggestion) ? suggestedLine(item.suggestion) : { place: null, text: "" };
+  const select = el("select", {}, places.map((place) => el("option", { value: place.id, selected: place.id === suggested.place },
     place.kind === "skill" ? t`Add to skills line: ${place.where}` : t`New line under ${place.where}`)));
-  const input = el("input", { type: "text", value: suggestion.kind === "skill" ? suggestion.items.join(", ") : suggestion.text || guidance?.template || "" });
+  const input = el("textarea", { rows: 4, "aria-label": t("CV entry") });
+  input.value = suggested.text;
   const hint = () => {
     I18n.attribute(input, "placeholder", select.value.startsWith("skill:") ? t("Skills to add, separated by commas") : t("The line as it should read on your CV"));
   };
   select.addEventListener("change", hint);
   hint();
-  const add = actionButton(ai ? t("Confirm this is true — add to my CV") : t("Add to my CV"), async () => {
-    if (input.value.includes("[[") || input.value.includes("]]")) {
-      throw new Error(t("Replace every [[placeholder]] with your own details before adding this line."));
-    }
+  const add = actionButton(ai ? t("Adopt and add to my CV") : t("Add to my CV"), async () => {
     await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/write`, {
       method: "POST", body: JSON.stringify({ place: select.value, text: input.value }),
     });
     await refresh();
   });
   return el("details", { class: "write-own", open: ai },
-    el("summary", {}, guidance ? t("Edit this reference template") : ai ? t("Review the suggested entry") : t("Write your own line")),
-    guidance ? el("p", { class: "muted" }, t("Replace the [[placeholders]] with your details. You do not need to add confirmed facts first.")) : null,
-    el("p", { class: "muted" }, t("Suggestions may go beyond your saved facts. Choose what applies, edit it, and confirm before adding it to your CV.")),
+    el("summary", {}, ai ? t("Edit the suggested entry") : t("Write your own line")),
+    el("p", { class: "muted" }, t("Use the complete suggestion as written, or edit it before adding it to your CV.")),
     el("div", { class: "write-row" }, select, input, add));
 }
 
@@ -1036,33 +1018,40 @@ function aiEntry(view, item, refresh) {
   let opened = false;
   const result = (currentView, currentItem) => {
     opened = true;
-    const guidance = currentItem.guidance;
     content.replaceChildren(...[
-      guidance ? el("p", { class: "muted" }, guidance.source === "ai"
-        ? t("AI ideas for experiences you may want to add") : t("Reference template for this requirement")) : null,
-      guidance ? el("ul", {}, guidance.questions.map(question => el("li", {}, question))) : null,
+      el("p", { class: "suggested-entry" }, suggestionText(currentItem.suggestion)),
       writeOwn(currentView, currentItem, currentView.gaps.places || [], refresh, true)
         || el("p", {}, t("No place is available for this entry. Update your CV first.")),
     ].filter(Boolean));
   };
   const button = actionButton(t("AI suggested entry"), async () => {
     if (opened) { content.hidden = !content.hidden; return; }
-    if (item.suggestion || item.ai_checked) {
+    if (completeSuggestion(item.suggestion)) {
       result(view, item);
       return;
     }
     await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/suggest`, { method: "POST" });
     const latest = await api(`/api/jobs/${view.job_id}`);
-    const found = latest.gaps && !latest.gaps.stale && !latest.gaps.outdated
+    const found = latest.gaps && !latest.gaps.outdated
       && latest.gaps.requirements.find((row) => row.requirement_id === item.requirement_id);
     if (!found) throw new Error(t("Your CV or facts changed since this check. Choose Check again to update the result."));
-    // Cached in the page as well as on the server, including an answer that needs more facts.
+    if (!completeSuggestion(found.suggestion)) throw new Error(t("No usable suggestion was returned. Try AI suggested entry again."));
+    // Cache only a complete suggestion; historical empty results remain retryable.
     item = found;
     view = latest;
     result(view, item);
   });
-  button.disabled = Boolean(view.gaps.stale);
   return el("div", { class: "ai-entry" }, button, content);
+}
+
+// What a row offers for a requirement a check found missing or only related, before Write your
+// own line: its complete suggestion (V1 shows it with Adopt and Skip, V2 behind AI suggested
+// entry) or AI suggested entry to ask for one; once adopted or skipped, only that.
+function suggestionArea(view, item, refresh, post) {
+  if (MODE !== "v2" && (completeSuggestion(item.suggestion) || ["added", "declined"].includes(item.suggestion_status))) {
+    return suggestionBlock(item, post);
+  }
+  return aiEntry(view, item, refresh);
 }
 
 function coverageRow(view, language, item, refresh, post) {
@@ -1073,31 +1062,40 @@ function coverageRow(view, language, item, refresh, post) {
   const notes = [];
   if (item.status === "related") notes.push(el("p", { class: "muted" }, t`Missing: ${item.missing || item.text}`));
   if (item.status === "unchecked") notes.push(el("p", { class: "muted" }, t("DeepSeek gave no usable answer for this requirement, so it does not count as shown. Use Check again.")));
+  if (item.status === "recheck") {
+    notes.push(el("p", { class: "muted" }, t("Your CV changed after this check, so whether it still shows this is not known yet. Use Check again.")));
+    if (LAST_CHECK[item.verdict]) notes.push(el("p", { class: "muted" }, t`Last check: ${LAST_CHECK[item.verdict]}`));
+  }
   const gap = item.status === "related" || item.status === "none";
+  // Found missing or related by a check now out of date: still to check again, but its
+  // suggestions stay usable, so adopting one line never forces a new check before the next.
+  const flagged = item.status === "recheck" && (item.verdict === "related" || item.verdict === "none");
+  const undecided = !["added", "declined"].includes(item.suggestion_status);
   return el("div", { class: `requirement ${item.status} ${gap ? item.suggestion_status : ""}` },
     el("div", { class: "requirement-text" }, item.status === "none" ? t`Missing: ${item.missing || item.text}` : item.text, strength), lines, notes,
-    gap ? (MODE === "v2" ? aiEntry(view, item, refresh) : suggestionBlock(item, post)) : null,
-    gap ? writeOwn(view, item, view.gaps.places || [], refresh) : null);
+    flagged && undecided ? el("p", { class: "muted" }, t("Suggested for what the last check found missing. Your CV has changed since; adopt only what you still need.")) : null,
+    gap || flagged ? suggestionArea(view, item, refresh, post) : null,
+    gap || flagged ? writeOwn(view, item, view.gaps.places || [], refresh) : null);
 }
 
 function gapsPanel(view, refresh) {
   const gaps = view.gaps && !view.gaps.outdated ? view.gaps : null;
-  const post = (path) => async () => {
-    await api(`/api/jobs/${view.job_id}/gaps${path}`, { method: "POST" });
+  const post = (path, body) => async () => {
+    await api(`/api/jobs/${view.job_id}/gaps${path}`, { method: "POST", ...(body ? { body: JSON.stringify(body) } : {}) });
     await refresh();
   };
   const check = actionButton(gaps ? t("Check again") : t("Check now"), post(""), Boolean(gaps));
   const heading = el("h2", {}, t("3. What this CV shows for each requirement"));
   const intro = el("p", { class: "muted" },
-    t("DeepSeek compares each requirement with your confirmed facts and with this CV as it is shown now, after cuts and rewording. "),
-    t("A line that is only about the same thing does not count as showing it. Review the suggestion and confirm it is true before adding it; "),
-    t("then it becomes a confirmed fact and the CV is prepared again."));
+    t("DeepSeek compares each requirement with your profile and the current CV. "),
+    t("Use AI suggested entry to get complete wording for a requirement. "),
+    t("Adopt a suggestion to save it and prepare the CV again."));
   if (!gaps) {
     return el("section", { class: "panel step-panel gaps-panel" }, heading, intro,
-      el("p", { class: "muted" }, MODE === "v2" ? t("Not checked yet. Choose Check now to compare this CV with the requirements.") : t("Checking…")), el("div", { class: "toolbar" }, check));
+      el("p", { class: "muted" }, t("Not checked yet. Choose Check now to compare this CV with the requirements.")), el("div", { class: "toolbar" }, check));
   }
   const notes = [];
-  if (gaps.stale) notes.push(el("p", { class: "warning" }, MODE === "v2" ? t("Your CV or facts changed since this check. Choose Check again to update the result.") : t("Your CV or facts changed since this check. Checking again…")));
+  if (gaps.stale) notes.push(el("p", { class: "warning" }, t("Your CV or facts changed since this check. Choose Check again to update the result.")));
   const checking = gaps.evidence_check || {};
   if (checking.fallback_reason) {
     notes.push(el("p", { class: "warning" }, t`Not checked: ${I18n.serverText(checking.message || checking.fallback_reason)} `,
@@ -1152,7 +1150,7 @@ function interruptedNote(interrupted) {
 // or saving failed partway). Nothing is repeated for the user; repeating it is safe.
 function unfinishedNote(notice, refresh) {
   const text = notice.kind === "save_cv"
-    ? I18n.join([t("Saving an uploaded CV did not finish. Some of its lines may already be here, waiting for confirmation, and "), t("your CV layout may still be the old one. Upload the same PDF again and save: lines already saved are reused, "), t("never added twice.")])
+    ? I18n.join([t("Saving an uploaded CV did not finish. Some lines may already have been saved, and "), t("your CV layout may still be the old one. Upload the same PDF again and save: lines already saved are reused, "), t("never added twice.")])
     : notice.kind === "add_line"
       ? I18n.join([t`Adding “${notice.line}” for “${notice.requirement}” did not finish. If that requirement below still offers `, t("to add it, add it again with the same words: it will not be added twice. If it says the line was added, "), t("prepare the CV again so the CV shows it.")])
       : I18n.join([t("A change did not finish, and its record could not be read. Check your facts and your CV, and repeat what "), t("you were doing.")]);
@@ -1172,14 +1170,13 @@ function unfinishedNote(notice, refresh) {
   return el("p", { class: "warning" }, text, " ", ...tools);
 }
 
-// Review uses confirmed facts already held by the server; it does not generate a CV.
+// Review uses saved profile content already held by the server; it does not generate a CV.
 function jobReviewPanel(view, refresh, needsPreparation) {
   const review = view.review;
   if (!review) return null;
   const matches = review.skill_matches || [];
-  const confirmed = review.confirmed_fact_count || 0;
-  const pending = review.pending_fact_count || 0;
-  const ready = confirmed > 0 && (view.cv_languages || []).length > 0;
+  const count = review.fact_count ?? ((review.confirmed_fact_count || 0) + (review.pending_fact_count || 0));
+  const ready = count > 0 && (view.cv_languages || []).length > 0;
   const running = (view.tasks || []).some((task) => !TERMINAL.has(task.status));
   let next = null;
   if (needsPreparation) {
@@ -1192,29 +1189,28 @@ function jobReviewPanel(view, refresh, needsPreparation) {
         }
       });
       prepare.disabled = running;
-      next = el("div", {}, el("p", { class: "muted" }, t("When you continue, the job requirements will be extracted and a draft prepared from your confirmed facts. Review the draft before exporting.")),
+      next = el("div", {}, el("p", { class: "muted" }, t("Continue to extract job requirements and prepare a draft using your profile. Review the draft before exporting.")),
         el("div", { class: "toolbar" }, prepare));
     } else {
-      next = el("p", { class: "warning" }, t("Before preparing a CV, save your CV profile and confirm at least one fact. You can keep reviewing this job meanwhile."), " ",
-        el("a", { href: "#facts" }, t("Complete your profile and facts")));
+      next = el("p", { class: "warning" }, t("Upload and save your CV profile before preparing a CV. You can keep reviewing this job meanwhile."), " ",
+        el("a", { href: "#facts" }, t("Add your profile")));
     }
   }
   return el("section", { class: "panel job-review-panel" },
     el("h2", {}, t("Does this job deserve a closer look?")),
-    el("p", { class: "muted" }, t("Compare the job wording with your confirmed experience. These are shared skill words, not a qualification check, a fit score or an offer prediction.")),
-    el("p", {}, t`${confirmed} confirmed facts · ${pending} awaiting confirmation`, " · ", el("a", { href: "#facts" }, t("Review or correct your facts"))),
+    el("p", { class: "muted" }, t("Compare the job wording with your profile. These are shared skill words, not a qualification check, a fit score or an offer prediction.")),
+    el("p", {}, t`${count} saved profile lines`, " · ", el("a", { href: "#facts" }, t("Review or correct your facts"))),
     matches.length ? matches.map((match) => el("article", { class: "skill-evidence" },
       el("h3", {}, match.tag),
       el("div", { class: "skill-evidence-pair" },
         el("div", {}, el("h4", {}, t("In the job description")), el("blockquote", {}, match.job_quote)),
-        el("div", {}, el("h4", {}, t("In your confirmed facts")), el("ul", {}, (match.facts || []).map((fact) => el("li", {}, fact.text)))))))
-      : el("p", { class: "muted" }, t("No shared skill words found in your confirmed facts. This alone does not mean the role is unsuitable; review the description and your experience.")),
+        el("div", {}, el("h4", {}, t("In your profile")), el("ul", {}, (match.facts || []).map((fact) => el("li", {}, fact.text)))))))
+      : el("p", { class: "muted" }, t("No shared skill words found in your profile. This alone does not mean the role is unsuitable; review the description and your experience.")),
     next);
 }
 
 async function renderJob(jobId) {
-  // V2 opening a saved role is read-only. Model checks run only from an explicit button.
-  // The single-user page retains its existing automatic coverage check.
+  // Opening a saved role is read-only in both modes. Paid checks require an explicit action.
   const refresh = async (checked = false) => {
     const view = await api(`/api/jobs/${jobId}`);
     const jd = view.jd;
@@ -1242,11 +1238,6 @@ async function renderJob(jobId) {
     if ((view.tasks || []).some((task) => !TERMINAL.has(task.status))) {
       setTimeout(() => { if (location.hash === `#job/${jobId}`) run(() => refresh(true)); }, 2000);
       return view;
-    }
-    const due = !view.gaps || view.gaps.outdated || view.gaps.stale;
-    if (MODE !== "v2" && !checked && due && (view.selected_requirements || []).length && view.cv[view.language].head) {
-      await api(`/api/jobs/${jobId}/gaps`, { method: "POST" });
-      return refresh(true);
     }
     return view;
   };
@@ -1347,10 +1338,10 @@ function accountPanel() {
 
 const routes = { facts: renderFacts, find: renderFind, jobs: renderJobs };
 
-// With no page chosen: facts while any wait for confirmation, otherwise the matched jobs.
+// With no page chosen, any saved profile content can continue to job discovery.
 async function openDefault() {
   const { facts } = await api("/api/facts");
-  location.replace(facts.length && facts.every((fact) => fact.status === "confirmed") ? "#find" : "#facts");
+  location.replace(facts.length ? "#find" : "#facts");
 }
 
 function route() {
