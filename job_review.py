@@ -1,7 +1,7 @@
 """Local evidence for deciding whether to prepare a job-specific CV.
 
 This is a transparent keyword baseline, not a semantic match or eligibility decision.
-Only confirmed facts can support a displayed skill hint. Reading a job calls no model,
+All current resume entries can support a displayed skill hint. Reading a job calls no model,
 assesses nothing, confirms no fact and changes no material or approval.
 """
 from typing import Any
@@ -20,8 +20,7 @@ def build_job_review(jd: dict[str, Any], facts: list[dict[str, Any]],
     The source and capture time shown are this job's own. Unknown sponsorship stays unknown;
     none of these hints establishes the candidate's work permission.
     """
-    confirmed = [fact for fact in facts if fact.get("status") == "confirmed"]
-    tags = list(dict.fromkeys(tag for fact in confirmed for tag in fact.get("tags", [])))
+    tags = list(dict.fromkeys(tag for fact in facts for tag in fact.get("tags", [])))
     text = jd.get("text") or ""
     matches = tag_finder(tags)(text) if tags else []
     hints = []
@@ -31,7 +30,7 @@ def build_job_review(jd: dict[str, Any], facts: list[dict[str, Any]],
         occurrence = tag_pattern(tag).search(line)
         # Keep the literal surrounding text, never a model-written explanation.
         quote = line[max(0, occurrence.start() - 90):occurrence.end() + 180] if occurrence else line[:270]
-        supporting = [fact for fact in confirmed if tag.casefold() in
+        supporting = [fact for fact in facts if tag.casefold() in
                       {item.casefold() for item in fact.get("tags", [])}]
         hints.append({"tag": tag, "job_quote": quote,
                       "facts": [{key: fact[key] for key in ("id", "version", "text")}
@@ -40,6 +39,7 @@ def build_job_review(jd: dict[str, Any], facts: list[dict[str, Any]],
         "sponsorship": shown(sponsorship, source=jd.get("source"), captured_at=jd.get("captured_at")),
         "skill_matches": hints,
         "skill_match_count": len(matches),
-        "confirmed_fact_count": len(confirmed),
-        "pending_fact_count": len(facts) - len(confirmed),
+        "confirmed_fact_count": sum(fact.get("status") == "confirmed" for fact in facts),
+        "pending_fact_count": sum(fact.get("status") != "confirmed" for fact in facts),
+        "fact_count": len(facts),
     }

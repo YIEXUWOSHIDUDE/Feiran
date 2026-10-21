@@ -25,10 +25,10 @@ class BuildReportTests(unittest.TestCase):
         self.assertEqual(unknown["evidence_status"], "未知")
         self.assertIsNone(unknown["draft_suggestion"])
 
-    def test_unconfirmed_fact_cannot_be_used(self) -> None:
+    def test_unconfirmed_material_can_be_used(self) -> None:
         self.data["facts"][0]["confirmed"] = False
-        with self.assertRaisesRegex(ValueError, "事实尚未确认"):
-            build_report(self.data)
+        report = build_report(self.data)
+        self.assertEqual(report["items"][0]["fact_quote"], self.data["facts"][0]["text"])
 
     def test_versioned_fact_requires_exact_selection_version(self) -> None:
         self.data["facts"][0]["version"] = 2

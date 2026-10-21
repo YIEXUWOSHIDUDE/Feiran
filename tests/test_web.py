@@ -67,7 +67,7 @@ class FakeDeepSeek(FakeChat):
     def __call__(self, messages, model, effort):
         self.sent.append(messages[-1]["content"])
         self.systems.append(messages[0]["content"])
-        if self.tailor_error and messages[0]["content"].startswith("You rewrite resume lines"):
+        if self.tailor_error and messages[0]["content"].startswith("You write competitive resume lines"):
             raise self.tailor_error
         if messages[0]["content"] == STRUCTURE_RULES:
             if self.cv_structure is None:
@@ -553,24 +553,19 @@ class WebTests(unittest.TestCase):
         self.assertEqual(stages(fixed), [("draft", "done", None, True), ("rewording", "done", None, True),
                                          ("layout", "done", None, True)])
 
-    def test_a_cv_that_cannot_be_drafted_says_what_to_do(self):
-        import_facts(self.database, CV_FACTS)  # imported, not confirmed yet
+    def test_saved_pending_material_can_be_prepared_and_revised_without_confirmation(self):
+        import_facts(self.database, CV_FACTS)
         job_id = self.client.post("/api/jobs", headers=self.headers,
-                                  json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
+            json={"title": "Backend Intern", "text": "Requirements:\n- Python and SQL"}).json()["job_id"]
         cv = self.job(job_id)["cv"]["en"]
-        self.assertIsNone(cv["head"])
-        self.assertEqual([(item["stage"], item["status"], item["reason_code"]) for item in cv["stages"]],
-                         [("draft", "failed", "facts_not_confirmed"), ("rewording", "skipped", None), ("layout", "skipped", None)])
-        self.assertIn("Facts page", cv["stages"][0]["message"])
-        # Once a CV exists, a later failure is shown next to it instead of being hidden.
-        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
-        self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
+        self.assertEqual(cv["head"], "tailored")
+        self.assertEqual(cv["stages"][0]["status"], "done")
         revise_fact(self.database, "fact-skills-languages", text="Languages: Python, Java, Go")
         again = self.client.post(f"/api/jobs/{job_id}/cv/en/prepare", headers=self.headers)
-        cv = self.job(job_id)["cv"]["en"]
-        self.assertEqual(again.status_code, 400)
-        self.assertEqual((cv["head"], cv["stages"][0]["status"], cv["stages"][0]["output_available"]), ("tailored", "failed", True))
-        self.assertIn("last time it could be prepared", cv["stages"][0]["message"])
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(self.job(job_id)["cv"]["en"]["stages"][0]["status"], "done")
+        self.assertTrue(all(f["status"] == "pending" for f in list_facts(self.database)))
+
 
     def decided_job(self):
         job_id = self.create_job()
@@ -582,7 +577,7 @@ class WebTests(unittest.TestCase):
         )
         return job_id, ids
 
-    def test_matching_offers_only_confirmed_facts_and_builds_the_evidence_report(self):
+    def test_matching_offers_saved_material_and_builds_the_content_report(self):
         import_facts(self.database, FACTS)
         self.client.post("/api/facts/confirm", json={"refs": ["fact-web-python@1"]}, headers=self.headers)
         job_id, ids = self.decided_job()
@@ -596,7 +591,7 @@ class WebTests(unittest.TestCase):
             headers=self.headers,
         ).json()
         quotes = {item["requirement_quote"]: item["fact_quote"] for item in linked["report"]["items"]}
-        self.assertEqual(offered, {python: ["fact-web-python"], availability: []})
+        self.assertEqual(offered, {python: ["fact-web-python", "fact-web-sql"], availability: []})
         self.assertEqual(quotes, {"熟悉Python，了解SQL": "Built services in Python.", "每周至少实习4天": None})
 
     def cv_step(self, job_id, action):
@@ -1331,7 +1326,7 @@ def upload_and_save():
         dies_rewording = """
 real_call = FakeDeepSeek.__call__
 def dying(self, messages, model, effort):
-    if messages[0]["content"].startswith("You rewrite resume lines"):
+    if messages[0]["content"].startswith("You write competitive resume lines"):
         os._exit(9)
     return real_call(self, messages, model, effort)
 FakeDeepSeek.__call__ = dying
@@ -1423,15 +1418,131 @@ FakeDeepSeek.__call__ = dying
         self.assertEqual(len(saved["sections"][1]["entries"][0]["facts"]), 3)
         self.assertEqual(len(backups), 1)
         self.assertEqual(json.loads(backups[0].read_text(encoding="utf-8")), PROFILE)
-        # The facts and the CV changed, so the check is out of date; checked again, the added
-        # lines are what shows each requirement, and the line said to be untrue is not offered again.
+        # The facts and the CV changed, so the check is out of date: nothing it found is shown as
+        # missing or related now, whether added, declined or open, also when the job is opened
+        # again, and opening it asks the model nothing. Checked again, the added lines are what
+        # shows each requirement, and the line said to be untrue is not offered again.
         self.assertTrue(declined["gaps"]["stale"])
+        sent = len(self.chat.sent)
+        for gaps in (declined["gaps"], self.job(job_id)["gaps"], self.job(job_id)["gaps"]):
+            self.assertEqual({item["requirement_id"]: (item["status"], item["verdict"]) for item in gaps["requirements"]}, {
+                docker: ("recheck", "none"), years: ("recheck", "related"), tests: ("recheck", "none"), go: ("recheck", "none")})
+            self.assertEqual({name: count for name, count in gaps["counts"].items() if count}, {"recheck": 4})
+        self.assertEqual(len(self.chat.sent), sent)
         again = self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]
         self.assertEqual({item["text"]: item["status"] for item in again["requirements"]}, {
             "Hands-on Docker and Kubernetes": "shown", "3+ years of backend experience": "related", "Writing integration tests": "shown",
             "Experience with Go": "none"})
         self.assertEqual(next(item for item in again["requirements"] if item["requirement_id"] == go)["suggestion_status"], "declined")
         self.assertFalse(again["stale"])
+
+    def test_a_requirement_without_a_suggestion_gets_complete_wording_when_asked(self):
+        # Dogfood round 3: V1 showed only "Write your own line" for a gap DeepSeek left without a
+        # suggestion; V2 could already ask for one.
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        text = "Requirements:\n- Experience deploying services using Docker and Kubernetes\n- Experience with CI pipelines"
+        job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": text}, headers=self.headers).json()["job_id"]
+        self.chat.evidence = lambda request: [{"id": item["id"], "verdict": "none"} for item in request["requirements"]]
+        self.chat.gap_suggestions = lambda ids: [{"requirement": rid, "kind": "none"} for rid in ids.values()]
+        rows = {row["text"]: row for row in
+                self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]["requirements"]}
+        docker, ci = rows["Experience deploying services using Docker and Kubernetes"], rows["Experience with CI pipelines"]
+        self.assertEqual((docker["status"], docker["suggestion"]), ("none", None))
+        url = f"/api/jobs/{job_id}/gaps/{docker['requirement_id']}/suggest"
+        asked = len(self.chat.sent)
+        self.job(job_id)
+        self.job(job_id)
+        self.assertEqual(len(self.chat.sent), asked)  # opening the job asks nothing
+        self.chat.gap_suggestions = lambda ids: []  # nothing usable comes back
+        failed = self.client.post(url, headers=self.headers)
+        self.assertEqual((failed.status_code, failed.json()), (502, {"error": "DeepSeek's answer could not be used. Try again."}))
+        row = next(row for row in self.job(job_id)["gaps"]["requirements"] if row["requirement_id"] == docker["requirement_id"])
+        self.assertIsNone(row["suggestion"])  # nothing saved, so a click can retry
+        line = "Containerized the internal tool's API with Docker and deployed it to a Kubernetes cluster."
+        self.chat.gap_suggestions = lambda ids: [{"requirement": rid, "kind": "bullet", "entry": "s1e0", "text": line,
+                                                  "tags": ["Docker", "Kubernetes"]} for rid in ids.values()]
+        facts = list_facts(self.database)
+        found = self.client.post(url, headers=self.headers)
+        self.assertEqual(found.status_code, 200, found.text)
+        row = next(row for row in found.json()["gaps"]["requirements"] if row["requirement_id"] == docker["requirement_id"])
+        self.assertEqual((row["suggestion"]["text"], row["suggestion_status"]), (line, "open"))
+        self.assertEqual(list_facts(self.database), facts)  # only adopting saves a line
+        asked = len(self.chat.sent)
+        self.assertEqual(self.client.post(url, headers=self.headers).status_code, 200)
+        self.assertEqual(len(self.chat.sent), asked)  # a complete suggestion is reused
+        # Once it is adopted the check is out of date; the other requirement can still get wording.
+        adopted = self.client.post(f"/api/jobs/{job_id}/gaps/{docker['requirement_id']}/write", headers=self.headers,
+                                   json={"place": f"entry:{row['suggestion']['entry_key']}", "text": line})
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        self.assertTrue(adopted.json()["gaps"]["stale"])
+        self.chat.gap_suggestions = lambda ids: [{"requirement": rid, "kind": "bullet", "entry": "s1e0",
+                                                  "text": "Set up CI pipelines that test every change.", "tags": []} for rid in ids.values()]
+        later = self.client.post(f"/api/jobs/{job_id}/gaps/{ci['requirement_id']}/suggest", headers=self.headers)
+        self.assertEqual(later.status_code, 200, later.text)
+        row = next(row for row in later.json()["gaps"]["requirements"] if row["requirement_id"] == ci["requirement_id"])
+        self.assertEqual((row["status"], row["suggestion"]["text"]), ("recheck", "Set up CI pipelines that test every change."))
+
+    def test_after_one_adoption_the_other_suggestions_can_be_adopted_without_checking_again(self):
+        # Dogfood round 3: adopting one suggestion hid the others until a paid check. They stay,
+        # the page adopts the words it shows, and a second click or an old tab adds nothing.
+        import_facts(self.database, CV_FACTS)
+        confirm_facts(self.database, [(item["id"], 1) for item in CV_FACTS])
+        text = "Requirements:\n- Hands-on Docker and Kubernetes\n- Experience with Go\n- Writing integration tests"
+        job_id = self.client.post("/api/jobs", json={"title": "Backend Intern", "text": text}, headers=self.headers).json()["job_id"]
+        self.chat.evidence = lambda request: [{"id": item["id"], "verdict": "none"} for item in request["requirements"]]
+        suggestions = {
+            "Hands-on Docker and Kubernetes": {"kind": "skill", "line": "fact-skills-languages", "items": ["Docker"]},
+            "Experience with Go": {"kind": "skill", "line": "fact-skills-languages", "items": ["Go"]},
+            "Writing integration tests": {"kind": "bullet", "entry": "s1e0",
+                                          "text": "Wrote integration tests for the internal tool.", "tags": ["integration tests"]},
+        }
+        self.chat.gap_suggestions = lambda ids: [{"requirement": ids[text], **suggestion}
+                                                 for text, suggestion in suggestions.items() if text in ids]
+        rows = {item["text"]: item for item in
+                self.client.post(f"/api/jobs/{job_id}/gaps", headers=self.headers).json()["gaps"]["requirements"]}
+        checks = self.chat.systems.count(EVIDENCE_RULES)
+
+        def adopt(row):  # what the page sends: the place and words of the suggestion it shows
+            suggestion = row["suggestion"]
+            line = ({"place": f"skill:{suggestion['fact_id']}", "text": ", ".join(suggestion["items"])}
+                    if suggestion["kind"] == "skill" else {"place": f"entry:{suggestion['entry_key']}", "text": suggestion["text"]})
+            return self.client.post(f"/api/jobs/{job_id}/gaps/{row['requirement_id']}/write", json=line, headers=self.headers)
+
+        first = adopt(rows["Hands-on Docker and Kubernetes"])
+        self.assertEqual(first.status_code, 200, first.text)
+        after = {item["text"]: item for item in first.json()["gaps"]["requirements"]}
+        self.assertTrue(first.json()["gaps"]["stale"])
+        for text in ("Experience with Go", "Writing integration tests"):
+            self.assertEqual((after[text]["status"], after[text]["verdict"], after[text]["suggestion_status"]),
+                             ("recheck", "none", "open"))
+            self.assertEqual(after[text]["suggestion"], rows[text]["suggestion"])  # still offered as it was
+        for text in ("Experience with Go", "Writing integration tests"):
+            adopted = adopt(after[text])
+            self.assertEqual(adopted.status_code, 200, adopted.text)
+        self.assertEqual(self.chat.systems.count(EVIDENCE_RULES), checks)  # no check ran in between
+        facts = list_facts(self.database)
+        skills = next(fact for fact in facts if fact["id"] == "fact-skills-languages")
+        self.assertIn("Docker", skills["text"])  # the second skill was added to the line, not over it
+        self.assertIn("Go", skills["text"])
+        self.assertEqual(sum(fact["text"] == "Wrote integration tests for the internal tool." for fact in facts), 1)
+        # The same line again (a second click, a tab left open) is refused before anything is
+        # written or the CV prepared again, as is another line for a requirement already added.
+        # Accepting an added suggestion again (the older page's button) changes nothing either.
+        sent = len(self.chat.sent)
+        for again, error in ((adopt(after["Writing integration tests"]), "简历中已经有这一行"),
+                             (adopt(after["Experience with Go"]), "请写要加入这一行的技能（用逗号分隔），不要与这一行已有的重复"),
+                             (self.client.post(f"/api/jobs/{job_id}/gaps/{after['Writing integration tests']['requirement_id']}/write",
+                                               json={"place": f"entry:{after['Writing integration tests']['suggestion']['entry_key']}",
+                                                     "text": "Wrote more tests."}, headers=self.headers), "这条要求已经添加过一行")):
+            self.assertEqual((again.status_code, again.json()["error"]), (400, error))
+        accepted = self.client.post(f"/api/jobs/{job_id}/gaps/{after['Experience with Go']['requirement_id']}/accept",
+                                    headers=self.headers)
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual((len(self.chat.sent), list_facts(self.database)), (sent, facts))
+        reopened = self.job(job_id)["gaps"]["requirements"]
+        self.assertEqual({item["suggestion_status"] for item in reopened}, {"added"})
+        self.assertEqual({item["status"] for item in reopened}, {"recheck"})
 
     def test_a_line_the_user_writes_for_a_requirement_joins_the_cv(self):
         import_facts(self.database, CV_FACTS)
@@ -1454,7 +1565,7 @@ FakeDeepSeek.__call__ = dying
                                    json={"place": place, "text": "Something else."})
         self.assertEqual(refused.status_code, 400)
 
-    def test_a_line_that_is_saved_is_not_reported_as_refused_when_the_cv_cannot_be_prepared(self):
+    def test_a_saved_line_is_used_even_when_other_material_is_pending(self):
         # Found in review by Codex: the line and the profile were saved, then preparing the CV
         # failed on another fact waiting for confirmation, and the page showed a refusal.
         import_facts(self.database, CV_FACTS)
@@ -1472,7 +1583,7 @@ FakeDeepSeek.__call__ = dying
         view = written.json()
         self.assertEqual(view["gaps"]["requirements"][0]["suggestion_status"], "added")
         draft_stage = next(stage for stage in view["cv"]["en"]["stages"] if stage["stage"] == "draft")
-        self.assertEqual((draft_stage["status"], draft_stage["reason_code"]), ("failed", "facts_not_confirmed"))
+        self.assertEqual((draft_stage["status"], draft_stage["reason_code"]), ("done", None))
 
     def test_without_the_evidence_check_nothing_counts_as_shown_and_the_page_says_why(self):
         import_facts(self.database, CV_FACTS)

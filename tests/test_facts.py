@@ -68,7 +68,7 @@ class FactStoreTests(unittest.TestCase):
                 tags=["Python", "FastAPI"],
             )
             history = list_facts(database, original["id"])
-            with self.assertRaisesRegex(FactStoreError, "已不是当前已确认版本"):
+            with self.assertRaisesRegex(FactStoreError, "已不是当前版本"):
                 load_confirmed_fact(database, original["id"], 1)
         self.assertTrue(created)
         self.assertEqual(revised["version"], 2)
@@ -99,7 +99,7 @@ class FactStoreTests(unittest.TestCase):
         self.assertEqual(repeated["version"], revision["version"])
         self.assertEqual(len(history), 2)
 
-    def test_retrieval_uses_only_current_confirmed_tags_and_types(self):
+    def test_retrieval_uses_all_current_tags_and_types(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "workbench.db"
             python, _ = add_fact(database, "使用 Python 开发后端。", "project", ["Python", "backend"])
@@ -118,7 +118,7 @@ class FactStoreTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in by_tag], [python["id"]])
         self.assertEqual(by_tag[0]["retrieval_basis"]["matched_tags"], ["Python"])
         self.assertEqual([item["id"] for item in by_type], [degree["id"]])
-        self.assertNotIn(pending["id"], {item["fact_id"] for item in terms})
+        self.assertIn(pending["id"], {item["fact_id"] for item in terms})
         self.assertNotIn("fact_quote", terms[0])
         self.assertEqual(
             displayed_texts[(python["id"], 1)], "使用 Python 开发后端。"
@@ -235,7 +235,7 @@ class FactStoreTests(unittest.TestCase):
         self.assertEqual(len(stored), 20)
         self.assertTrue(all(fact["status"] == "pending" for fact in stored))
 
-    def test_imported_facts_are_retrieved_only_after_confirming_them_together(self):
+    def test_imported_material_is_available_before_optional_confirmation(self):
         items = [
             {"type": "project", "text": "使用 Python 开发后端课程项目。", "tags": ["Python"]},
             {"type": "skill", "text": "熟悉 SQL 查询。", "tags": ["SQL"]},
@@ -249,7 +249,7 @@ class FactStoreTests(unittest.TestCase):
             refs = [f"{fact['id']}@{fact['version']}" for fact in imported["facts"]]
             exit_code, confirmed = run_cli(["confirm", *refs, "--db", str(database)])
             after = find_confirmed_facts(database, "Python and SQL experience")
-        self.assertEqual(before, [])
+        self.assertEqual(len(before), 2)
         self.assertIn(" ".join(refs), imported["next_step"])
         self.assertEqual(exit_code, 0)
         self.assertEqual(confirmed["changed_count"], 2)

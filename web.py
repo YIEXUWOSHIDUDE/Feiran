@@ -6,6 +6,7 @@ so other websites open in the browser cannot read facts or trigger DeepSeek call
 """
 
 import argparse
+from functools import lru_cache
 import asyncio
 import hashlib
 import json
@@ -49,6 +50,7 @@ from cv import (
 from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, structure_cv
 from cv_status import (
     CANDIDATE_FIELDS,
+    REASONS,
     STAGES,
     STAGE_FAILED,
     adjusted as _adjusted,
@@ -60,7 +62,7 @@ from cv_status import (
     stage_failure as _stage_failure,
 )
 from cv_plan import plan_draft, set_change
-from deepseek_client import chat_json
+from deepseek_client import DeepSeekError, chat_json
 from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs, revise_fact
 from gaps import (
     GAPS_VERSION,
@@ -71,6 +73,7 @@ from gaps import (
     find_gaps,
     line_to_write,
     places,
+    suggest_gap,
     suggested_addition,
     write_line,
 )
@@ -540,16 +543,20 @@ def create_app(
         with workspace.lock:
             return job_view_locked(job_id)
 
+    @lru_cache(maxsize=128)
+    def sponsor_for_text(text: str) -> dict:
+        # Per-app cache; a changed JD is a new key. Rule changes load on server restart.
+        return assess_sponsorship(text)
+
     def job_view_locked(job_id: str) -> dict:
         steps = workspace.state(job_id)
         jd = {key: value for key, value in require(job_id, "input")["jd"].items() if key != "raw_content"}
-        # The single-owner app works the local sponsor rules out on each read and keeps no
-        # answer (nothing to backfill); V2 assesses once when a job is saved.
+        # Reuse analysis for unchanged saved descriptions. V2 persists it when saving.
         view: dict = {
             "job_id": job_id, "steps": steps, "jd": jd,
             "language": job_cv_language(jd["text"], job_id), "cv_languages": cv_languages(),
             "review": build_job_review(jd, list_facts(facts_db) if facts_db.exists() else [],
-                                       assess_sponsorship(jd["text"])),
+                                       sponsor_for_text(jd["text"])),
         }
         decided = workspace.read(job_id, "decided")
         requirements = decided or workspace.read(job_id, "candidates")
@@ -586,7 +593,7 @@ def create_app(
         _, head = cv_head(job_id, gaps.get("language", "en"))
         if gaps.get("gaps_version") != GAPS_VERSION or head is None:
             return {"outdated": True}
-        confirmed = [(fact["id"], fact["version"]) for fact in list_facts(facts_db) if fact["status"] == "confirmed"] \
+        confirmed = [(fact["id"], fact["version"]) for fact in list_facts(facts_db) ] \
             if Path(facts_db).exists() else []
         return {**coverage(gaps, head, confirmed), "language": gaps["language"], "created_at": gaps["created_at"],
                 "places": [{key: place[key] for key in ("id", "kind", "where")} for place in places(head)],
@@ -737,7 +744,7 @@ def create_app(
         draft = workspace.read(job_id, f"cv-draft-{language}")
         status = workspace.read_note(job_id, f"cv-status-{language}")
         if not draft or not status or status.get("draft_created_at") != draft["created_at"]:
-            status = {"stages": [_stage("draft", "done", "Built from your confirmed facts.")]}
+            status = {"stages": [_stage("draft", "done", "Built from your saved material.")]}
         kept = [item for item in status["stages"] if item["stage"] not in (stage["stage"], *not_run)]
         again = [_stage(name, "skipped", f"{STAGE_FAILED[name]} since the last change; use the button below.")
                  for name in not_run]
@@ -765,7 +772,7 @@ def create_app(
                 for name in ("rewording", "layout"))])
             raise
         workspace.write(job_id, f"cv-draft-{language}", head)
-        stages = [log_stage(job_id, language, _stage("draft", "done", "Built from your confirmed facts."), started)]
+        stages = [log_stage(job_id, language, _stage("draft", "done", "Built from your saved material."), started)]
         private = known_private_terms()
         started = time.monotonic()
         try:
@@ -1139,6 +1146,39 @@ def create_app(
                                                   private=known_private_terms(), previous=workspace.read(job_id, "gaps")))
         return job_view(job_id)
 
+    @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/suggest", response_model=None)
+    def suggest_entry(job_id: str, requirement_id: str) -> dict | JSONResponse:
+        """Complete wording for one requirement the check found missing or only related, made
+        when the user asks, with the CV as it is now. A complete answer is saved and reused; a
+        failed or empty one saves nothing, so the next click asks again."""
+        gaps = require(job_id, "gaps")
+        _, head = cv_head(job_id, gaps.get("language", "en"))
+        if head is None:
+            raise WorkspaceError("请先准备这个岗位的简历")
+        try:
+            updated = suggest_gap(gaps, require(job_id, "decided"), head, facts_db, requirement_id, chat,
+                                  private=known_private_terms())
+        except DeepSeekError as exc:  # the kind of failure, never DeepSeek's own words
+            return JSONResponse({"error": REASONS.get(exc.reason) or REASONS["bad_response"]}, status_code=502)
+        if updated != gaps:
+            workspace.write(job_id, "gaps", updated)
+        return job_view(job_id)
+
+    def saved_and_prepared(job_id: str, gaps: dict, updated: dict, profile: dict | None) -> bool:
+        """Whether adding a line changed nothing (a second click, a tab left open) and the CV is
+        already prepared with it: preparing it again would only replace it, and with it any
+        change the user has undone since."""
+        if updated != gaps or profile is not None:
+            return False
+        _, head = cv_head(job_id, gaps["language"])
+        try:
+            if head is None:
+                return False
+            require_current_cv(head, gaps["language"])
+        except (CVError, FactStoreError):
+            return False
+        return True
+
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/accept")
     def accept_suggestion(job_id: str, requirement_id: str) -> dict:
         """The user says the suggested line is true: it becomes a confirmed fact on the CV."""
@@ -1146,6 +1186,8 @@ def create_app(
         adds = suggested_addition(gaps, requirement_id)
         with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
             updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile(gaps["language"]))
+            if saved_and_prepared(job_id, gaps, updated, profile):
+                return job_view(job_id)
             if profile is not None:
                 save_profile(profile, gaps["language"])
             workspace.write(job_id, "gaps", updated)
@@ -1162,6 +1204,8 @@ def create_app(
         adds = addition(line_to_write(gaps, requirement_id, request.place, request.text, head))  # refused before any write
         with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
             updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile(gaps["language"]))
+            if saved_and_prepared(job_id, gaps, updated, profile):
+                return job_view(job_id)
             if profile is not None:
                 save_profile(profile, gaps["language"])
             workspace.write(job_id, "gaps", updated)

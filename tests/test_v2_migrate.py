@@ -102,7 +102,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual((report["jobs"], report["approvals_carried"], report["final_pdfs"]), (2, 1, 1))
         self.assertEqual(report["approvals_not_carried"], [
             {"job": self.jobs["outdated"][0], "language": self.jobs["outdated"][1],
-             "reason": "the approved CV no longer rests on the current confirmed facts"}])
+             "reason": "the approved CV no longer matches the current saved material"}])
         self.assertEqual(report["verified"]["valid_approvals"], 1)
         self.assertEqual(report["verified"]["foreign_key_problems"], 0)
         owner = UserWorkspace(self.v2, report["owner_user_id"])

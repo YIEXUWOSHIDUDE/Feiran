@@ -23,7 +23,7 @@ def answered(row):
 
 
 class ReviewEvidenceTests(unittest.TestCase):
-    def test_only_confirmed_facts_support_exact_job_quotes(self):
+    def test_all_current_material_supports_exact_job_quotes(self):
         jd = {"text": "Requirements:\nBuild Python services.\nSQL is useful.\nWe cannot provide visa sponsorship.",
               "source": "https://example.org/jobs/1", "captured_at": "2026-10-18T00:00:00Z"}
         facts = [{"id": "fact-python", "version": 2, "status": "confirmed",
@@ -34,13 +34,14 @@ class ReviewEvidenceTests(unittest.TestCase):
         review = build_job_review(jd, facts, assess_sponsorship(jd["text"]))
         self.assertEqual(review["sponsorship"]["status"], "not_supported")
         self.assertEqual((review["confirmed_fact_count"], review["pending_fact_count"]), (1, 1))
-        self.assertEqual([item["tag"] for item in review["skill_matches"]], ["Python"])
+        self.assertEqual(review["fact_count"], 2)
+        self.assertEqual([item["tag"] for item in review["skill_matches"]], ["Python", "SQL"])
         hint = review["skill_matches"][0]
         self.assertIn(hint["job_quote"], jd["text"])
         self.assertEqual(hint["facts"][0], {"id": "fact-python", "version": 2, "text": "Built a Python service."})
         self.assertEqual(facts, before)
         facts[0]["status"] = "pending"
-        self.assertEqual(build_job_review(jd, facts, None)["skill_matches"], [])
+        self.assertEqual(len(build_job_review(jd, facts, None)["skill_matches"]), 2)
         # No answer is "not assessed", with this job's own provenance; never "unknown".
         missing = build_job_review(jd, facts, None)["sponsorship"]
         self.assertEqual((missing["status"], missing["evidence"], missing["source"], missing["captured_at"]),

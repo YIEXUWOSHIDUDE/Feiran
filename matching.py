@@ -17,10 +17,9 @@ from review import build_report
 MATCHING_METHOD = "versioned-tags-and-type-v1"
 MODEL_MATCHING_METHOD = "deepseek-facts-v1"
 MAX_MODEL_FACTS = 3
-MATCH_RULES = """You match one job's requirements to an applicant's confirmed resume facts and reply in json only.
-For each requirement, list the ids of facts whose own words show that the applicant meets it,
-strongest first, at most 3. Being related is not enough. Years of experience, seniority or
-leadership count only when the fact states them. Use an empty list when no fact shows it.
+MATCH_RULES = """You match one job's requirements to an applicant's resume material and reply in json only.
+For each requirement, list the ids of relevant material, strongest first, at most 3.
+Select useful related experience, projects or skills as a basis for a targeted resume.
 Reply as {"matches": [{"requirement": "<requirement id>", "facts": ["<fact id>", ...]}]}."""
 REQUIREMENT_TYPE_PREFERENCES = {
     "skill_or_experience": ("project", "experience", "skill", "achievement"),
@@ -89,14 +88,14 @@ def _model_choices(
     requirements: list[dict[str, Any]], facts_db: Path, chat: Callable[..., dict], effort: str,
     private: Iterable[str] = (),
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    """Ask DeepSeek which confirmed facts show each requirement is met.
+    """Ask DeepSeek which current material relates to each requirement.
 
-    Only requirement texts and confirmed fact texts are sent, under stand-in IDs, with the name,
+    Only requirement texts and current material texts are sent, under stand-in IDs, with the name,
     contact details, schools and employers in ``private`` (and any email, link or phone) masked.
     Unknown stand-ins and requirements in the answer are dropped, so the model can only point at
-    facts the user confirmed.
+    material present in the current profile.
     """
-    confirmed = {fact["id"]: fact for fact in list_facts(facts_db) if fact["status"] == "confirmed"}
+    confirmed = {fact["id"]: fact for fact in list_facts(facts_db)}
     out, back = stand_ins(confirmed, prefix="F")
     request = {
         "requirements": [{"id": item["id"], "text": item["text"]} for item in requirements],
@@ -138,7 +137,7 @@ def propose_matches(
 ) -> dict[str, Any]:
     """Retrieve bounded local candidates without copying unrelated facts.
 
-    With ``chat`` DeepSeek chooses up to three confirmed facts per requirement; if it fails,
+    With ``chat`` DeepSeek chooses up to three current entries per requirement; if it fails,
     facts sharing tags with the requirement are offered instead and the reason is recorded.
     """
     if not isinstance(data, dict):
@@ -322,7 +321,7 @@ def apply_match_decisions(
             "text": fresh["text"],
             "fact_type": fresh["fact_type"],
             "tags": fresh["tags"],
-            "confirmed": True,
+            "confirmed": fresh["status"] == "confirmed",
         }
     result["facts"] = list(selected_facts.values())
     result["fact_matching"]["decision_counts"] = {

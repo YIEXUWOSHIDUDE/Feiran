@@ -104,7 +104,7 @@ class V2Case(unittest.TestCase):
         for stage in stages:
             self.assertEqual(client.post("/api/consent", json={"stage": stage, "version": 1}, headers=headers).status_code, 200)
 
-    def ready_user(self, subject="alice"):
+    def ready_user(self, subject="alice", confirm=True):
         """Signed in, agreed to both data flows, CV uploaded, saved and every fact confirmed."""
         client, headers = self.browser(subject)
         self.consent(client, headers, "upload_parsing", "job_processing")
@@ -116,8 +116,9 @@ class V2Case(unittest.TestCase):
         self.assertEqual(proposal["private"]["email"], "alex@example.com")
         saved = client.post(f"/api/cv/uploads/{upload}/save", json=CONTACT, headers=headers)
         self.assertEqual(saved.status_code, 200, saved.text)
-        refs = [f"{fact['id']}@{fact['version']}" for fact in client.get("/api/facts", headers=headers).json()["facts"]]
-        self.assertEqual(client.post("/api/facts/confirm", json={"refs": refs}, headers=headers).status_code, 200)
+        if confirm:
+            refs = [f"{fact['id']}@{fact['version']}" for fact in client.get("/api/facts", headers=headers).json()["facts"]]
+            self.assertEqual(client.post("/api/facts/confirm", json={"refs": refs}, headers=headers).status_code, 200)
         return client, headers
 
     def new_job(self, client, headers):
@@ -530,6 +531,38 @@ class MoreRouteTests(V2Case):
     def job(self, client, headers, job_id):
         return client.get(f"/api/jobs/{job_id}", headers=headers).json()
 
+    def test_pending_upload_to_complete_suggestion_adoption_and_export_needs_no_confirmation(self):
+        client, headers = self.ready_user(confirm=False)
+        self.assertTrue(all(f['status'] == 'pending' for f in client.get('/api/facts', headers=headers).json()['facts']))
+        job_id = self.new_job(client, headers)
+        view = self.job(client, headers, job_id)
+        self.assertIsNotNone(view['cv']['en']['head'])
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        view = self.job(client, headers, job_id)
+        rid = next(r['requirement_id'] for r in view['gaps']['requirements'] if r['text'] == '熟悉Python，了解SQL')
+        text = 'Led backend development over 3 years, building Python services and SQL data pipelines.'
+        self.chat.gap_suggestions = lambda ids: [{'requirement': rid, 'kind': 'bullet',
+            'entry': 's1e0', 'text': text, 'tags': ['Python', 'SQL']}]
+        generated = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps/{rid}/suggest", headers=headers))
+        self.assertEqual(generated['status'], 'succeeded')
+        view = self.job(client, headers, job_id)
+        row = next(r for r in view['gaps']['requirements'] if r['requirement_id'] == rid)
+        self.assertEqual(row['suggestion']['text'], text)
+        place = next(p['id'] for p in view['gaps']['places'] if p['kind'] == 'bullet')
+        adopted = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps/{rid}/write",
+            json={'place': place, 'text': text}, headers=headers))
+        self.assertEqual(adopted['status'], 'succeeded')
+        after = client.get('/api/facts', headers=headers).json()['facts']
+        self.assertEqual(sum(f['text'] == text for f in after), 1)
+        self.assertTrue(any(f['status'] == 'pending' for f in after))
+        view = self.job(client, headers, job_id)
+        approved = client.post(f"/api/jobs/{job_id}/cv/en/approve",
+            json={'expected_content_sha256': view['cv']['en']['content_sha256']}, headers=headers)
+        self.assertEqual(approved.status_code, 200)
+        exported = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/en/export", headers=headers))
+        self.assertEqual(exported['status'], 'succeeded')
+        self.assertEqual(client.get(f"/download/{job_id}/en.pdf").status_code, 200)
+
     def test_targeted_suggestion_is_private_cached_and_never_confirms_a_fact(self):
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
@@ -554,7 +587,7 @@ class MoreRouteTests(V2Case):
         self.assertEqual(row["suggestion"]["items"], ["SQL"])
         self.assertEqual(row["suggestion_status"], "open")
 
-    def test_empty_suggestion_is_an_editable_template_on_repeated_requests(self):
+    def test_empty_suggestion_fails_and_can_retry_complete_content(self):
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
         self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
@@ -562,14 +595,17 @@ class MoreRouteTests(V2Case):
         rid = next(r['requirement_id'] for r in self.job(client, headers, job_id)['gaps']['requirements']
                    if r['text'] == '熟悉Python，了解SQL')
         url = f'/api/jobs/{job_id}/gaps/{rid}/suggest'
+        self.assertEqual(self.settle(client, headers, client.post(url, headers=headers))['status'], 'failed')
+        self.chat.gap_suggestions = lambda ids: [{"requirement": rid, "kind": "skill",
+            "line": "fact-skills-languages", "items": ["SQL"]}]
         self.assertEqual(self.settle(client, headers, client.post(url, headers=headers))['status'], 'succeeded')
         usage = client.get('/api/me', headers=headers).json()['usage']['tokens']['calls']
         for _ in range(2):
             response = client.post(url, headers=headers)
             self.assertEqual(response.status_code, 200)
             row = next(r for r in response.json()['gaps']['requirements'] if r['requirement_id'] == rid)
-            self.assertIn('[[', row['guidance']['template'])
-            self.assertTrue(row['guidance']['questions'])
+            self.assertEqual(row['suggestion']['items'], ['SQL'])
+            self.assertNotIn('guidance', row)
         self.assertEqual(client.get('/api/me', headers=headers).json()['usage']['tokens']['calls'], usage)
         self.assertEqual(client.get('/api/facts', headers=headers).json(), before)
 
@@ -583,7 +619,7 @@ class MoreRouteTests(V2Case):
         user = UserWorkspace(self.database, uid)
         def change_during_call(ids):
             user.decline_gap(job_id, rid)
-            return [{"requirement": rid, "kind": "none"}]
+            return [{"requirement": rid, "kind": "skill", "line": "fact-skills-languages", "items": ["SQL"]}]
         self.chat.gap_suggestions = change_during_call
         response = client.post(f"/api/jobs/{job_id}/gaps/{rid}/suggest", headers=headers)
         self.assertEqual(self.settle(client, headers, response)["status"], "superseded")
@@ -706,6 +742,16 @@ class MoreRouteTests(V2Case):
         self.assertEqual((skills["text"], skills["status"], skills["version"]), ("Languages: Python, Java, SQL", "confirmed", 2))
         view = self.job(client, headers, job_id)
         self.assertFalse(view["cv"]["en"]["stale"])
+        # The adopted line made the check out of date: no row reads as missing now, also when the
+        # job is opened again, and opening it asks the model nothing.
+        sent = len(self.chat.sent)
+        for gaps in (view["gaps"], self.job(client, headers, job_id)["gaps"]):
+            self.assertTrue(gaps["stale"])
+            rows = {item["text"]: item for item in gaps["requirements"]}
+            self.assertEqual({text: (row["status"], row["verdict"]) for text, row in rows.items()},
+                             {text: ("recheck", "none") for text in by_text})
+            self.assertEqual(rows["熟悉Python，了解SQL"]["suggestion_status"], "added")
+        self.assertEqual(len(self.chat.sent), sent)
         degree = by_text["本科及以上学历，计算机相关专业"]
         declined = client.post(f"/api/jobs/{job_id}/gaps/{degree['requirement_id']}/decline", headers=headers)
         self.assertEqual(declined.status_code, 200)
@@ -717,6 +763,39 @@ class MoreRouteTests(V2Case):
         own = [fact for fact in client.get("/api/facts", headers=headers).json()["facts"]
                if fact["text"] == "Worked four days a week during the internship."]
         self.assertEqual([fact["status"] for fact in own], ["confirmed"])
+
+    def test_after_one_adoption_another_suggestion_is_asked_for_and_adopted_without_a_check(self):
+        # Dogfood round 3: adopting one line made the check out of date, and the next requirement
+        # could get no suggestion until the user paid for a new check.
+        from gaps import EVIDENCE_RULES
+        client, headers = self.ready_user()
+        job_id = self.new_job(client, headers)
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        gaps = self.job(client, headers, job_id)["gaps"]
+        rows = {row["text"]: row for row in gaps["requirements"]}
+        python, weekly = rows["熟悉Python，了解SQL"]["requirement_id"], rows["每周至少实习4天"]["requirement_id"]
+        place = next(item["id"] for item in gaps["places"] if item["kind"] == "bullet")
+        first = client.post(f"/api/jobs/{job_id}/gaps/{python}/write", headers=headers,
+                            json={"place": place, "text": "Built Python services with SQL data pipelines."})
+        self.assertEqual(self.settle(client, headers, first)["status"], "succeeded")
+        self.assertTrue(self.job(client, headers, job_id)["gaps"]["stale"])
+        checks = self.chat.systems.count(EVIDENCE_RULES)
+        text = "Worked four days a week throughout the internship."
+        self.chat.gap_suggestions = lambda ids: [{"requirement": weekly, "kind": "bullet", "entry": "s1e0", "text": text, "tags": []}]
+        asked = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps/{weekly}/suggest", headers=headers))
+        self.assertEqual(asked["status"], "succeeded", asked)
+        row = next(row for row in self.job(client, headers, job_id)["gaps"]["requirements"] if row["requirement_id"] == weekly)
+        self.assertEqual((row["status"], row["verdict"], row["suggestion"]["text"]), ("recheck", "none", text))
+        adopted = client.post(f"/api/jobs/{job_id}/gaps/{weekly}/write", headers=headers, json={"place": place, "text": text})
+        self.assertEqual(self.settle(client, headers, adopted)["status"], "succeeded")
+        self.assertEqual(self.chat.systems.count(EVIDENCE_RULES), checks)  # no check ran in between
+        facts = client.get("/api/facts", headers=headers).json()["facts"]
+        self.assertEqual(sum(fact["text"] == text for fact in facts), 1)
+        # Accepting it again (a tab left open) saves nothing and queues no new preparation.
+        again = client.post(f"/api/jobs/{job_id}/gaps/{weekly}/accept", headers=headers)
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertNotIn("task", again.json())
+        self.assertEqual(client.get("/api/facts", headers=headers).json()["facts"], facts)
 
     def test_cancelled_and_failed_work_is_explained_on_the_page(self):
         client, headers = self.ready_user()

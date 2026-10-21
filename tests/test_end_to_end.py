@@ -87,7 +87,7 @@ class EndToEndTests(unittest.TestCase):
             report = self.run_step(review, [root / "linked.json"])
 
         quotes = {item["requirement_quote"]: item["fact_quote"] for item in report["items"]}
-        self.assertEqual(before_confirm["candidate_count"], 0)
+        self.assertEqual(before_confirm["candidate_count"], 3)
         self.assertEqual(report["jd_source"], "未知")
         self.assertEqual(report["material_status"], "待人工审核草稿")
         self.assertEqual(quotes, {**links, "每周至少实习4天": None})

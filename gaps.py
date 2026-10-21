@@ -1,29 +1,18 @@
-"""What each of a job's requirements has behind it: evidence the CV shows, evidence it leaves
-out, related lines only, or nothing; with honest suggestions for what is missing.
+"""Compare saved resume content with job requirements and propose complete additions.
 
-DeepSeek judges each requirement against the user's confirmed facts, the words this CV shows
-(a reworded line is judged as reworded) and each entry's role or degree with its dates: a
-line that is only about the same thing never counts as showing it. What the CV shows is
-worked out later, from the CV as it is then (see ``coverage``), so undoing a cut changes it
-at once. Without an answer a requirement stays unchecked; a matching skill word never stands
-in for one.
-
-For requirements nothing shows, DeepSeek may suggest one line the user could add if it is
-true: items for an existing skills line, or a bullet under an existing entry. Nothing reaches
-the CV until the user says the line is true; it then becomes a confirmed fact like any other.
-Only requirement texts, line texts and roles or degrees with dates are sent, under stand-in
-IDs, never names, schools, employers or fact IDs.
+Coverage describes the words present in the CV, not whether the applicant's claims are true.
+Suggestions may extend beyond saved material. Only user adoption writes them into the CV.
+Names, contact details, schools and employers are masked in model requests.
 """
 
 import copy
 import json
 import re
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from claims import LINK, NUMBER, _leadership
+from claims import LINK
 from cv import CVError, _localized
 from cv_layout import original_layout, shown_sections
 from deepseek_client import DEFAULT_MODEL, DeepSeekError
@@ -39,7 +28,7 @@ MAX_MISSING_CHARACTERS = 120
 EVIDENCE_RULES = """You check which lines of an applicant's resume show that they meet each of a job's
 requirements, and reply in json only. The resume comes entry by entry (a job, school or project):
 its "role" is the role or degree with dates, then its lines; a line may be a rewording of another
-line of the same entry. "other_facts" are the applicant's confirmed facts not on this resume.
+line of the same entry. "other_facts" are the applicant's saved material not on this resume.
 Judge every line by its own words, and the years it covers only by its own entry's dates; the job
 description is never evidence. For each requirement give one verdict:
 - "supported": lines that together show every part of it, including any years, level, degree or
@@ -51,7 +40,8 @@ description is never evidence. For each requirement give one verdict:
   "missing": a few English words naming what no line shows.
 - "none": no line is about it.
 Being related is never "supported". Years, seniority and leadership count only when a line or
-its own entry's dates state them.
+its own entry's dates state them. This describes resume coverage, not real-world verification;
+it must never prevent generating or exporting new copy.
 Reply as {"requirements": [{"id": "<requirement id>", "verdict": "supported", "sets": [["E1"]]},
 {"id": "<requirement id>", "verdict": "related", "lines": ["E2"], "missing": "..."},
 {"id": "<requirement id>", "verdict": "none"}]}"""
@@ -60,100 +50,24 @@ MAX_ITEMS = 5
 MAX_ITEM_CHARACTERS = 40
 MAX_LINE_CHARACTERS = 300
 MAX_TAGS = 8
-SUGGEST_RULES = """You help an applicant close the gaps between a job's requirements and their resume,
-and reply in json only. The applicant confirms every suggestion before anything is added, so for
-each gap that names a concrete tool, language, framework, platform, method or practice, suggest the
-smallest addition that would show it, true or not for this applicant; they will decide. Suggest at
-most one addition per gap, in the same language as the resume lines:
-- "skill": items to append to one existing skills line whose label fits them (give that line's id),
-  such as a tool name; never put an item into a line whose label it does not fit, such as a concept
-  into a list of programming languages.
-- "bullet": one new bullet under an existing experience or project entry (give the entry id), only
-  when that entry's own lines already show closely related work, so the new line adds a practice
-  to that same work. Write it like the other bullets there, describing plain hands-on use. When
-  the addition is only a tool for work a line already describes, suggest the tool as a skill.
-- "none": when no honest addition fits: years of experience, seniority, leadership, a degree, work
-  authorization or personal traits; a quality or scale rather than a tool or practice, such as
-  efficient, scalable, stable, real-time or large-scale; experience that needs a project of its own,
-  such as a model architecture, a research area or a field like autonomous driving; or a gap that
-  is only about how an existing line is worded.
-Never restate or reword a line the resume already has: if a line says "Built REST APIs for an
-internal tool", do not suggest "Developed and released REST APIs for an internal tool, handling
-deployment". Never copy the requirement's own wording, and never invent a model, system, feature or
-result. Never include numbers, metrics, results, team
-sizes or leadership words, and never claim more than basic hands-on use. Give "tags": the skill
-words the bullet names.
+SUGGEST_RULES = """You write complete, job-targeted resume content and reply in JSON only.
+Use the resume as context and style guidance, not as a factual boundary. The user wants useful
+finished wording, including proposed experience, projects, skills, responsibilities, numbers or
+years beyond the saved material. They choose which proposals to adopt. Do not demand evidence,
+previous confirmation, answers to questions, or missing details before writing.
+For each gap, produce one concise, specific addition in the resume language:
+- "skill": items to append to an existing skills line whose category fits, with its line id.
+  Keep category labels meaningful: Docker/Kubernetes belong to tools or platforms, not a
+  programming-languages line. If no suitable skills line exists, write a bullet instead.
+- "bullet": a complete resume sentence, at most 300 characters, under the most suitable existing
+  experience/project entry, with its entry id and tags for terms actually in the sentence.
+Prefer specific actions, tools and outcomes to generic claims. You may rephrase and expand existing
+content. Do not merely copy the requirement, repeat an existing line verbatim, return "none",
+or return a template, placeholders or questions. Do not include contact details or links.
+The output is proposed copy, not an assertion that the system verified the applicant.
 Reply as {"suggestions": [{"requirement": "<gap id>", "kind": "skill", "line": "<line id>",
 "items": ["..."]}, {"requirement": "<gap id>", "kind": "bullet", "entry": "<entry id>",
-"text": "...", "tags": ["..."]}, {"requirement": "<gap id>", "kind": "none"}]}"""
-
-GUIDANCE_RULES = """
-For this explicitly requested suggestion, do not stop at "none" because the resume lacks facts.
-The user wants ideas for experiences they may have omitted, not only paraphrases of known facts.
-For any gap that cannot be expressed as a concrete skill/bullet proposal, return "kind":"template",
-"template": a useful editable CV line (at most 300 characters), and "questions": 1-3 specific
-questions that help the user supply missing details. Put EVERY unknown activity, qualification,
-date, duration, result or responsibility in [[double bracket placeholders]]. This is a proposal,
-not evidence that the applicant meets the requirement. Do not copy a required number of years
-into a claim. For years, ask for relevant roles and their actual start/end dates, including overlap;
-provide a chronology template without asserting a total. For degrees or work permission, ask for
-the actual status and provide a status template. Do not require an existing related fact before
-offering a template. Use the resume's language. Include the requirement id as for other kinds.
-Example: {"suggestions":[{"requirement":"r1","kind":"template",
-"template":"[[start date]]–[[end date]]: [[role]], working on [[relevant responsibilities]].",
-"questions":["Which relevant roles have you held, and on what dates?"]}]}.
-"""
-
-PLACEHOLDER = re.compile(r"\[\[.*?\]\]")
-
-
-def _guidance(value: Any) -> dict | None:
-    if not isinstance(value, dict):
-        return None
-    template, questions = value.get('template'), value.get('questions')
-    if (not isinstance(template, str) or not template.strip() or len(template) > MAX_LINE_CHARACTERS
-            or not PLACEHOLDER.search(template) or not isinstance(questions, list)):
-        return None
-    questions = [q.strip() for q in questions if isinstance(q, str) and q.strip() and len(q) <= 300][:3]
-    return {'template': template.strip(), 'questions': questions, 'source': 'ai'} if questions else None
-
-
-def gap_guidance(text: str, language: str) -> dict:
-    """Useful reference templates for saved empty answers; not presented as model output.
-
-    Keeping this a view fallback also upgrades old cached 'none' answers without changing facts,
-    charging another call, or making users rerun the entire job check.
-    """
-    years = bool(re.search(r'\byears?\b|年.{0,8}(?:经验|经历)', text, re.I))
-    if language == 'zh':
-        template = ('[[起始年月]]至[[结束年月]]，担任[[岗位]]，负责[[相关职责]]。' if years else
-                    '在[[项目或工作场景]]中，使用[[工具或方法]]完成[[具体任务]]，通过[[验证方式]]检查结果。')
-        questions = (['还有哪些相关工作未写进简历？分别从何时开始、何时结束？', '哪些经历时间重叠？按实际工作时间填写，不直接套用岗位要求的年限。']
-                     if years else ['针对这条要求，你可以回想哪些课程、实习、项目或工作？', '你具体做了什么、用了什么方法，以及怎样验证结果？'])
-    else:
-        template = ('[[start date]]–[[end date]]: [[role]], working on [[relevant responsibilities]].' if years else
-                    'In [[project or work setting]], used [[tools or methods]] to complete [[specific task]] and checked the result with [[validation method]].')
-        questions = (['Which relevant roles are missing from your CV, and what were their start and end dates?', 'Which periods overlap? Use actual dates rather than copying the required number of years.']
-                     if years else ['What coursework, internships, projects or work could relate to this requirement?', 'What did you do, which methods did you use, and how did you check the result?'])
-    return {'template': template, 'questions': questions, 'source': 'reference'}
-
-
-NEAR_COPY = 0.85  # how alike, word by word in order, a new line may be to one already there
-
-
-def _near_copy(text: str, existing: list[str]) -> bool:
-    """Whether a new line is an existing one with a word or two changed, or with only its first
-    word (its verb) changed. Naming the same work while adding a tool or practice is not: that
-    is what a new line is for, so only the order of nearly all the words gives a copy away.
-    Chinese is compared character by character."""
-    def tokens(value: str) -> list[str]:
-        return re.findall(r"[\u4e00-\u9fff]|[^\W_\u4e00-\u9fff]+", value.casefold())
-    words = tokens(text)
-    for known in map(tokens, existing):
-        if (len(words) > 1 and words[1:] == known[1:]) \
-                or SequenceMatcher(None, words, known, autojunk=False).ratio() >= NEAR_COPY:
-            return True
-    return False
+"text": "...", "tags": ["..."]}]}"""
 
 
 def _entry_key(kind: str, fields: dict[str, Any]) -> str:
@@ -206,7 +120,7 @@ def _resume(
 
 
 def _existing_lines(draft: dict[str, Any]) -> list[str]:
-    """Every line the CV holds, as confirmed and as reworded."""
+    """Every line the CV holds, in its source and rewritten forms."""
     return [
         text for section in draft["sections"] for entry in section["entries"] for line in entry["lines"]
         for text in (line["text"], line.get("source_text")) if text
@@ -216,11 +130,7 @@ def _existing_lines(draft: dict[str, Any]) -> list[str]:
 def _suggestion(
     item: Any, skills: dict[str, tuple[str, str]], entries: dict[str, dict[str, Any]], existing: list[str]
 ) -> dict[str, Any] | None:
-    """Keep a suggestion only if it points at a real line or entry, adds something the CV does
-    not already say, and claims nothing more than plain use. An existing line with a word or two
-    changed is dropped; whether a new line in other words says something new is left to the
-    rules DeepSeek follows and to the user, who sees it beside the entry's lines: matching words
-    cannot tell a new fact from a reworded one."""
+    """Validate destination and output shape; candidate authenticity is not a filter."""
     if not isinstance(item, dict):
         return None
     if item.get("kind") == "skill" and isinstance(item.get("line"), str) and item["line"] in skills:
@@ -231,7 +141,7 @@ def _suggestion(
                 continue
             value = " ".join(value.split())
             if (value and len(value) <= MAX_ITEM_CHARACTERS and len(value.split()) <= 4
-                    and not _leadership(value)
+                    and "[[" not in value and "]]" not in value
                     and not any(tag_pattern(value).search(known) for known in existing)
                     and value.casefold() not in {existing.casefold() for existing in items}):
                 items.append(value)
@@ -242,10 +152,9 @@ def _suggestion(
     if item.get("kind") == "bullet" and isinstance(item.get("entry"), str) and item["entry"] in entries:
         text = " ".join(item.get("text").split()) if isinstance(item.get("text"), str) else ""
         entry = entries[item["entry"]]
-        if (not text or len(text) > MAX_LINE_CHARACTERS or NUMBER.search(text)
-                or _leadership(text) or LINK.search(text)
-                or any(text.casefold() in known.casefold() or known.casefold() in text.casefold() for known in existing)
-                or _near_copy(text, existing)):
+        if (not text or len(text) > MAX_LINE_CHARACTERS or LINK.search(text)
+                or "[[" in text or "]]" in text
+                or any(text.casefold() == known.casefold() for known in existing)):
             return None
         tags = [
             tag.strip() for tag in (item.get("tags") if isinstance(item.get("tags"), list) else [])
@@ -280,7 +189,7 @@ Pair = tuple[dict[str, Any], dict[str, Any] | None]
 
 def _cv_parts(cv: dict[str, Any]) -> list[tuple[str, dict[str, Any] | None, list[Pair]]]:
     """This CV entry by entry: its section, its role or degree with dates (if any), and each line
-    in its confirmed words with, if reworded, its new words."""
+    in its saved words with, if reworded, its new words."""
     parts = []
     for section in cv["sections"]:
         for entry in section["entries"]:
@@ -305,7 +214,7 @@ def _evidence(
     cv: dict[str, Any], confirmed: list[dict[str, Any]], private: list[str]
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """What to judge, under stand-in IDs; the request's resume, entry by entry (an entry is named
-    only by a stand-in, since its name is a school, an employer or a project); and the confirmed
+    only by a stand-in, since its name is a school, an employer or a project); and the saved
     facts not on this CV."""
     items: dict[str, dict[str, Any]] = {}
     refs: dict[str, str] = {}
@@ -370,15 +279,16 @@ def _suggest(
     decided: dict[str, Any], cv: dict[str, Any], gaps: list[dict[str, Any]], chat: Callable[..., dict[str, Any]],
     effort: str, private: list[str], *, strict: bool = False,
 ) -> dict[str, Any]:
-    """Ask for one honest line per gap and keep the ones that pass; returns how it went."""
+    """Ask for one complete line per gap and validate its format and destination; returns how it went."""
     resume, skills, entries = _resume(cv, private)
     request = {
         "job_title": decided["jd"].get("title"),
+        "language": cv["language"],
         "gaps": [{"id": gap["requirement_id"], "text": gap["text"], "strength": gap["strength"]} for gap in gaps],
         "resume": resume,
     }
     messages = [
-        {"role": "system", "content": SUGGEST_RULES + (GUIDANCE_RULES if strict else '')},
+        {"role": "system", "content": SUGGEST_RULES},
         {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
     ]
     try:
@@ -390,21 +300,19 @@ def _suggest(
     by_requirement: dict[str, Any] = {}
     if strict and (not isinstance(picks, list) or not all(
             any(isinstance(pick, dict) and pick.get('requirement') == gap['requirement_id']
-                and pick.get('kind') in ('skill', 'bullet', 'none', 'template') for pick in picks) for gap in gaps)):
+                and pick.get('kind') in ('skill', 'bullet') for pick in picks) for gap in gaps)):
         if suggesting.get('fallback_reason'):
             raise DeepSeekError(suggesting['fallback_reason'], reason=suggesting.get('fallback_code', 'bad_response'))
         raise DeepSeekError('DeepSeek returned no usable suggestion response.')
     for pick in picks if isinstance(picks, list) else []:
         requirement = pick.get("requirement") if isinstance(pick, dict) else None
-        if isinstance(requirement, str) and requirement not in by_requirement:
+        # The first usable pick: one dropped (skills the CV already lists) leaves room for the next.
+        if isinstance(requirement, str) and not by_requirement.get(requirement):
             by_requirement[requirement] = _suggestion(pick, skills, entries, _existing_lines(cv))
     for gap in gaps:
         gap["suggestion"] = by_requirement.get(gap["requirement_id"])
-        if strict:
-            guide = next((_guidance(pick) for pick in picks if isinstance(pick, dict)
-                          and pick.get('requirement') == gap['requirement_id'] and pick.get('kind') == 'template'), None)
-            if guide:
-                gap['guidance'] = guide
+        if strict and not gap["suggestion"]:
+            raise DeepSeekError("DeepSeek did not return a complete suggested entry. Try again.")
     return suggesting
 
 
@@ -417,13 +325,14 @@ def _suggestion_key(requirement: str, suggestion: dict[str, Any]) -> str:
     return json.dumps([requirement, suggestion.get("kind"), claim], ensure_ascii=False)
 
 
-def suggestion_target(gaps: dict, decided: dict, cv: dict, confirmed: Iterable[tuple[str, int]],
-                      requirement_id: str) -> dict:
-    """Validate the saved check before reusing or requesting a row's suggestion."""
+def suggestion_target(gaps: dict, decided: dict, cv: dict, requirement_id: str) -> dict:
+    """Validate the saved check before reusing or requesting a row's suggestion: the same
+    requirements and CV language, and a row the check found missing or only related. The CV may
+    have changed since (another line adopted), so one adoption never forces a new check: a
+    suggestion is asked with the CV as it is now, and the page says the row awaits a new check."""
     expected = [(r['id'], r['text'], r.get('strength') or 'unclear') for r in decided['selected_requirements']]
     actual = [(r['requirement_id'], r['text'], r['strength']) for r in gaps.get('requirements', [])]
-    if (gaps.get('gaps_version') != GAPS_VERSION or expected != actual
-            or gaps.get('language') != cv['language'] or coverage(gaps, cv, confirmed)['stale']):
+    if gaps.get('gaps_version') != GAPS_VERSION or expected != actual or gaps.get('language') != cv['language']:
         raise ValueError('The CV, facts or requirements changed. Check again before requesting a suggestion.')
     item = _gap(gaps, requirement_id)
     if item['evidence'] not in ('related', 'none'):
@@ -433,37 +342,28 @@ def suggestion_target(gaps: dict, decided: dict, cv: dict, confirmed: Iterable[t
 
 def suggest_gap(gaps: dict, decided: dict, cv: dict, facts_db: Any, requirement_id: str,
                 chat: Callable[..., dict], private: Iterable[str] = ()) -> dict:
-    """Generate only the selected missing entry. Saved answers, including no suitable answer,
-    are reused. The returned check contains proposals only; no fact or CV is changed."""
-    confirmed = [(f['id'], f['version']) for f in fact_source(facts_db).listed() if f['status'] == 'confirmed']
+    """Generate complete copy for one row; reuse full proposals but retry old empty/templates.
+    The returned check contains proposals only; no saved material or CV is changed. The request
+    carries only the CV and the requirement; ``facts_db`` stays for the callers' signature."""
     updated = copy.deepcopy(gaps)
-    item = suggestion_target(updated, decided, cv, confirmed, requirement_id)
-    if item.get('suggestion') or item.get('ai_checked') or item['status'] in ('added', 'declined'):
+    item = suggestion_target(updated, decided, cv, requirement_id)
+    if item.get('suggestion') or item['status'] in ('added', 'declined'):
         return updated
     private = sorted({*private_terms(cv), *private}, key=len, reverse=True)
     result = _suggest(decided, cv, [item], chat, 'none', private, strict=True)
     if result.get('fallback_reason'):
         # No cached success on a transport or quota failure: the user's next click can retry.
         raise DeepSeekError(result['fallback_reason'], reason=result.get('fallback_code', 'bad_response'))
-    # These gaps cannot be repaired by adding a tool or a hypothetical bullet. Leave a
-    # request for the user's own evidence even if a model tries to propose a qualification.
-    qualification = re.search(r'\b(?:years?|seniority|leadership|degree|bachelor|master|ph\.?d|'
-                              r'citizenship|authorization|clearance|sponsorship)\b|'
-                              r'年.{0,8}(?:经验|经历)|学历|学位|本科|硕士|博士|工作许可|签证|管理经验',
-                              item['text'], re.I)
-    if qualification or _leadership(item['text']):
-        item['suggestion'] = None
     if item['suggestion'] and _suggestion_key(item['text'], item['suggestion']) in _declined(gaps):
-        item['suggestion'] = None
+        raise DeepSeekError("This suggestion was previously declined. Try a different entry.")
     item['ai_checked'] = True
-    item['ai_needs_details'] = not bool(item['suggestion'])
-    if not item['suggestion'] and not item.get('guidance'):
-        item['guidance'] = gap_guidance(item['text'], cv['language'])
+    item.pop('ai_needs_details', None)
+    item.pop('guidance', None)
     return updated
 
 
 def _declined(previous: Any) -> set[str]:
-    """What the user said is not true in any earlier check, by requirement and claim; kept even
+    """What the user skipped in an earlier check, by requirement and claim; kept even
     through a check that failed and so suggested nothing."""
     if not isinstance(previous, dict):
         return set()
@@ -490,7 +390,7 @@ def find_gaps(
     ``previous`` check stays declined. ``facts_db`` is the single-user database or a fact
     source (facts.fact_source)."""
     private = sorted({*private_terms(cv), *(private or ())}, key=len, reverse=True)
-    confirmed = [fact for fact in fact_source(facts_db).listed() if fact["status"] == "confirmed"]
+    confirmed = list(fact_source(facts_db).listed())
     items, resume, other = _evidence(cv, confirmed, private)
     requirements = [
         {"requirement_id": item["id"], "text": item["text"], "strength": item.get("strength") or "unclear",
@@ -535,7 +435,7 @@ def find_gaps(
     }
 
 
-STATUSES = ("not_shown", "related", "none", "unchecked", "shown")
+STATUSES = ("not_shown", "related", "none", "unchecked", "recheck", "shown")
 
 
 def _shown_now(cv: dict[str, Any]) -> tuple[dict[tuple[str, int, str], str], dict[str, str]]:
@@ -598,7 +498,7 @@ def _left_out(
                 source = line.get("source_text") or line["text"]
                 comes_back_reworded = line["text"] != source and rewording in undoable
                 if item["text"] == source and comes_back_reworded:
-                    words = [rewording]  # put back in the confirmed words that show it
+                    words = [rewording]  # put back the saved words that show it
                 elif item["text"] != source and not comes_back_reworded:
                     return "cut", []  # only the undone rewording shows it; undoing the cut would not
             cut = next((change for change in cuts if change in undoable), None)
@@ -613,8 +513,11 @@ def coverage(gaps: dict[str, Any], cv: dict[str, Any], confirmed: Iterable[tuple
     A requirement is "shown" when a whole group of lines that shows it is on the CV in the words
     and entries that were judged, "not_shown" when its evidence is cut, reworded or not on this
     CV (with the changes to undo to show it), and otherwise "related", "none" or "unchecked" as
-    judged. ``confirmed`` lists the (fact ID, version) pairs confirmed now: the check is
-    ``stale`` once they, or anything the CV could show, differ from what was judged.
+    judged. ``confirmed`` is the legacy name for all current (fact ID, version) pairs: the check is
+    ``stale`` once they, or anything the CV could show, differ from what was judged. A stale check
+    never judged the CV's new words or lines, so evidence it no longer finds word for word, and its
+    "related" and "none" verdicts, are "recheck" (why "changed", nothing to undo), never left out or
+    missing: the CV may show it now. ``verdict`` keeps what that check found.
     """
     lines, entries = _shown_now(cv)
     items = gaps["items"]
@@ -627,6 +530,8 @@ def coverage(gaps: dict[str, Any], cv: dict[str, Any], confirmed: Iterable[tuple
         item = items[ref]
         if _is_shown(item, lines, entries):
             return {"text": item["text"], "shown": True, "why": None, "undo": []}
+        if stale:
+            return {"text": item["text"], "shown": False, "why": "changed", "undo": []}
         why, undo = _left_out(item, cv, lines, undoable)
         return {"text": item["text"], "shown": False, "why": why, "undo": undo}
 
@@ -638,16 +543,17 @@ def coverage(gaps: dict[str, Any], cv: dict[str, Any], confirmed: Iterable[tuple
             whole = next((group for group, flags in zip(record["sets"], shown) if all(flags)), None)
             # When no group is whole, explain the one closest to being shown.
             status, refs = ("shown", whole) if whole else (
-                "not_shown", max(zip(record["sets"], shown), key=lambda pair: sum(pair[1]))[0])
+                "recheck" if stale else "not_shown", max(zip(record["sets"], shown), key=lambda pair: sum(pair[1]))[0])
         elif status == "related":
             refs = record["related"]
+        if stale and status in ("related", "none"):
+            status = "recheck"
         requirements.append({
             "requirement_id": record["requirement_id"], "text": record["text"], "strength": record["strength"],
-            "status": status, "evidence": [described(ref) for ref in refs], "missing": record["missing"],
+            "status": status, "verdict": record["evidence"],
+            "evidence": [described(ref) for ref in refs], "missing": record["missing"],
             "suggestion": record["suggestion"], "suggestion_status": record["status"],
-            "ai_checked": bool(record.get("ai_checked")), "ai_needs_details": bool(record.get("ai_needs_details")),
-            "guidance": (record.get('guidance') or gap_guidance(record['text'], gaps['language']))
-                if record.get('ai_checked') and not record.get('suggestion') else None,
+            "ai_checked": bool(record.get("ai_checked") and record.get("suggestion")),
         })
     return {
         "stale": stale,
@@ -666,7 +572,7 @@ def _gap(gaps: dict[str, Any], requirement_id: str) -> dict[str, Any]:
 def accept_gap(
     gaps: dict[str, Any], requirement_id: str, facts_db: Path, profile: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """The user says the suggestion is true: store it as a confirmed fact.
+    """The user adopts the suggestion: save it using the legacy confirmed status.
 
     A skill becomes a new confirmed version of that skills line, already on the CV. A bullet
     becomes a new confirmed fact and a new profile (returned) lists it under its entry; the
@@ -684,7 +590,7 @@ def accept_gap(
     updated = copy.deepcopy(gaps)
     gap = _gap(updated, requirement_id)
     if gap["status"] == "declined":
-        raise ValueError("这条建议已标记为不属实；如需添加请重新检查缺口")
+        raise ValueError("这条建议已被跳过；如需添加可自行编辑内容")
     if gap["status"] == "added":
         return updated, None
     suggestion = gap["suggestion"]
@@ -695,11 +601,8 @@ def accept_gap(
         fact_id = suggestion["fact_id"]
         current = facts.current([fact_id]).get(fact_id)
         if current is not None and current["text"] == suggestion["new_text"]:
-            # Added before. A pending version with this text may carry other tags nobody has
-            # reviewed, so it is confirmed on the Facts page, never here.
-            if current["status"] != "confirmed":
-                raise ValueError("这行技能有一个尚未确认的新版本，请先在 Facts 页面核对确认，再重新检查缺口")
-        elif current is not None and current["status"] == "confirmed" and current["text"] == suggestion["where"]:
+            pass  # Already saved; the legacy confirmation flag is not a prerequisite.
+        elif current is not None and current["text"] == suggestion["where"]:
             facts.revise_confirmed(fact_id, suggestion["new_text"], [*current["tags"], *suggestion["items"]])
         else:
             raise ValueError("这行技能已经改变，请重新检查缺口")
@@ -718,8 +621,6 @@ def accept_gap(
         there = facts.current(listed)
         before = next((fact_id for fact_id in listed if (there.get(fact_id) or {}).get("text") == suggestion["text"]), None)
         if before is not None:
-            if there[before]["status"] != "confirmed":
-                raise ValueError("这一行已在该条目下，但尚未确认，请先在 Facts 页面核对确认")
             gap.update(status="added", fact_id=before)
             return updated, None
         elsewhere = {
@@ -833,7 +734,7 @@ def write_line(
     facts_db: Path, profile: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """The user writes what shows a requirement themselves (see line_to_write), even after
-    saying a suggestion was not true. It is their own words, so it becomes a confirmed fact as
+    skipping a suggestion. Their adopted text is saved using the legacy confirmed status as
     written, numbers included. Adding works as for a suggestion (see accept_gap), with the same
     protection against a changed line or entry."""
     suggestion = line_to_write(gaps, requirement_id, place_id, text, cv)
@@ -849,7 +750,7 @@ def write_line(
 
 
 def decline_gap(gaps: dict[str, Any], requirement_id: str) -> dict[str, Any]:
-    """The user says the suggestion is not true: it stays a gap and never reaches the CV."""
+    """The user skips the suggestion: leave it off the CV."""
     updated = copy.deepcopy(gaps)
     gap = _gap(updated, requirement_id)
     if gap["status"] == "added":

@@ -13,7 +13,7 @@ import re
 from typing import Any
 
 
-RULE_VERSION = 1
+RULE_VERSION = 3
 STATUSES = ("supported", "not_supported", "conditional", "unknown", "conflicting")
 _FLAGS = re.IGNORECASE
 _SPONSOR = r"(?:(?:work\s+)?visa\s+|immigration\s+|employment\s+|h[-‐‑–]?1b\s+)?sponsorship"
@@ -75,6 +75,12 @@ _NON_POLICY = _patterns(
     r"(?:不确定|不確定|不一定|不保证|不保證|无法确认|無法確認|是否|尚未明确|尚未明確)",
 )
 _NEGATIVE = _patterns(
+    # Employer-name subjects and adverbs common in ATS policy paragraphs.
+    r"(?:^|[\n:])\s*(?:(?-i:[A-Z])[A-Za-z0-9&’' .-]{0,60}?)\s+"
+    r"(?:does\s+not|will\s+not|is\s+unable\s+to)\s+(?:currently\s+)?"
+    r"(?:provide|offer|anticipate\s+providing)\s+(?:visa\s+)?sponsorship"
+    r"(?=\s+for\s+(?:employment\s+visas?|this\s+(?:role|position)|this\s+employment\s+position)|\s+at\s+this\s+time)",
+    rf"\b{_SUBJECT}\s+(?:are|is)\s+not\s+currently\s+able\s+to\s+sponsor\s+(?:{_VISA})\b",
     rf"\bno\s+{_SPONSOR}(?:\s+(?:is|will\s+be))?\s*(?:available|provided|offered|supported)\b",
     rf"\bno\s+(?:visa\s+|immigration\s+|employment\s+|h[-‐‑–]?1b\s+)sponsorship\b"
     r"(?=\s*(?:[,.;!?。！？；]|$)|\s+(?:now\b|in\s+the\s+future\b|at\s+this\s+time\b|for\s+(?:this|the)\s+(?:role|position)\b))",
@@ -98,7 +104,7 @@ _POSITIVE = _patterns(
     rf"\b{_SPONSOR}\s+(?:(?:is|will\s+be)\s+)?(?:available|provided|offered|supported)\b",
     rf"\b{_SUBJECT}\s+(?:(?:can|will|do)\s+|(?:are|is)\s+able\s+to\s+)?"
     rf"(?:provide|offer|support)\s+{_SPONSOR}\b",
-    rf"\b{_SUBJECT}\s+(?:can\s+|will\s+)?sponsor\s+(?:{_VISA}|candidates|applicants)\b",
+    rf"\b{_SUBJECT}\s+(?:can\s+|will\s+|do\s+)?sponsor\s+(?:{_VISA}|candidates|applicants)\b",
     rf"\b{_SPONSOR}\s*:\s*yes\b",
     rf"{_ZH_POLICY_SUBJECT}(?:提供|支持)(?:工作)?(?:签证|簽證)(?:支持|赞助|贊助)",
     rf"{_ZH_POLICY_SUBJECT}(?:办理|辦理)工作(?:签证|簽證)",
@@ -113,6 +119,8 @@ _CONDITION = _patterns(
 # These need a sponsorship noun as well; a general conditional elsewhere is not
 # evidence that the employer offers any sponsorship at all.
 _CONDITIONAL_POLICY = _patterns(
+    r"\bwe\s+(?:aren['’]t|are\s+not)\s+able\s+to\s+(?:successfully\s+)?"
+    r"sponsor\s+visas\s+for\s+every\s+role\b",
     rf"\b{_SPONSOR}\s+(?:may|might|can)\s+be\s+(?:available|provided|offered|considered)\b",
     rf"\b{_SUBJECT}\s+(?:may|might|will|can)\s+consider\s+(?:offering\s+)?{_SPONSOR}\b",
     r"\bh[-‐‑–]?1b\s+transfers?\s+(?:only|(?:are\s+)?(?:accepted|supported|available|eligible))\b",
@@ -121,6 +129,13 @@ _CONDITIONAL_POLICY = _patterns(
     rf"{_ZH_SUBJECT}\s*(?:可|可以|可能|视情况|視情況|酌情)(?:考虑|考慮)?(?:提供|支持|办理|辦理)"
     r".{0,8}(?:签证|簽證)",
 )
+# A refusal of every role or candidate denies only that sponsorship covers all of them, so
+# "sponsorship is not available for every role" states a condition, not a refusal. The scope
+# must follow the refusal directly; "any role", "at all" and "this role" stay refusals.
+_EVERY = (r"(?:every|all|each)\s+(?:of\s+(?:our|the)\s+)?"
+          r"(?:roles?|positions?|jobs?|openings?|candidates?|applicants?)\b")
+_SCOPE = re.compile(rf"\s+(?:(?:for|to)\s+)?{_EVERY}", _FLAGS)
+_NOT_EVERY = re.compile(rf"\bnot\s+(?:for|to)\s+{_EVERY}", _FLAGS)  # "available, but not for every role"
 _ABBREVIATION = re.compile(r"\b(?:[A-Za-z]\.){2,}$")
 _FUTURE = re.compile(r"\b(?:future|later)\b|未来|未來", _FLAGS)
 _BOTH_TIMES = re.compile(
@@ -157,36 +172,51 @@ def _segments(text):
 
 
 def _signal(segment):
+    """The segment's signal, and whether its only condition is that sponsorship does not cover
+    every role (_EVERY), which a refusal elsewhere does not contradict."""
     if any(pattern.search(segment) for pattern in _NON_POLICY):
-        return "unknown"
-    negatives = [match for pattern in _NEGATIVE for match in pattern.finditer(segment)]
+        return "unknown", False
+    refusals = [match for pattern in _NEGATIVE for match in pattern.finditer(segment)]
+    scoped = [(match.start(), scope.end()) for match in refusals
+              if (scope := _SCOPE.match(segment, match.end()))]
+    partial = scoped + [match.span() for match in _NOT_EVERY.finditer(segment)]
+    negatives = [match for match in refusals
+                 if not any(start < match.end() and match.start() < end for start, end in partial)]
     positives = [
         match for pattern in _POSITIVE for match in pattern.finditer(segment)
         if not any(negative.start() < match.end() and match.start() < negative.end()
-                   for negative in negatives)
+                   for negative in refusals)
         and (not re.search(r"\b(?:candidates|applicants)\b", match.group(), _FLAGS)
              or _VISA_CONTEXT.search(segment))
     ]
-    conditional = any(pattern.search(segment) for pattern in _CONDITIONAL_POLICY)
+    rest = segment  # the segment without its every-role scopes
+    for start, end in partial:
+        rest = rest[:start] + " " * (end - start) + rest[end:]
+    conditional = any(pattern.search(rest) for pattern in _CONDITIONAL_POLICY)
     if negatives and positives:
-        return "conflicting"
+        return "conflicting", False
     if negatives:
         if re.search(r"\b(?:unless|except)\b|除非", segment, _FLAGS):
-            return "conditional"
+            return "conditional", False
         if conditional:
-            return "conditional" if re.search(r"\btransfers?\b|转移|轉移", segment, _FLAGS) else "conflicting"
+            return ("conditional" if re.search(r"\btransfers?\b|转移|轉移", segment, _FLAGS)
+                    else "conflicting"), False
         if _FUTURE.search(segment) and not _BOTH_TIMES.search(segment):
-            return "conditional"
-        return "not_supported"
+            return "conditional", False
+        return "not_supported", False
     if positives:
         # A positive substring under an unrecognized negation is not affirmative
         # evidence. Prefer unknown even if the negation might be unrelated.
         if re.search(r"\b(?:no|not|never|cannot|unable|unlikely|without|deny|denies|reject|"
                      r"can['’]t|don['’]t|won['’]t|isn['’]t|aren['’]t)\b|不|无法|無法|未|并非|並非",
-                     segment, _FLAGS):
-            return "unknown"
-        return "conditional" if any(pattern.search(segment) for pattern in _CONDITION) else "supported"
-    return "conditional" if conditional else "unknown"
+                     rest, _FLAGS):
+            return "unknown", False
+        if any(pattern.search(segment) for pattern in _CONDITION):
+            return "conditional", False
+        return ("conditional", True) if partial else ("supported", False)
+    if conditional:
+        return "conditional", False
+    return ("conditional", True) if scoped else ("unknown", False)
 
 
 def assess_sponsorship(text: str, *, source: str | None = None,
@@ -197,11 +227,13 @@ def assess_sponsorship(text: str, *, source: str | None = None,
     policy. An explicit classification directive makes all text signals unknown.
     Work authorization alone proves no sponsorship policy. Immediate anaphoric
     restrictions are kept with their statement; this is not general coreference
-    resolution. Conditions may include future-only restrictions or transfers only.
+    resolution. Conditions may include future-only restrictions, transfers only, or
+    sponsorship that is not for every role; beside a refusal, the last only agrees with it.
     Unrecognized relevant text remains visible as unknown evidence. source and
     captured_at are caller-supplied provenance, not independently verified here.
     """
     evidence = []
+    every_role = set()  # evidence whose only condition is "not for every role"
     directed = any(pattern.search(text) for pattern in _DIRECTIVE)
     spans = list(_segments(text))
     uncertain_restriction = False
@@ -220,17 +252,22 @@ def assess_sponsorship(text: str, *, source: str | None = None,
                     end = next_end
                     segment = text[start:end]
                     restricted = True
-            signal = "unknown" if directed else _signal(segment)
+            signal, partial = ("unknown", False) if directed else _signal(segment)
             uncertain_restriction |= restricted and signal == "unknown"
+            if partial:
+                every_role.add(len(evidence))
             evidence.append({"text": segment, "start": start, "end": end,
                              "signal": signal})
-    signals = {item["signal"] for item in evidence} - {"unknown"}
+    # A refusal says which side of "not for every role" this role is on.
+    refused = any(item["signal"] == "not_supported" for item in evidence)
+    weighed = [item for index, item in enumerate(evidence) if not (refused and index in every_role)]
+    signals = {item["signal"] for item in weighed} - {"unknown"}
     transfer_exception = (
         signals == {"not_supported", "conditional"}
         and all(re.search(r"\btransfers?\b|转移|轉移", item["text"], _FLAGS)
-                for item in evidence if item["signal"] == "conditional")
+                for item in weighed if item["signal"] == "conditional")
         and not any(re.search(r"\btransfers?\b|转移|轉移", item["text"], _FLAGS)
-                    for item in evidence if item["signal"] == "not_supported")
+                    for item in weighed if item["signal"] == "not_supported")
     )
     if transfer_exception:
         status = "conditional"

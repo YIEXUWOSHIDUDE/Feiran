@@ -1,3 +1,5 @@
+"""Historical source-comparison utility tests, not candidate-content acceptance criteria."""
+
 import unittest
 
 from claims import check_rewrite

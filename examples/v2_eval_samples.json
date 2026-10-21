@@ -1,6 +1,6 @@
 {
   "version": "v2-eval-1",
-  "note": "Synthetic, hand-labelled samples for B6 (docs/v2-plan.md); no real person or CV. 'rules': 'must_catch' means the word-level claim checks (claims.check_rewrite) must flag an overclaim and pass a supported line; 'known_gap' is an overclaim they are not built to see, reported as missed, never as passed. 'vocabulary' is every tag on the CV (the fact's own tags when absent). Evidence samples are for a model run only.",
+  "note": "Synthetic content samples. Historical labels/rules are retained as provenance only; current offline acceptance checks complete text format, not truthfulness or support by source material.",
   "rewrites": [
     {"id": "en-lead-1", "language": "en", "fact": "Participated in building REST APIs for an internal tool.", "tags": ["REST APIs"],
      "rewrite": "Led the development of REST APIs for an internal tool.", "label": "overclaim", "category": "leadership", "rules": "must_catch"},

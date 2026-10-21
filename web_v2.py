@@ -719,7 +719,7 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
     def listings(request: Request, title: str = "", location: str = "", limit: int = 50, offset: int = 0,
                  hide_senior: bool = False, region: str = "all", sponsorship: str = "all") -> dict:
         user = workspace(request)
-        tags = list(dict.fromkeys(tag for fact in user.list_facts() if fact["status"] == "confirmed"
+        tags = list(dict.fromkeys(tag for fact in user.list_facts()
                                   for tag in fact["tags"]))
         rows = user.ranking_rows(tags, tag_finder(tags))
         ranked = group_postings(rows, len({tag.casefold() for tag in tags}), title, location, limit, offset,
@@ -946,12 +946,10 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
             raise StoreError('Check this CV against the requirements first.')
         try:
             item = suggestion_target(inputs['gaps']['gaps'], inputs['requirements']['decided'],
-                                     inputs['head']['draft'],
-                                     [(f['id'], f['version']) for f in inputs['facts'].listed() if f['status'] == 'confirmed'],
-                                     requirement_id)
+                                     inputs['head']['draft'], requirement_id)
         except ValueError as exc:
             raise Conflict(str(exc)) from exc
-        if item.get('suggestion') or item.get('ai_checked') or item['status'] in ('added', 'declined'):
+        if item.get('suggestion') or item['status'] in ('added', 'declined'):
             return job_view(user, job_id)
         version = inputs['gaps']['version']
         task = submit(request, 'suggest_gap', {'job_id': job_id, 'requirement_id': requirement_id},
@@ -965,6 +963,10 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
         user = workspace(request)
         changed = change(user)
         view = job_view(user, job_id)
+        cv = view["cv"].get(changed["language"]) or {}
+        if not changed["changed"] and cv.get("head") and not cv.get("stale"):
+            # The same line again, already in the prepared CV: preparing again would only replace it.
+            return JSONResponse(view)
         return then_prepare(request, job_id, changed["language"], view)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/accept")

@@ -19,6 +19,7 @@ from cv import (
     profile_languages,
     render_html,
     tailor_draft,
+    verify_draft,
 )
 from facts import confirm_facts, import_facts, revise_fact
 
@@ -123,16 +124,23 @@ class CVDraftTests(unittest.TestCase):
         )
         self.assertEqual(len(draft["profile_sha256"]), 64)
 
-    def test_unconfirmed_facts_are_refused_and_listed(self):
+    def test_pending_material_can_be_built_tailored_approved_and_exported(self):
+        expanded = "Led 4 engineers across 3 years to deploy AWS services and cut latency by 40%."
         with tempfile.TemporaryDirectory() as directory:
             database = make_store(directory, confirm=False)
-            confirm_facts(database, [("fact-edu-coursework", 1)])
-            with self.assertRaises(CVError) as raised:
-                build_draft(PROFILE, database, "en")
-        message = str(raised.exception)
-        self.assertIn("fact-intern-api@1", message)
-        self.assertIn("fact-skills-languages@1", message)
-        self.assertNotIn("fact-edu-coursework", message)
+            draft = build_draft(PROFILE, database, "en")
+            tailored = tailor_draft(draft, database, chat=FakeChat({"fact-intern-api": expanded}))
+            self.assertEqual(line_for(tailored, "fact-intern-api")["text"], expanded)
+            approved = approve_draft(tailored, database)
+            printer = FakePrinter()
+            result = export_pdf(approved, database, Path(directory) / "final.pdf", printer=printer)
+            self.assertTrue(result["final"])
+            self.assertIn(expanded, printer.html)
+            self.assertNotIn('class="watermark"', printer.html)
+            changed = copy.deepcopy(approved)
+            line_for(changed, "fact-intern-api")["text"] = "Different material after approval."
+            with self.assertRaisesRegex(CVError, "批准后内容已改变"):
+                export_pdf(changed, database, Path(directory) / "changed.pdf", printer=FakePrinter())
 
     def test_chinese_draft_uses_chinese_fields_and_lists_english_fallbacks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -238,18 +246,33 @@ class CVExportTests(unittest.TestCase):
         self.assertEqual(result["pages"], 2)
         self.assertIn('class="watermark"', printer.html)
 
-    def test_export_refuses_drafts_with_changed_facts_or_edited_lines(self):
+    def test_original_imported_text_over_300_characters_remains_exportable(self):
+        original = "Built REST APIs and documented integration behavior for internal service consumers. " * 6
+        self.assertGreater(len(original), 300)
+        with tempfile.TemporaryDirectory() as directory:
+            database = make_store(directory, confirm=False)
+            revised = revise_fact(database, "fact-intern-api", text=original)[0]
+            draft = build_draft(PROFILE, database, "en")
+            current = verify_draft(draft, database)
+            self.assertEqual(current["fact-intern-api"]["version"], revised["version"])
+            approved = approve_draft(draft, database)
+            printer = FakePrinter()
+            result = export_pdf(approved, database, Path(directory) / "long-original.pdf", printer=printer)
+            self.assertTrue(result["final"])
+            self.assertIn(original.strip(), printer.html)
+
+    def test_manual_edits_are_allowed_but_stale_source_versions_are_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             database = make_store(directory)
             edited = build_draft(PROFILE, database, "en")
             edited["sections"][1]["entries"][0]["lines"][0]["text"] = "Led the whole API platform."
-            with self.assertRaisesRegex(CVError, "fact-intern-api"):
-                export_pdf(edited, database, Path(directory) / "edited.pdf", printer=FakePrinter())
+            result = export_pdf(edited, database, Path(directory) / "edited.pdf", printer=FakePrinter())
+            self.assertFalse(result["final"])
             stale = build_draft(PROFILE, database, "en")
             revise_fact(database, "fact-intern-tests", text="Wrote unit tests for payment code.")
             with self.assertRaisesRegex(CVError, "fact-intern-tests"):
                 export_pdf(stale, database, Path(directory) / "stale.pdf", printer=FakePrinter())
-            self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["workbench.db"])
+            self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["edited.pdf", "workbench.db"])
 
 
 FACT_IDS = {item["text"]: item["id"] for item in FACTS}
@@ -307,7 +330,7 @@ def line_for(draft, fact_id):
 
 
 class CVTailorTests(unittest.TestCase):
-    def test_supported_rewrites_are_used_and_unsupported_ones_keep_the_fact(self):
+    def test_expanded_rewrites_are_used_without_source_claim_checks(self):
         chat = FakeChat({
             "fact-intern-api": "For an internal tool, built REST APIs.",
             "fact-intern-tests": "Wrote 40 unit tests for billing code.",
@@ -321,13 +344,22 @@ class CVTailorTests(unittest.TestCase):
         self.assertEqual(accepted["text"], "For an internal tool, built REST APIs.")
         self.assertEqual(accepted["source_text"], "Built REST APIs for an internal tool.")
         self.assertEqual(accepted["tailoring"]["status"], "accepted")
-        self.assertEqual(rejected["text"], "Wrote unit tests for billing code.")
-        self.assertEqual(rejected["tailoring"]["status"], "rejected")
-        self.assertTrue(any("40" in reason for reason in rejected["tailoring"]["reasons"]))
-        self.assertEqual((tailored["tailoring"]["accepted"], tailored["tailoring"]["rejected"]), (3, 1))
+        self.assertEqual(rejected["text"], "Wrote 40 unit tests for billing code.")
+        self.assertEqual(rejected["tailoring"]["status"], "accepted")
+        self.assertEqual((tailored["tailoring"]["accepted"], tailored["tailoring"]["rejected"]), (4, 0))
         # A requirement saved before strengths were kept counts as unclear, never as required.
         self.assertEqual(json.loads(chat.messages[-1]["content"])["job_requirements"],
                          [{"text": "Requirement number 0", "strength": "unclear"}])
+
+    def test_malformed_expanded_lines_are_rejected_for_format_only(self):
+        for invalid in ("", "x" * 301, "first\nsecond", "Built [[project]].", "Unclosed ]]"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                database = make_store(directory, confirm=False)
+                tailored = tailor_draft(build_draft(PROFILE, database), database,
+                                        chat=FakeChat({"fact-intern-api": invalid}))
+                line = line_for(tailored, "fact-intern-api")
+                self.assertEqual(line["tailoring"]["status"], "rejected")
+                self.assertIn("300", line["tailoring"]["reasons"][0])
 
     def test_request_holds_only_lines_and_requirements_never_contact_or_papers(self):
         profile = copy.deepcopy(PROFILE)
@@ -470,8 +502,8 @@ class CVCommandLineTests(unittest.TestCase):
                     "--output", root / "tailored.json",
                 ])
             saved = json.loads((root / "tailored.json").read_text(encoding="utf-8"))
-        self.assertEqual((summary["accepted"], summary["rejected"]), (3, 1))
-        self.assertEqual(summary["rejected_lines"][0]["fact_id"], "fact-intern-tests")
+        self.assertEqual((summary["accepted"], summary["rejected"]), (4, 0))
+        self.assertEqual(summary["rejected_lines"], [])
         self.assertEqual(saved["tailoring"]["model"], "deepseek-flash")
 
     def test_cli_approve_lists_rewrites_then_pdf_is_final(self):

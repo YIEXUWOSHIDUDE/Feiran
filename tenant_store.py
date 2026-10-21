@@ -1751,7 +1751,7 @@ class UserWorkspace:
 
     def _inputs_current(self, connection: sqlite3.Connection, row: sqlite3.Row) -> bool:
         """Whether the profile, every fact and the requirements a CV was made from are still the
-        current (and confirmed) versions."""
+        current versions."""
         try:
             current = self._profile(connection, row['language'])['version'] == row['profile_version']
         except NotFound:
@@ -1762,7 +1762,7 @@ class UserWorkspace:
         for ref in connection.execute('SELECT fact_id, fact_version FROM material_facts WHERE user_id = ? AND material_id = ?',
                                       (self.user_id, row['material_id'])):
             fact = self._fact(connection, ref['fact_id'])
-            current = current and fact['version'] == ref['fact_version'] and fact['status'] == 'confirmed'
+            current = current and fact['version'] == ref['fact_version']
         return current
 
     def _material(self, connection, material_id):
@@ -1876,7 +1876,7 @@ class UserWorkspace:
                            requirements_version: int | None) -> bool:
         """Whether CVs made from these inputs are still current: the language's profile and the
         job's requirements are the versions the task read, and every fact the CVs show is still
-        that version, confirmed."""
+        that version."""
         try:
             if self._profile(connection, language)['version'] != profile_version:
                 return False
@@ -1890,7 +1890,7 @@ class UserWorkspace:
                 fact = self._fact(connection, fact_id)
             except NotFound:
                 return False
-            if fact['version'] != version or fact['status'] != 'confirmed':
+            if fact['version'] != version:
                 return False
         return True
 
@@ -2100,10 +2100,12 @@ class UserWorkspace:
                     'gaps': self._gaps(connection, job_id)}
 
     def publish_gaps(self, *, task_id: str, token: str, job_id: str, base_version: int, gaps: dict,
-                     checked_head: str | None, requirements_version: int | None) -> dict:
+                     checked_head: str | None, requirements_version: int | None,
+                     facts_read: list | None = None) -> dict:
         """Keep a new gap check unless another was saved after this one started, or the CV
-        (``checked_head``), the requirements or the confirmed facts it judged changed meanwhile;
-        then nothing is kept and the task is superseded."""
+        (``checked_head``), the requirements or the current material it used changed meanwhile;
+        then nothing is kept and the task is superseded. A suggestion added to an earlier check,
+        which may predate a line adopted since, names the facts it read in ``facts_read``."""
         with self._transaction(write=True) as connection:
             _running_task(connection, self.user_id, task_id, token)
             current = self._gaps(connection, job_id)
@@ -2113,11 +2115,10 @@ class UserWorkspace:
                 return {'superseded': True}
             head = self._head(connection, job_id, _language(gaps.get('language')))
             requirements = self._requirements(connection, job_id)
-            confirmed = sorted([fact['id'], fact['version']] for fact in self._list_facts(connection)
-                               if fact['status'] == 'confirmed')
+            confirmed = sorted([fact['id'], fact['version']] for fact in self._list_facts(connection))
             if ((head['material_id'] if head else None) != checked_head
                     or (requirements['version'] if requirements else None) != requirements_version
-                    or confirmed != gaps.get('checked_facts')):
+                    or confirmed != (gaps.get('checked_facts') if facts_read is None else facts_read)):
                 _end_task(connection, self.user_id, task_id, 'superseded', error_code='inputs_changed',
                           message="The CV, its facts or the requirements changed while they were checked")
                 return {'superseded': True}
@@ -2139,14 +2140,17 @@ class UserWorkspace:
                 updated, profile = change(connection, gaps, language)
             except (ValueError, CVError, FactStoreError) as exc:
                 raise StoreError(str(exc)) from exc
+            if updated == gaps and profile is None:
+                # The same line again (a second click, a tab left open): saved already.
+                return {'gaps_version': current['version'], 'language': language, 'changed': False}
             if profile is not None:
                 self._save_profile(connection, language, profile, self._profile(connection, language)['version'])
             connection.execute('INSERT INTO job_gaps VALUES (?, ?, ?, ?, ?)',
                                (self.user_id, job_id, current['version'] + 1, _json(updated), _now()))
-            return {'gaps_version': current['version'] + 1, 'language': language}
+            return {'gaps_version': current['version'] + 1, 'language': language, 'changed': True}
 
     def accept_gap(self, job_id: str, requirement_id: str) -> dict:
-        """The user says a suggested line is true: it becomes a confirmed fact, the CV layout
+        """The user adopts a suggested line: it is saved with legacy status, the CV layout
         lists it and the gap is marked added, all in one transaction (see gaps.accept_gap)."""
         def change(connection, gaps, language):
             profile = self._profile(connection, language)['profile']
@@ -2172,7 +2176,7 @@ class UserWorkspace:
     def job_snapshot(self, job_id: str) -> dict[str, Any]:
         """The job, its requirements, notes, the current CV per language (with the draft it grew
         from, whether its inputs are current and its approval and final PDF, if still valid),
-        the latest gap check, confirmed facts, the stored sponsor answer for the job's words
+        the latest gap check, current saved material, the stored sponsor answer for the job's words
         (None when not assessed: nothing is assessed while reading) and this job's recent tasks,
         from one transaction, so they agree with each other."""
         with self._transaction() as connection:
@@ -2204,8 +2208,7 @@ class UserWorkspace:
                 'job': job, 'requirements': self._requirements(connection, job_id),
                 'notes': {name: self._note(connection, job_id, name) for name in NOTE_NAMES},
                 'cv': cvs, 'cv_languages': self._languages(connection), 'gaps': self._gaps(connection, job_id),
-                'confirmed': [(fact['id'], fact['version']) for fact in self._list_facts(connection)
-                              if fact['status'] == 'confirmed'],
+                'confirmed': [(fact['id'], fact['version']) for fact in self._list_facts(connection)],
                 'tasks': [_task_view(row, connection) for row in connection.execute(
                     '''SELECT * FROM tasks WHERE user_id = ? AND job_id = ? AND dismissed = 0
                        ORDER BY created_at DESC LIMIT 10''', (self.user_id, job_id)).fetchall()],
@@ -2297,10 +2300,10 @@ class UserWorkspace:
 
     def ranking_rows(self, terms: list[str], find: Callable[[str], list[str]]) -> list[dict[str, Any]]:
         """Public postings of the boards this user follows, each with its stored text (for the
-        listing filters to read), the user's confirmed skill words it mentions and the stored
+        listing filters to read), the user's saved skill words it mentions and the stored
         sponsor answer for its words (read only: one not yet assessed shows as such). Matches are
         this user's own cache: redone for a posting whose text changed or when the user's
-        confirmed skills change; never shared with another user."""
+        saved skills change; never shared with another user."""
         key = hashlib.sha256(json.dumps(terms, ensure_ascii=False).encode("utf-8")).hexdigest()
         with self._transaction() as connection:
             rows = connection.execute('''SELECT p.provider, p.board, p.job_id, p.title, p.location, p.source,

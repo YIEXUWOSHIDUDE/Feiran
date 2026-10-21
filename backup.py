@@ -248,7 +248,7 @@ def verify_data(data: Path) -> dict[str, Any]:
             try:
                 verify_draft(step, facts_db)
             except (CVError, FactStoreError, sqlite3.DatabaseError):
-                problems.append(f"{where}: the approved CV no longer rests on the confirmed facts")
+                problems.append(f"{where}: the approved CV no longer matches the current saved material")
     return {"counts": counts, "problems": problems, "notes": notes}
 
 

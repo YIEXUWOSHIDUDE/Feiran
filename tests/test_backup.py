@@ -172,7 +172,7 @@ class BackupTests(unittest.TestCase):
         confirm_facts(self.data / "workbench.db", [("fact-intern-api", 2)])
         report = verify_data(self.data)
         self.assertEqual(report["problems"],
-                         [f"jobs/{self.job}/cv-approved-en.json: the approved CV no longer rests on the confirmed facts"])
+                         [f"jobs/{self.job}/cv-approved-en.json: the approved CV no longer matches the current saved material"])
         self.assertNotIn("fact-intern-api", json.dumps(report))  # a fact ID can hold an employer's name
 
     def test_verifying_finds_a_damaged_database(self):

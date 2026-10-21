@@ -1,4 +1,9 @@
-"""Deterministic checks that a rewritten CV line claims nothing beyond its source fact."""
+"""Legacy offline source-comparison utility; not a product acceptance gate.
+
+The application no longer uses ``check_rewrite`` to accept or reject candidate content.
+It is kept for historical diagnostic comparisons. ``LINK`` is still imported by the
+suggestion path for contact/link handling and must remain available.
+"""
 
 import re
 from typing import Iterable

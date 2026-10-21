@@ -1,4 +1,4 @@
-"""The B6 evaluation: the offline claim-check gate, and the paid runner's limits with a fake model."""
+"""The candidate-format evaluation and the paid runner's limits with a fake model."""
 
 import contextlib
 import io
@@ -10,28 +10,39 @@ from gaps import EVIDENCE_RULES
 
 
 class OfflineGateTests(unittest.TestCase):
-    def test_the_claim_checks_meet_every_label_they_are_built_for(self) -> None:
-        report = eval_v2.offline(eval_v2.load())
+    def test_expanded_candidates_pass_without_truthfulness_comparison(self) -> None:
+        samples = eval_v2.load()
+        report = eval_v2.offline(samples)
         self.assertEqual(report["regressions"], [])
-        self.assertEqual(report["cases"], len(eval_v2.load()["rewrites"]))
+        self.assertEqual(report["unusable"], [])
+        self.assertEqual(report["cases"], len(samples["rewrites"]))
+        # This exercises the historical cases that introduced skills, numbers,
+        # leadership, changed qualifiers and other additions beyond source material.
+        self.assertTrue(any(case["label"] == "overclaim" for case in samples["rewrites"]))
+        self.assertEqual(report["evaluation"], "candidate-line-format")
 
-    def test_samples_are_labelled_consistently(self) -> None:
+    def test_malformed_candidate_lines_are_rejected(self) -> None:
+        invalid = ["", "   ", "first\nsecond", "first\rsecond", "x" * 301, "Built [[project]] using [[tool]].", None, 123]
+        samples = {"version": "format-cases", "rewrites": [
+            {"id": str(number), "rewrite": line, "category": "format", "expected_usable": False}
+            for number, line in enumerate(invalid)
+        ]}
+        report = eval_v2.offline(samples)
+        self.assertEqual(report["regressions"], [])
+        self.assertEqual(report["unusable"], [str(number) for number in range(len(invalid))])
+
+    def test_invalid_content_is_a_regression_when_a_usable_candidate_is_expected(self) -> None:
+        report = eval_v2.offline({"version": "bad-output", "rewrites": [
+            {"id": "empty", "rewrite": "", "category": "format"}
+        ]})
+        self.assertEqual(report["regressions"], ["empty"])
+
+    def test_sample_ids_are_unique_and_evidence_labels_are_known(self) -> None:
         samples = eval_v2.load()
         ids = [case["id"] for part in ("rewrites", "evidence") for case in samples[part]]
         self.assertEqual(len(ids), len(set(ids)))
-        for case in samples["rewrites"]:
-            self.assertIn(case["label"], ("overclaim", "supported"))
-            self.assertIn(case["rules"], ("must_catch", "known_gap"))
-            if case["rules"] == "known_gap":
-                self.assertEqual(case["label"], "overclaim", case["id"])
         for case in samples["evidence"]:
             self.assertIn(case["expected"], ("supported", "related", "none"))
-
-    def test_known_gaps_are_reported_as_missed_not_passed(self) -> None:
-        report = eval_v2.offline(eval_v2.load())
-        gaps = {case["id"] for case in eval_v2.load()["rewrites"] if case["rules"] == "known_gap"}
-        self.assertEqual(set(report["known_gaps_missed"]) | set(report["known_gaps_caught"]), gaps)
-        self.assertFalse(gaps & set(report["regressions"]))
 
 
 class FakeModel:

@@ -100,6 +100,8 @@ assert(find(waiting, n => n.attributes?.class?.includes("sponsor-not_assessed"))
 const strange = run('sponsorshipSummary({status:"probably", evidence:[]})');
 assert(find(strange, n => n.attributes?.class?.includes("sponsor-not_assessed")));
 assert(!strange.textContent.includes("Not stated"));
+assert.match(run('sponsorshipSummary({status:"unknown", evidence:[]})').textContent, /No sponsorship wording in JD/);
+assert.match(run('sponsorshipSummary({status:"unknown", evidence:[{text:"Discuss visa arrangements"}]})').textContent, /Policy unclear in JD/);
 const checked = run('sponsorshipSummary({status:"supported", evidence:[{text:"Visa sponsorship available"}], assessed_at:"2026-10-18T12:00:00Z", rule_version:1})');
 assert(checked.textContent.includes("Wording checked"));
 assert(checked.textContent.includes("sponsor rules version 1"));
@@ -232,11 +234,31 @@ assert.equal(post.path, "/api/jobs/saved-job/requirements/find");
 assert.equal(JSON.parse(post.body).expected_version, 0);
 run('__view.review.confirmed_fact_count = 0');
 await run('renderJob("saved-job")');
+assert(button(app, "Prepare a CV for this job")); // legacy pending lines are usable
+run('__view.review.pending_fact_count = 0');
+await run('renderJob("saved-job")');
 assert(!button(app, "Prepare a CV for this job"));
 assert(find(app, n => n.tagName === "a" && n.attributes.href === "#facts"));
 run('__view.review.confirmed_fact_count = 1; __view.cv_languages = []');
 await run('renderJob("saved-job")');
 assert(!button(app, "Prepare a CV for this job"));
+''')
+
+    def test_filters_reuse_company_metadata_and_refresh_invalidates_it(self):
+        self.check_js(r'''
+run(`api = async (path, options = {}) => {
+ __calls.push({path, ...options});
+ if (path === "/api/sources") return {sources:[{provider:"greenhouse",board:"acme",company:"Acme",open_count:0,stale:false}]};
+ if (path.startsWith("/api/listings")) return {listings:[],total:0,skill_count:1};
+ return {};
+};`);
+await run('renderFind()');
+assert.equal(sandbox.__calls.filter(c => c.path === "/api/sources").length, 1);
+await button(app, "Filter").fire("click");
+assert.equal(sandbox.__calls.filter(c => c.path === "/api/sources").length, 1);
+await button(app, "Refresh all").fire("click");
+assert.equal(sandbox.__calls.filter(c => c.path === "/api/sources").length, 2);
+assert.equal(sandbox.__calls.filter(c => c.method === "POST").length, 1);
 ''')
 
     def test_existing_cv_does_not_trigger_automatic_paid_gap_check(self):
@@ -253,6 +275,21 @@ assert(button(app, "Check now"));
 await button(app, "Check now").fire("click");
 assert.equal(sandbox.__calls.filter(c => c.method === "POST" && c.path.endsWith("/gaps")).length, 1);
 ''')
+
+    def test_local_existing_cv_does_not_trigger_automatic_paid_gap_check(self):
+        self.check_js(r'''
+run(`__view = {job_id:"saved-job",jd:{title:"Engineer",text:"Python"},language:"en",
+ requirements_version:1,cv:{en:{head:"draft"}},selected_requirements:[{text:"Python"}],tasks:[]};
+ api = async (path, options = {}) => { __calls.push({path, ...options}); return __view; };
+ requirementsPanel = () => el("section",{},"requirements");
+ cvPanel = () => el("section",{},"cv");`);
+await run('renderJob("saved-job")');
+assert.equal(sandbox.__calls.length, 1);
+assert(app.textContent.includes("Not checked yet."));
+assert(button(app, "Check now"));
+await button(app, "Check now").fire("click");
+assert.equal(sandbox.__calls.filter(c => c.method === "POST" && c.path.endsWith("/gaps")).length, 1);
+''', mode="local")
 
     def test_paste_and_url_review_only_is_v2_specific(self):
         for mode in ("v2", "local"):
