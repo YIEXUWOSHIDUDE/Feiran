@@ -28,6 +28,25 @@ assert.equal(sandbox.__calls[0].path,"/api/jobs/j/gaps/r/write");
 assert.equal(JSON.parse(sandbox.__calls[0].body).text,"SQL, SQLite");
 ''')
 
+    def test_a_suggestion_ai_entry_generated_stays_shown_after_a_reload(self):
+        # Cloud V2 acceptance: after a reload the saved suggestion looked lost, the row offering
+        # only AI suggested entry and Write your own line again, as if nothing had been generated.
+        self.check_js(r'''
+run(`api = async (path, options = {}) => { __calls.push({path, ...options}); return {}; };
+__view = {job_id:"j", gaps:{places:[{id:"entry:a",kind:"bullet",where:"Other project"},{id:"entry:k",kind:"bullet",where:"Test project"}]}};
+__text = "Diagnosed ambiguous service failures by testing two hypotheses and shipping the fix.";
+__item = {requirement_id:"r",text:"Ambiguous challenges",status:"none",evidence:[],suggestion_status:"open",ai_checked:true,
+ suggestion:{kind:"bullet",entry_key:"k",where:"Test project",text:__text}};`);
+const row = run('coverageRow(__view,"en",__item,async()=>{},()=>{})');
+assert(row.textContent.includes(sandbox.__text));
+assert.equal(find(row, n => n.tagName === "select").value, "entry:k");
+assert.equal(find(row, n => n.tagName === "textarea").value, sandbox.__text);
+assert(button(row, "Adopt and add to my CV"));
+assert(row.textContent.indexOf("AI suggested entry") < row.textContent.indexOf("Write your own line"));
+await button(row, "AI suggested entry").fire("click");
+assert.equal(sandbox.__calls.length, 0);
+''')
+
     def test_v1_shows_a_complete_suggestion_and_adopts_exactly_what_it_shows(self):
         self.check_js(r'''
 run(`api = async (path, options = {}) => { __calls.push({path, ...options}); return {}; };

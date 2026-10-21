@@ -1041,12 +1041,16 @@ function aiEntry(view, item, refresh) {
     view = latest;
     result(view, item);
   });
+  // One this button generated (ai_checked) is shown at once, as it was before a reload or
+  // reopen, so a saved suggestion never looks lost behind the button. Nothing is requested.
+  if (item.ai_checked && completeSuggestion(item.suggestion)) result(view, item);
   return el("div", { class: "ai-entry" }, button, content);
 }
 
 // What a row offers for a requirement a check found missing or only related, before Write your
 // own line: its complete suggestion (V1 shows it with Adopt and Skip, V2 behind AI suggested
-// entry) or AI suggested entry to ask for one; once adopted or skipped, only that.
+// entry unless that entry generated it) or AI suggested entry to ask for one; once adopted or
+// skipped, only that.
 function suggestionArea(view, item, refresh, post) {
   if (MODE !== "v2" && (completeSuggestion(item.suggestion) || ["added", "declined"].includes(item.suggestion_status))) {
     return suggestionBlock(item, post);
