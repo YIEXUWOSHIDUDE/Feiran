@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fastapi.testclient import TestClient  # noqa: E402
 from pypdf import PdfReader  # noqa: E402
 
-from cv import build_draft, export_pdf, is_final_approval  # noqa: E402
+from cv import TAILOR_RULES, build_draft, export_pdf, is_final_approval  # noqa: E402
 from cv_import import STRUCTURE_RULES  # noqa: E402
 from cv_plan import PLAN_RULES  # noqa: E402
 from facts import confirm_facts, import_facts  # noqa: E402
@@ -73,7 +73,7 @@ class ScriptedDeepSeek:
         elif system == FIND_RULES:
             content = {"requirements": [{"line": line["n"], "kind": "required"}
                                         for line in request["lines"] if line["text"].startswith("- ")]}
-        elif system.startswith("You rewrite resume lines"):
+        elif system == TAILOR_RULES.format(language=request.get("target_language")):
             content = {"lines": [{"fact_id": line["fact_id"], "text": line["text"]} for line in request["lines"]]}
         elif system == PLAN_RULES:
             content = {"sections": [section["section"] for section in request["resume"]], "entries": [], "reasons": []}
