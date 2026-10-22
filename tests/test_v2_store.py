@@ -20,7 +20,10 @@ from tenant_store import (Conflict, FactSnapshot, LateResult, NotFound, Refused,
                           set_user_active, sign_in, store_public_board, take_login_attempt)
 from tests.test_cv import FACTS, PROFILE, FakeChat
 from tests.test_cv_plan import CUT_API, FakePlanner
+from gaps import check_state, find_gaps, places
+from task_runner import TaskContext
 from tests.test_gaps import FakeDeepSeek, decided_job, suggestions
+from v2_flow import make_handlers
 
 ISSUER = "https://cognito-idp.example.amazonaws.com/pool"
 PDF = b"%PDF-1.7\nsynthetic\n%%EOF"
@@ -456,12 +459,12 @@ class MaterialTests(StoreCase):
                     current = self.a.requirements(job)
                     self.a.save_requirements(job, current["candidates"], current["decided"],
                                              expected_version=current["version"])
-                outcome = self.a.publish_gaps(task_id=task_id, token=token, job_id=job, base_version=0, gaps=gaps,
-                                              checked_head=inputs["head"]["material_id"],
+                outcome = self.a.publish_gaps(task_id=task_id, token=token, job_id=job, language="en", base_version=0,
+                                              gaps=gaps, checked_head=inputs["head"]["material_id"],
                                               requirements_version=inputs["requirements"]["version"])
                 self.assertEqual(outcome, {"superseded": True})
                 self.assertEqual(self.a.get_task(task_id)["error_code"], "inputs_changed")
-                self.assertIsNone(self.a.job_snapshot(job)["gaps"])
+                self.assertEqual(self.a.job_snapshot(job)["gaps"], {"en": None, "zh": None})
 
     def test_requirement_change_makes_the_cv_outdated(self):
         job = self.ready(self.a)
@@ -503,8 +506,93 @@ class MaterialTests(StoreCase):
         self.assertEqual(self.b.job_summaries(), [])
 
 
+class LocalCVTests(StoreCase):
+    def local_job(self):
+        job = self.ready(self.a)
+        self.prepare(self.a, job, plan=False)
+        return job
+
+    def head(self, job):
+        return self.a.cv_inputs(job, "en")["head"]
+
+    def test_edit_undo_redo_are_local_and_each_changed_version_needs_approval(self):
+        from cv_edit import shown_text
+        job = self.local_job()
+        other = self.a.create_job(decided_job()["jd"], request_id="other")["job_id"]
+        self.a.save_requirements(other, decided_job(), decided_job(), expected_version=0)
+        self.prepare(self.a, other, plan=False, key="other-cv")
+        other_head = self.head(other)
+        before = self.head(job)
+        facts, profile = self.a.list_facts(), self.a.get_profile("en")
+        block = "fact-intern-api"
+        old = shown_text(before["draft"], block)
+        self.a.approve(job, "en", before["content_sha256"])
+        changed = self.a.edit_cv_line(job, "en", block, "Led API delivery with AWS.", expected_text=old, request_id="edit-1")
+        self.assertFalse(self.a.preview(job, "en")[1])
+        with self.assertRaises(Conflict):
+            self.a.approve(job, "en", before["content_sha256"])
+        self.assertEqual(self.a.edit_cv_line(job, "en", block, "Led API delivery with AWS.",
+                                           expected_text=old, request_id="edit-1"), changed)
+        with self.assertRaises(Conflict):
+            self.a.edit_cv_line(job, "en", block, "Different retry", expected_text=old, request_id="edit-1")
+        with self.assertRaises(Conflict):
+            self.a.edit_cv_line(job, "en", block, "Unseen overwrite", expected_text=old)
+        with self.assertRaises(NotFound):
+            self.b.edit_cv_line(job, "en", block, "Cross user", expected_text=old)
+        edit = self.head(job)["draft"]["edits"][-1]
+        self.a.set_cv_edit(job, "en", edit["id"], True, request_id="undo")
+        self.assertEqual(shown_text(self.head(job)["draft"], block), old)
+        self.a.set_cv_edit(job, "en", edit["id"], False, request_id="redo")
+        self.assertEqual(shown_text(self.head(job)["draft"], block), "Led API delivery with AWS.")
+        self.a.approve(job, "en", self.head(job)["content_sha256"])
+        self.assertTrue(self.a.preview(job, "en")[1])
+        self.assertEqual((self.a.list_facts(), self.a.get_profile("en"), self.head(other)), (facts, profile, other_head))
+
+    def test_explicit_save_checks_visible_words_is_atomic_and_retry_does_not_add_versions(self):
+        from cv_edit import shown_text
+        job = self.local_job()
+        block = "fact-intern-api"
+        old = shown_text(self.head(job)["draft"], block)
+        text = "Delivered API services on AWS."
+        self.a.edit_cv_line(job, "en", block, text, expected_text=old)
+        before = (self.a.list_facts(), self.a.get_profile("en"), self.head(job))
+        with self.assertRaises(Conflict):
+            self.a.save_cv_line(job, "en", block, expected_text=old)
+        with patch.object(UserWorkspace, "_insert_material", side_effect=sqlite3.OperationalError("disk full")):
+            with self.assertRaisesRegex(StoreError, "storage operation failed"):
+                self.a.save_cv_line(job, "en", block, expected_text=text, request_id="save")
+        self.assertEqual((self.a.list_facts(), self.a.get_profile("en"), self.head(job)), before)
+        saved = self.a.save_cv_line(job, "en", block, expected_text=text, request_id="save")
+        self.assertEqual(self.a.get_fact(block)["status"], "pending")
+        self.assertEqual(self.a.get_fact(block)["version"], 2)
+        self.assertTrue(self.a.job_snapshot(job)["cv"]["en"]["material"]["inputs_current"])
+        self.assertEqual(self.a.save_cv_line(job, "en", block, expected_text=text, request_id="save"), saved)
+        self.assertFalse(self.a.save_cv_line(job, "en", block, expected_text=text, request_id="save-again")["changed"])
+        self.assertEqual(self.a.get_fact(block)["version"], 2)
+        self.assertEqual(self.head(job)["material_id"], saved["material_id"])
+        with self.assertRaises(NotFound):
+            self.b.save_cv_line(job, "en", block, expected_text=text)
+
+    def test_new_local_line_save_adds_one_pending_entry_and_keeps_current_cv(self):
+        from cv_edit import add_line
+        from tests.test_cv_edit import experience_key
+        job = self.local_job()
+        self.a._edit_cv(job, "en", "add", ["synthetic-add"], lambda c, h, d, key:
+            (*add_line(d, experience_key(d), "Led a Kubernetes rollout.", request=key), None))
+        edit = self.head(job)["draft"]["edits"][-1]
+        before = len(self.a.list_facts())
+        self.a.save_cv_line(job, "en", edit["block"], expected_text=edit["text"], request_id="save")
+        self.assertEqual(len(self.a.list_facts()), before + 1)
+        self.assertEqual(self.a.get_fact(edit["block"])["status"], "pending")
+        self.assertIn(edit["block"], json.dumps(self.a.get_profile("en")["profile"]))
+        self.assertEqual(self.a.get_profile("en")["version"], 2)
+        self.assertTrue(self.a.job_snapshot(job)["cv"]["en"]["material"]["inputs_current"])
+        self.assertFalse(self.a.save_cv_line(job, "en", edit["block"], expected_text=edit["text"])["changed"])
+        self.assertEqual(len(self.a.list_facts()), before + 1)
+
+
 class GapStoreTests(StoreCase):
-    def test_accepting_a_gap_confirms_the_line_and_updates_profile_and_gaps_together(self):
+    def test_accepting_a_gap_changes_only_this_cv_and_repeating_adds_nothing(self):
         job = self.ready(self.a)
         self.prepare(self.a, job, plan=False)
         inputs = self.a.gaps_inputs(job, "en")
@@ -512,32 +600,31 @@ class GapStoreTests(StoreCase):
         gaps = find_gaps(inputs["requirements"]["decided"], inputs["head"]["draft"], inputs["facts"],
                          FakeDeepSeek(suggestions), private=inputs["private"])
         task_id, token = run_task(self.database, self.a_id, "check_gaps", key="g", job_id=job)
-        self.assertEqual(self.a.publish_gaps(task_id=task_id, token=token, job_id=job, base_version=0, gaps=gaps,
-                                             checked_head=inputs["head"]["material_id"],
+        self.assertEqual(self.a.publish_gaps(task_id=task_id, token=token, job_id=job, language="en", base_version=0,
+                                             gaps=gaps, checked_head=inputs["head"]["material_id"],
                                              requirements_version=inputs["requirements"]["version"]),
                          {"gaps_version": 1})
         integration = next(item["requirement_id"] for item in gaps["requirements"]
                            if item["text"] == "Writing integration tests for services")
         with self.assertRaises(NotFound):
-            self.b.accept_gap(job, integration)
-        before = len(self.a.list_facts())
-        self.a.accept_gap(job, integration)
+            self.b.accept_gap(job, integration, language="en", shown_version=1)
+        before = self.a.list_facts()
+        self.a.accept_gap(job, integration, language="en", shown_version=1)
         facts = self.a.list_facts()
-        added = [fact for fact in facts if fact["text"] == "Wrote integration tests for internal services."]
-        self.assertEqual(len(facts), before + 1)
-        self.assertEqual(added[0]["status"], "confirmed")
-        self.assertEqual(self.a.get_profile("en")["version"], 2)
-        self.assertIn(added[0]["id"], json.dumps(self.a.get_profile("en")["profile"]))
-        self.assertEqual(self.a.job_snapshot(job)["gaps"]["version"], 2)
-        self.a.accept_gap(job, integration)  # again: nothing is added twice
-        self.assertEqual(len(self.a.list_facts()), before + 1)
+        self.assertEqual(facts, before)
+        self.assertEqual(self.a.get_profile("en")["version"], 1)
+        head = self.a.job_snapshot(job)["cv"]["en"]["material"]
+        self.assertIn("Wrote integration tests for internal services.", json.dumps(head["draft"]))
+        self.assertEqual(self.a.job_snapshot(job)["gaps"]["en"]["version"], 1)
+        self.a.accept_gap(job, integration, language="en", shown_version=1)
+        self.assertEqual(self.a.job_snapshot(job)["cv"]["en"]["material"]["material_id"], head["material_id"])
         docker = next(item["requirement_id"] for item in gaps["requirements"] if "Docker" in item["text"])
-        self.a.decline_gap(job, docker)
+        self.a.decline_gap(job, docker, language="en", shown_version=1)
         with self.assertRaises(StoreError):
-            self.a.accept_gap(job, docker)
-        self.assertFalse(self.a.job_snapshot(job)["cv"]["en"]["material"]["inputs_current"])
+            self.a.accept_gap(job, docker, language="en", shown_version=2)
+        self.assertTrue(self.a.job_snapshot(job)["cv"]["en"]["material"]["inputs_current"])
 
-    def test_a_refused_acceptance_writes_nothing(self):
+    def test_local_adoption_allows_profile_changes_but_saving_refuses_a_stale_fact(self):
         job = self.ready(self.a)
         self.prepare(self.a, job, plan=False)
         inputs = self.a.gaps_inputs(job, "en")
@@ -545,15 +632,231 @@ class GapStoreTests(StoreCase):
         gaps = find_gaps(inputs["requirements"]["decided"], inputs["head"]["draft"], inputs["facts"],
                          FakeDeepSeek(suggestions))
         task_id, token = run_task(self.database, self.a_id, "check_gaps", key="g", job_id=job)
-        self.a.publish_gaps(task_id=task_id, token=token, job_id=job, base_version=0, gaps=gaps,
+        self.a.publish_gaps(task_id=task_id, token=token, job_id=job, language="en", base_version=0, gaps=gaps,
                             checked_head=inputs["head"]["material_id"],
                             requirements_version=inputs["requirements"]["version"])
         skills = next(item["requirement_id"] for item in gaps["requirements"] if "Docker" in item["text"])
         self.a.revise_fact("fact-skills-languages", expected_version=1, text="Languages: Python", tags=["Python"])
-        with self.assertRaises(StoreError):
-            self.a.accept_gap(job, skills)  # the skills line changed since the check
+        # A shared profile change does not forbid local writing, but does keep this CV stale.
+        self.a.accept_gap(job, skills, language="en", shown_version=1)
         self.assertEqual(self.a.get_fact("fact-skills-languages")["status"], "pending")
-        self.assertEqual(self.a.job_snapshot(job)["gaps"]["version"], 1)
+        head = self.a.job_snapshot(job)["cv"]["en"]["material"]
+        self.assertFalse(head["inputs_current"])
+        before = self.a.list_facts()
+        from cv_edit import shown_text
+        with self.assertRaises(Conflict):
+            self.a.save_cv_line(job, "en", "fact-skills-languages",
+                                expected_text=shown_text(head["draft"], "fact-skills-languages"))
+        self.assertEqual(self.a.list_facts(), before)
+        self.assertEqual(self.a.job_snapshot(job)["gaps"]["en"]["version"], 1)
+
+
+
+def no_evidence(request):
+    """An evidence answer for whatever requirements are asked: none is shown."""
+    return [{"id": item["id"], "verdict": "none"} for item in request["requirements"]]
+
+
+class GapCheckTests(StoreCase):
+    """A check stands only for the requirements it judged and the CV language it was made for
+    (docs/architecture-handoff.md, round 1 A and B), through the real check task (v2_flow) and
+    store, with an offline model stand-in."""
+
+    def setUp(self):
+        super().setUp()
+        self.handlers = make_handlers()
+        self.model = FakeDeepSeek(suggestions, evidence=no_evidence)
+        self.runs = 0
+
+    def run_check(self, user, job, language="en"):
+        """The check_gaps task as the runner runs it, from what the page's request queues."""
+        last = user.gaps_inputs(job, language)["gaps"]
+        request = {"job_id": job, "language": language, "base_gaps_version": last["version"] if last else 0}
+        self.runs += 1
+        task, token = run_task(self.database, user.user_id, "check_gaps", key=f"check-{self.runs}", request=request,
+                               job_id=job)
+        self.handlers["check_gaps"](TaskContext(self.database, user, task, token, "check_gaps", request, job,
+                                                model=self.model))
+        return user.get_task(task)
+
+    def state(self, user, job, language="en"):
+        snapshot = user.job_snapshot(job)
+        record, requirements = snapshot["gaps"][language], snapshot["requirements"]
+        return check_state(record["gaps"], snapshot["cv"][language]["material"]["draft"], snapshot["confirmed"],
+                           requirements["decided"], requirements["version"])
+
+    def without_first_requirement(self, user, job):
+        current = user.requirements(job)
+        changed = copy.deepcopy(current["decided"])
+        removed = changed["selected_requirements"].pop(0)
+        for candidate in changed["requirement_candidates"]:
+            if candidate["id"] == removed["id"]:
+                candidate["status"] = "excluded"
+        user.save_requirements(job, current["candidates"], changed, expected_version=current["version"])
+        return removed
+
+    def bilingual(self, user):
+        job = self.ready(user)
+        user.save_profile("zh", copy.deepcopy(user.get_profile("en")["profile"]), expected_version=0)
+        for language in ("en", "zh"):
+            self.prepare(user, job, language=language, plan=False, key=f"prepare-{language}")
+        return job
+
+    def rows(self, user, job, language="en"):
+        return {row["text"]: row for row in user.job_snapshot(job)["gaps"][language]["gaps"]["requirements"]}
+
+    def test_requirements_change_invalidates_old_check_even_when_words_stay(self):
+        job = self.ready(self.a)
+        self.prepare(self.a, job, plan=False)
+        self.assertEqual(self.run_check(self.a, job)["status"], "succeeded")
+        old = self.a.job_snapshot(job)["gaps"]["en"]
+        self.assertEqual(old["gaps"]["inputs"], {"requirements_version": 1,
+                                                 "material_id": self.a.job_snapshot(job)["cv"]["en"]["material"]["material_id"]})
+        self.assertEqual(self.state(self.a, job), "current")
+        removed = self.without_first_requirement(self.a, job)
+        self.prepare(self.a, job, plan=False, key="prepare-new-requirements")  # the same words, for the new requirements
+        snapshot = self.a.job_snapshot(job)
+        self.assertTrue(snapshot["cv"]["en"]["material"]["inputs_current"])
+        self.assertEqual(self.state(self.a, job), "requirements_changed")
+        # Nothing is adopted, skipped or written from it; the check itself stays, as history.
+        kept = next(text for text in self.rows(self.a, job) if text != removed["text"])
+        rid = self.rows(self.a, job)[kept]["requirement_id"]
+        place = next(item["id"] for item in places(snapshot["cv"]["en"]["material"]["draft"]) if item["kind"] == "bullet")
+        before = (self.a.list_facts(), self.a.get_profile("en"))
+        for act in (lambda: self.a.accept_gap(job, rid, language="en", shown_version=old["version"]),
+                    lambda: self.a.decline_gap(job, rid, language="en", shown_version=old["version"]),
+                    lambda: self.a.write_gap_line(job, rid, place, "Wrote integration tests for services.",
+                                                  language="en", shown_version=old["version"])):
+            with self.assertRaisesRegex(Conflict, "requirements changed"):
+                act()
+        self.assertEqual((self.a.list_facts(), self.a.get_profile("en")), before)
+        self.assertEqual(self.a.job_snapshot(job)["gaps"]["en"], old)
+        # Checking again judges the requirements of now, and that check stands.
+        self.assertEqual(self.run_check(self.a, job)["status"], "succeeded")
+        self.assertEqual(self.state(self.a, job), "current")
+        self.assertNotIn(removed["text"], self.rows(self.a, job))
+        self.assertEqual(self.a.job_snapshot(job)["gaps"]["en"]["gaps"]["inputs"]["requirements_version"], 2)
+        with raw(self.database) as connection:
+            self.assertEqual(connection.execute("SELECT version FROM job_gaps ORDER BY version").fetchall(), [(1,), (2,)])
+
+    def test_requirements_saved_again_in_the_same_words_are_another_version(self):
+        job = self.ready(self.a)
+        self.prepare(self.a, job, plan=False)
+        self.run_check(self.a, job)
+        current = self.a.requirements(job)
+        self.a.save_requirements(job, current["candidates"], current["decided"], expected_version=current["version"])
+        self.assertEqual(self.state(self.a, job), "requirements_changed")
+
+    def test_each_language_reads_its_own_latest_check(self):
+        job = self.bilingual(self.a)
+        for language in ("en", "zh"):
+            self.assertEqual(self.run_check(self.a, job, language)["status"], "succeeded")
+        en, zh = (self.a.gaps_inputs(job, language)["gaps"] for language in ("en", "zh"))
+        # One version sequence per job (the table's key), each language finding its own newest.
+        self.assertEqual((en["gaps"]["language"], en["version"], zh["gaps"]["language"], zh["version"]), ("en", 1, "zh", 2))
+        self.assertEqual(self.a.job_snapshot(job)["gaps"], {"en": en, "zh": zh})
+        self.assertEqual((self.state(self.a, job, "en"), self.state(self.a, job, "zh")), ("current", "current"))
+
+    def test_a_language_never_checked_borrows_nothing_from_the_other(self):
+        job = self.bilingual(self.a)
+        self.run_check(self.a, job, "en")
+        self.assertIsNone(self.a.gaps_inputs(job, "zh")["gaps"])
+        self.assertIsNone(self.a.job_snapshot(job)["gaps"]["zh"])
+        docker = self.rows(self.a, job)["Hands-on Docker and Kubernetes"]["requirement_id"]
+        with self.assertRaises(NotFound):  # the English check's version names no Chinese check
+            self.a.decline_gap(job, docker, language="zh", shown_version=1)
+        self.assertEqual(self.rows(self.a, job)["Hands-on Docker and Kubernetes"]["status"], "open")
+
+    def test_checks_and_changes_in_one_language_never_replace_or_block_the_other(self):
+        job = self.bilingual(self.a)
+        self.run_check(self.a, job, "en")  # version 1
+        docker = self.rows(self.a, job)["Hands-on Docker and Kubernetes"]["requirement_id"]
+        # A Chinese check starts; meanwhile the English one is changed (a skipped suggestion).
+        zh_inputs = self.a.gaps_inputs(job, "zh")
+        found = find_gaps(zh_inputs["requirements"]["decided"], zh_inputs["head"]["draft"], zh_inputs["facts"], self.model)
+        task, token = run_task(self.database, self.a_id, "check_gaps", key="zh-meanwhile", job_id=job)
+        self.assertEqual(self.a.decline_gap(job, docker, language="en", shown_version=1)["gaps_version"], 2)
+        # Its base is the Chinese newest (none), which the English change did not move.
+        self.assertEqual(self.a.publish_gaps(task_id=task, token=token, job_id=job, language="zh", base_version=0,
+                                             gaps=found, checked_head=zh_inputs["head"]["material_id"],
+                                             requirements_version=zh_inputs["requirements"]["version"]),
+                         {"gaps_version": 3})
+        self.assertEqual(self.rows(self.a, job, "en")["Hands-on Docker and Kubernetes"]["status"], "declined")
+        self.assertEqual(self.rows(self.a, job, "zh")["Hands-on Docker and Kubernetes"]["status"], "open")
+        # Adopting in Chinese changes only that CV; neither shared profile nor check moves.
+        tests = self.rows(self.a, job, "zh")["Writing integration tests for services"]["requirement_id"]
+        with self.assertRaisesRegex(Conflict, "page showed"):  # the English check's version, from a page of the other language
+            self.a.accept_gap(job, tests, language="zh", shown_version=2)
+        self.a.accept_gap(job, tests, language="zh", shown_version=3)
+        self.assertEqual((self.a.get_profile("en")["version"], self.a.get_profile("zh")["version"]), (1, 1))
+        self.assertEqual(self.a.job_snapshot(job)["gaps"]["en"]["version"], 2)
+        self.assertEqual(self.rows(self.a, job, "en")["Writing integration tests for services"]["status"], "open")
+        # A check of one language that read an older check of that language is still superseded.
+        en = self.a.gaps_inputs(job, "en")
+        task, token = run_task(self.database, self.a_id, "check_gaps", key="en-stale", job_id=job)
+        self.assertEqual(self.a.publish_gaps(task_id=task, token=token, job_id=job, language="en", base_version=1,
+                                             gaps=find_gaps(en["requirements"]["decided"], en["head"]["draft"], en["facts"],
+                                                            self.model),
+                                             checked_head=en["head"]["material_id"],
+                                             requirements_version=en["requirements"]["version"]),
+                         {"superseded": True})
+        self.assertEqual(self.a.get_task(task)["error_code"], "superseded")  # its base, before any input
+        with raw(self.database) as connection:
+            self.assertEqual(connection.execute("SELECT version, json_extract(payload, '$.language') FROM job_gaps "
+                                                "ORDER BY version").fetchall(), [(1, "en"), (2, "en"), (3, "zh")])
+
+    def test_a_page_adopts_or_skips_only_the_suggestion_it_showed(self):
+        job = self.ready(self.a)
+        self.prepare(self.a, job, plan=False)
+        self.run_check(self.a, job)  # version 1
+        rows = self.rows(self.a, job)
+        docker, tests = (rows[text]["requirement_id"] for text in ("Hands-on Docker and Kubernetes",
+                                                                   "Writing integration tests for services"))
+        self.a.decline_gap(job, tests, language="en", shown_version=1)  # version 2: another row, from the same page
+        # Checked again in another tab, with another suggestion for Docker (version 3).
+        self.model.suggestions = lambda ids: [{"requirement": ids["Hands-on Docker and Kubernetes"], "kind": "skill",
+                                               "line": "fact-skills-languages", "items": ["Docker", "Helm"]}]
+        self.run_check(self.a, job)
+        for act in (lambda: self.a.accept_gap(job, docker, language="en", shown_version=1),
+                    lambda: self.a.decline_gap(job, docker, language="en", shown_version=1)):
+            with self.assertRaisesRegex(Conflict, "suggestion changed"):
+                act()
+        self.assertEqual(self.rows(self.a, job)["Hands-on Docker and Kubernetes"]["status"], "open")
+        self.a.decline_gap(job, docker, language="en", shown_version=3)
+        self.assertEqual(self.rows(self.a, job)["Hands-on Docker and Kubernetes"]["status"], "declined")
+
+    def test_checks_kept_before_they_named_their_inputs_stay_and_are_to_check_again(self):
+        job = self.ready(self.a)
+        self.prepare(self.a, job, plan=False)
+        inputs = self.a.gaps_inputs(job, "en")
+        earlier = find_gaps(inputs["requirements"]["decided"], inputs["head"]["draft"], inputs["facts"], self.model)
+        # As an earlier release (or v2_migrate) kept them: no record of the requirements version read;
+        # and one so old it names no language.
+        with raw(self.database) as connection:
+            connection.execute("INSERT INTO job_gaps VALUES (?, ?, 1, ?, ?)",
+                               (self.a_id, job, json.dumps({"gaps_version": 1, "gaps": []}), "2026-09-01T00:00:00+00:00"))
+            connection.execute("INSERT INTO job_gaps VALUES (?, ?, 2, ?, ?)",
+                               (self.a_id, job, tenant_store._json(earlier), "2026-09-02T00:00:00+00:00"))
+        self.assertEqual(self.a.gaps_inputs(job, "en")["gaps"]["version"], 2)
+        self.assertEqual(self.state(self.a, job), "unbound")  # never current by default
+        # Its suggestions stay usable, and what is saved from it never claims inputs it did not read.
+        docker = self.rows(self.a, job)["Hands-on Docker and Kubernetes"]["requirement_id"]
+        self.assertEqual(self.a.decline_gap(job, docker, language="en", shown_version=2)["gaps_version"], 3)
+        self.assertNotIn("inputs", self.a.job_snapshot(job)["gaps"]["en"]["gaps"])
+        self.assertEqual(self.state(self.a, job), "unbound")
+        # Requirements changed since: not usable at all.
+        self.without_first_requirement(self.a, job)
+        self.assertEqual(self.state(self.a, job), "requirements_changed")
+        tests = self.rows(self.a, job)["Writing integration tests for services"]["requirement_id"]
+        with self.assertRaises(Conflict):
+            self.a.accept_gap(job, tests, language="en", shown_version=3)
+        # A new check is kept with its inputs, after every earlier row, none of which is gone.
+        self.prepare(self.a, job, plan=False, key="prepare-again")
+        self.run_check(self.a, job)
+        self.assertEqual(self.state(self.a, job), "current")
+        with raw(self.database) as connection:
+            self.assertEqual([row[0] for row in connection.execute("SELECT version FROM job_gaps ORDER BY version")],
+                             [1, 2, 3, 4])
 
 
 class BoardTests(StoreCase):

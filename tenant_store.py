@@ -38,12 +38,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 import sponsorship
-from cv import (CVError, approve_draft, build_draft_from_facts, content_fingerprint, is_final_approval,
-                profile_fact_ids, profile_languages, verify_draft)
+from cv import (CVError, _profile_hash, approve_draft, build_draft_from_facts, content_fingerprint,
+                is_final_approval, profile_fact_ids, profile_languages, verify_draft)
+from cv_edit import EditError, StaleEdit, adopt_for, already_saved, change_line, mark_saved, save_plan, save_target, set_edit
 from cv_import import build_profile
 from cv_plan import set_change
 from facts import FactStoreError, normalize_fact_import
-from gaps import accept_gap, decline_gap, write_line
+from gaps import _gap, addition, decline_gap, unusable
 from privacy import private_terms
 from review import build_report
 
@@ -1351,19 +1352,23 @@ class UserWorkspace:
         ``fact_type`` the current type is kept."""
         _version(expected_version)
         with self._transaction(write=True) as connection:
-            current = self._fact(connection, _text(fact_id, 'fact_id'))
-            normalized = normalize_fact_import([{'id': fact_id, 'text': text, 'type': fact_type or current['fact_type'],
-                                                 'tags': tags}])[0]
-            payload = _fact_payload(*normalized[1:])
-            if current['version'] != expected_version:
-                raise Conflict("Fact version changed")
-            if _json({key: current[key] for key in ('text', 'fact_type', 'tags')}) == payload:
-                return current
-            version = expected_version + 1
-            self._write_fact(connection, fact_id, version, payload)
-            connection.execute('UPDATE facts SET current_version = ? WHERE user_id = ? AND fact_id = ?',
-                               (version, self.user_id, fact_id))
-            return self._fact(connection, fact_id)
+            return self._revise(connection, _text(fact_id, 'fact_id'), expected_version, text, fact_type, tags)
+
+    def _revise(self, connection: sqlite3.Connection, fact_id: str, expected_version: int, text: str,
+                fact_type: str | None, tags: list[str]) -> dict:
+        current = self._fact(connection, fact_id)
+        normalized = normalize_fact_import([{'id': fact_id, 'text': text, 'type': fact_type or current['fact_type'],
+                                             'tags': tags}])[0]
+        payload = _fact_payload(*normalized[1:])
+        if current['version'] != expected_version:
+            raise Conflict("Fact version changed")
+        if _json({key: current[key] for key in ('text', 'fact_type', 'tags')}) == payload:
+            return current
+        version = expected_version + 1
+        self._write_fact(connection, fact_id, version, payload)
+        connection.execute('UPDATE facts SET current_version = ? WHERE user_id = ? AND fact_id = ?',
+                           (version, self.user_id, fact_id))
+        return self._fact(connection, fact_id)
 
     def confirm_facts(self, refs: list[tuple[str, int]]) -> list[dict]:
         """The user's review: confirm exact current versions together; any missing/stale ref rolls all back."""
@@ -1964,6 +1969,105 @@ class UserWorkspace:
                 document=changed, facts=facts)
             return self._material(connection, material_id)
 
+    # -- this job's own changes to its CV (cv_edit) ------------------------------------------
+
+    def _repeated_edit(self, connection: sqlite3.Connection, request_id: str, request_payload: str) -> dict | None:
+        """The CV version a request with this key made already, when it is the same request again;
+        a key used for something else is refused."""
+        row = connection.execute('SELECT material_id, language, request_payload FROM materials WHERE user_id = ? AND request_id = ?',
+                                 (self.user_id, request_id)).fetchone()
+        if row is None:
+            return None
+        if row['request_payload'] != request_payload:
+            raise Conflict("Request key was used for different inputs")
+        return {'language': row['language'], 'material_id': row['material_id'], 'changed': True}
+
+    def _edit_cv(self, job_id: str, language: str, request_id: str | None, request: list,
+                 change: Callable[..., tuple[dict, bool, int | None]]) -> dict:
+        """One change of the job's own CV in ``language`` (cv_edit), made on its newest version in
+        one transaction and kept as the next version, which no approval of an earlier one covers.
+        ``change(connection, head, document, key)`` returns the new document, whether anything
+        changed and, when it saved to the profile, the profile version the CV now matches. The
+        same request again (``request_id``: the page's key for the user's action, with the same
+        ``request``) finds the version it made instead of making another. A line, entry or change
+        that is no longer as the page showed it is a conflict, and nothing is written."""
+        language = _language(language)
+        key = f"edit:{_text(request_id, 'request_id')}" if request_id is not None else f"edit:{secrets.token_hex(16)}"
+        payload = _json(request)
+        with self._transaction(write=True) as connection:
+            self._job(connection, _text(job_id, 'job_id'))
+            repeated = self._repeated_edit(connection, key, payload)
+            if repeated:
+                return repeated
+            head = self._head(connection, job_id, language)
+            if head is None:
+                raise StoreError("Prepare this job's CV first")
+            try:
+                document, changed, profile_version = change(connection, head, json.loads(head['payload']), key)
+            except StaleEdit as exc:
+                raise Conflict(str(exc)) from exc
+            except (EditError, CVError, FactStoreError, ValueError) as exc:
+                raise StoreError(str(exc)) from exc
+            if not changed:
+                return {'language': language, 'material_id': head['material_id'], 'changed': False}
+            material_id = self._insert_material(
+                connection, job_id=job_id, language=language, stage=head['stage'], parent_id=head['material_id'],
+                profile_version=profile_version or head['profile_version'],
+                requirements_version=head['requirements_version'], request_id=key, request_payload=payload,
+                document=document, facts=[(item['id'], item['version']) for item in document['facts']])
+            return {'language': language, 'material_id': material_id, 'changed': True}
+
+    def edit_cv_line(self, job_id: str, language: str, block: str, text: str, *, expected_text: str,
+                     request_id: str | None = None) -> dict:
+        """The user rewrites one line of the job's CV, in this CV only; refused when the line no
+        longer reads ``expected_text``, the words the page showed."""
+        block, text = _text(block, 'line', 64), _text(text, 'text', 2000)
+        expected_text = _text(expected_text, 'expected text', 2000)
+        return self._edit_cv(job_id, language, request_id, ['line', job_id, language, block, text, expected_text],
+                             lambda _c, _h, document, key: (*change_line(document, block, text, expected_text=expected_text,
+                                                                         request=key), None))
+
+    def set_cv_edit(self, job_id: str, language: str, edit_id: str, undone: bool, *, request_id: str | None = None) -> dict:
+        """Undo one of the job CV's own changes, or do it again (cv_edit.set_edit)."""
+        edit_id = _text(edit_id, 'change', 64)
+        if not isinstance(undone, bool):
+            raise StoreError("Invalid undo")
+        return self._edit_cv(job_id, language, request_id, ['undo', job_id, language, edit_id, undone],
+                             lambda _c, _h, document, key: (*set_edit(document, edit_id, undone, request=key), None))
+
+    def save_cv_line(self, job_id: str, language: str, block: str, *, expected_text: str,
+                     request_id: str | None = None) -> dict:
+        """The user saves one line of the job's CV to their profile, for their other CVs too
+        (cv_edit.save_plan): a new saved entry with the line's block ID, listed under its entry, or
+        a new version of the saved entry the line changed. What is saved is pending, as anything
+        saved is; saving never confirms it. The job's CV then quotes the saved entry, in the same
+        transaction, and stays current if it was. Other CVs made from the profile or entry before
+        are not current any more, as after any change to the profile."""
+        block = _text(block, 'line', 64)
+        expected_text = _text(expected_text, 'expected text', 2000)
+
+        def change(connection, head, document, key):
+            if already_saved(document, block, expected_text):
+                return document, False, None
+            target = save_target(document, block)
+            try:
+                profile = self._profile(connection, language)
+            except NotFound as exc:
+                raise StoreError("Upload your CV in this language before saving lines to it") from exc
+            plan = save_plan(target, profile['profile'], language, _TransactionFacts(self, connection))
+            fact, version, profile_hash = plan['fact'], None, None
+            if plan['create']:
+                fact = self._import(connection, normalize_fact_import(
+                    [{'id': block, 'text': target['text'], 'type': target['fact_type'], 'tags': plan['tags']}]))[0]
+            elif plan['revise']:
+                fact = self._revise(connection, block, fact['version'], target['text'], None, plan['tags'])
+            if plan['profile'] is not None:
+                saved = self._save_profile(connection, language, plan['profile'], profile['version'])
+                if head['profile_version'] == profile['version']:  # the CV was current: it is still
+                    version, profile_hash = saved['version'], _profile_hash(saved['profile'])
+            return mark_saved(document, block, fact['version'], profile_sha256=profile_hash), True, version
+        return self._edit_cv(job_id, language, request_id, ['save', job_id, language, block, expected_text], change)
+
     def _approval(self, connection: sqlite3.Connection, material_id: str) -> sqlite3.Row | None:
         return connection.execute('SELECT * FROM approvals WHERE user_id = ? AND material_id = ?',
                                   (self.user_id, material_id)).fetchone()
@@ -2083,37 +2187,71 @@ class UserWorkspace:
 
     # -- gaps ------------------------------------------------------------------------------
 
-    def _gaps(self, connection: sqlite3.Connection, job_id: str) -> dict | None:
-        row = connection.execute('SELECT * FROM job_gaps WHERE user_id = ? AND job_id = ? ORDER BY version DESC LIMIT 1',
-                                 (self.user_id, job_id)).fetchone()
+    def _gaps(self, connection: sqlite3.Connection, job_id: str, language: str) -> dict | None:
+        """The newest gap check of the job's CV in ``language``, or None. One version sequence per
+        job counts up across both languages (the table's key, as it was before checks were kept
+        per language), so a language's newest check is the newest row in that language: a check
+        in one language never hides or replaces the other's."""
+        row = connection.execute('''SELECT version, payload FROM job_gaps WHERE user_id = ? AND job_id = ?
+            AND json_extract(payload, '$.language') = ? ORDER BY version DESC LIMIT 1''',
+                                 (self.user_id, job_id, language)).fetchone()
         return {'version': row['version'], 'gaps': json.loads(row['payload'])} if row else None
 
+    def _gaps_at(self, connection: sqlite3.Connection, job_id: str, version: int) -> dict | None:
+        row = connection.execute('SELECT version, payload FROM job_gaps WHERE user_id = ? AND job_id = ? AND version = ?',
+                                 (self.user_id, job_id, version)).fetchone()
+        return {'version': row['version'], 'gaps': json.loads(row['payload'])} if row else None
+
+    def _next_gaps_version(self, connection: sqlite3.Connection, job_id: str) -> int:
+        return connection.execute('SELECT COALESCE(MAX(version), 0) + 1 FROM job_gaps WHERE user_id = ? AND job_id = ?',
+                                  (self.user_id, job_id)).fetchone()[0]
+
+    def gaps_language(self, job_id: str, version: int) -> str | None:
+        """The CV language of the job's gap check ``version``, or None when there is none, so a
+        page can be told it showed another language's check."""
+        _version(version)
+        with self._transaction() as connection:
+            self._job(connection, _text(job_id, 'job_id'))
+            found = self._gaps_at(connection, job_id, version)
+            return found['gaps'].get('language') if found else None
+
     def gaps_inputs(self, job_id: str, language: str) -> dict[str, Any]:
-        """What a gap check reads: requirements, the current CV, facts, private words, the last check.
-        The check is published against the same CV and requirements (publish_gaps)."""
+        """What a gap check reads: requirements, the current CV, facts, private words, the last
+        check of the CV in this language. The check is published against the same CV and
+        requirements (publish_gaps)."""
         with self._transaction() as connection:
             self._job(connection, _text(job_id, 'job_id'))
             head = self._head(connection, job_id, _language(language))
             return {'requirements': self._requirements(connection, job_id),
                     'head': self._material(connection, head['material_id']) if head else None,
                     'facts': FactSnapshot(self._list_facts(connection)), 'private': self._private_terms(connection),
-                    'gaps': self._gaps(connection, job_id)}
+                    'gaps': self._gaps(connection, job_id, language)}
 
-    def publish_gaps(self, *, task_id: str, token: str, job_id: str, base_version: int, gaps: dict,
+    def publish_gaps(self, *, task_id: str, token: str, job_id: str, language: str, base_version: int, gaps: dict,
                      checked_head: str | None, requirements_version: int | None,
                      facts_read: list | None = None) -> dict:
-        """Keep a new gap check unless another was saved after this one started, or the CV
-        (``checked_head``), the requirements or the current material it used changed meanwhile;
-        then nothing is kept and the task is superseded. A suggestion added to an earlier check,
-        which may predate a line adopted since, names the facts it read in ``facts_read``."""
+        """Keep a check of the job's CV in ``language``, or a suggestion added to one, unless
+        another check of that language was saved after this one started (``base_version`` is that
+        language's newest then; the other language's checks never get in the way), or the CV
+        (``checked_head``), the requirements or the facts it used changed meanwhile; then nothing
+        is kept and the task is superseded.
+
+        A new check is kept with what it was made from (``inputs``: the requirements version and
+        the CV version), which is what tells it from a check of other requirements later
+        (gaps.check_state). A suggestion added to an earlier check, which may predate a line
+        adopted since, names the facts it read in ``facts_read`` and leaves that check's record of
+        its inputs as it was, never claiming inputs the check did not read."""
+        language = _language(language)
+        if gaps.get('language') != language:
+            raise StoreError("This check is of a CV in another language")
         with self._transaction(write=True) as connection:
             _running_task(connection, self.user_id, task_id, token)
-            current = self._gaps(connection, job_id)
+            current = self._gaps(connection, job_id, language)
             if (current['version'] if current else 0) != base_version:
                 _end_task(connection, self.user_id, task_id, 'superseded', error_code='superseded',
                           message="A newer check was saved first")
                 return {'superseded': True}
-            head = self._head(connection, job_id, _language(gaps.get('language')))
+            head = self._head(connection, job_id, language)
             requirements = self._requirements(connection, job_id)
             confirmed = sorted([fact['id'], fact['version']] for fact in self._list_facts(connection))
             if ((head['material_id'] if head else None) != checked_head
@@ -2122,61 +2260,107 @@ class UserWorkspace:
                 _end_task(connection, self.user_id, task_id, 'superseded', error_code='inputs_changed',
                           message="The CV, its facts or the requirements changed while they were checked")
                 return {'superseded': True}
+            if facts_read is None:
+                gaps = {**gaps, 'inputs': {'requirements_version': requirements_version, 'material_id': checked_head}}
+            version = self._next_gaps_version(connection, job_id)
             connection.execute('INSERT INTO job_gaps VALUES (?, ?, ?, ?, ?)',
-                               (self.user_id, job_id, base_version + 1, _json(gaps), _now()))
-            outcome = {'gaps_version': base_version + 1}
+                               (self.user_id, job_id, version, _json(gaps), _now()))
+            outcome = {'gaps_version': version}
             _end_task(connection, self.user_id, task_id, 'succeeded', result=outcome)
             return outcome
 
-    def _change_gaps(self, job_id: str, change: Callable) -> dict:
+    def _acted_check(self, connection: sqlite3.Connection, job_id: str, language: str, shown_version: int,
+                     requirement_id: str, *, same_suggestion: bool) -> dict:
+        """The newest check of the job's CV in ``language``, the check a gap action acts on.
+        Refused when that check no longer applies to the job's requirements (gaps.unusable), when
+        ``shown_version``, the check the page showed, is not one of this language's checks, and,
+        for an action on the suggestion as the page showed it (``same_suggestion``: adopting or
+        skipping it), when the row's suggestion would add something else now. Otherwise a newer
+        check of the same requirements is acted on as it is: a requirement ID names the same
+        requirement there, and a line the user writes carries its own place and words."""
+        current = self._gaps(connection, job_id, language)
+        if current is None:
+            raise NotFound("Check this CV first")
+        requirements = self._requirements(connection, job_id)
+        reason = unusable(current['gaps'], language, (requirements or {}).get('decided'),
+                          requirements['version'] if requirements else None)
+        if reason == 'requirements_changed':
+            raise Conflict("The job's requirements changed after this check; check again before adding from it")
+        if reason:
+            raise Conflict("This check is out of date; check again first")
+        shown = current if shown_version == current['version'] else self._gaps_at(connection, job_id, shown_version)
+        if shown is None or shown['gaps'].get('language') != language:
+            raise Conflict("This check changed after the page showed it; reload the page")
+        if same_suggestion and _suggested(shown['gaps'], requirement_id) != _suggested(current['gaps'], requirement_id):
+            raise Conflict("This suggestion changed after the page showed it; reload the page")
+        return current
+
+    def _change_gaps(self, job_id: str, language: str, shown_version: int, requirement_id: str, change: Callable, *,
+                     same_suggestion: bool) -> dict:
+        """Change the newest check of the job's CV in ``language`` (see _acted_check)."""
+        _version(shown_version)
+        requirement_id = _text(requirement_id, 'requirement')
         with self._transaction(write=True) as connection:
             self._job(connection, _text(job_id, 'job_id'))
-            current = self._gaps(connection, job_id)
-            if current is None:
-                raise NotFound("Check this CV first")
+            language = _language(language)
+            current = self._acted_check(connection, job_id, language, shown_version, requirement_id,
+                                        same_suggestion=same_suggestion)
             gaps = current['gaps']
-            language = gaps.get('language')
             try:
-                updated, profile = change(connection, gaps, language)
-            except (ValueError, CVError, FactStoreError) as exc:
+                updated = change(gaps)
+            except (ValueError, CVError) as exc:
                 raise StoreError(str(exc)) from exc
-            if updated == gaps and profile is None:
-                # The same line again (a second click, a tab left open): saved already.
+            if updated == gaps:
                 return {'gaps_version': current['version'], 'language': language, 'changed': False}
-            if profile is not None:
-                self._save_profile(connection, language, profile, self._profile(connection, language)['version'])
+            version = self._next_gaps_version(connection, job_id)
             connection.execute('INSERT INTO job_gaps VALUES (?, ?, ?, ?, ?)',
-                               (self.user_id, job_id, current['version'] + 1, _json(updated), _now()))
-            return {'gaps_version': current['version'] + 1, 'language': language, 'changed': True}
+                               (self.user_id, job_id, version, _json(updated), _now()))
+            return {'gaps_version': version, 'language': language, 'changed': True}
 
-    def accept_gap(self, job_id: str, requirement_id: str) -> dict:
-        """The user adopts a suggested line: it is saved with legacy status, the CV layout
-        lists it and the gap is marked added, all in one transaction (see gaps.accept_gap)."""
-        def change(connection, gaps, language):
-            profile = self._profile(connection, language)['profile']
-            return accept_gap(gaps, _text(requirement_id, 'requirement'), _TransactionFacts(self, connection), profile)
-        return self._change_gaps(job_id, change)
+    def _adopt(self, job_id: str, requirement_id: str, language: str, shown_version: int, request_id: str | None,
+               request: list, *, place: str | None = None, text: str | None = None) -> dict:
+        """Adopt for one requirement of the check the page showed (see _acted_check) into the job's
+        CV in that language, and into nothing else: no profile, saved entry, other job's CV or gap
+        check changes (cv_edit.adopt_for: the row's suggestion as it is, or with ``place`` the
+        user's own words). A suggestion is acted on only as the page showed it."""
+        _version(shown_version)
+        requirement_id = _text(requirement_id, 'requirement')
 
-    def write_gap_line(self, job_id: str, requirement_id: str, place: str, text: str) -> dict:
-        """The user writes the line themselves (see gaps.write_line), in one transaction."""
-        def change(connection, gaps, language):
-            head = self._head(connection, job_id, language)
-            if head is None:
-                raise ValueError("Prepare this job's CV first")
-            profile = self._profile(connection, language)['profile']
-            return write_line(gaps, _text(requirement_id, 'requirement'), _text(place, 'place', 2000), text,
-                              json.loads(head['payload']), _TransactionFacts(self, connection), profile)
-        return self._change_gaps(job_id, change)
+        def change(connection, _head, document, key):
+            current = self._acted_check(connection, job_id, language, shown_version, requirement_id,
+                                        same_suggestion=place is None)
+            return (*adopt_for(document, _gap(current['gaps'], requirement_id), place=place, text=text,
+                               request=key), None)
+        return self._edit_cv(job_id, language, request_id, request, change)
 
-    def decline_gap(self, job_id: str, requirement_id: str) -> dict:
-        return self._change_gaps(job_id, lambda _c, gaps, _l: (decline_gap(gaps, _text(requirement_id, 'requirement')), None))
+    def accept_gap(self, job_id: str, requirement_id: str, *, language: str, shown_version: int,
+                   request_id: str | None = None) -> dict:
+        """The user adopts the suggestion of the check the page showed (``shown_version``) as it
+        is, into the job's CV in ``language`` only (see _adopt). Saving it to the profile is the
+        separate save_cv_line."""
+        return self._adopt(job_id, requirement_id, language, shown_version, request_id,
+                           ['adopt', job_id, language, requirement_id, shown_version])
+
+    def write_gap_line(self, job_id: str, requirement_id: str, place: str, text: str, *, language: str,
+                       shown_version: int, request_id: str | None = None) -> dict:
+        """The user's own words for a requirement (or the suggestion as they edited it), adopted
+        word for word into the job's CV in ``language`` only (see _adopt)."""
+        place, text = _text(place, 'place', 2000), _text(text, 'text', 2000)
+        return self._adopt(job_id, requirement_id, language, shown_version, request_id,
+                           ['write', job_id, language, requirement_id, shown_version, place, text],
+                           place=place, text=text)
+
+    def decline_gap(self, job_id: str, requirement_id: str, *, language: str, shown_version: int) -> dict:
+        """The user skips the suggestion the page showed (see _change_gaps)."""
+        return self._change_gaps(job_id, language, shown_version, requirement_id,
+                                 lambda gaps: decline_gap(gaps, requirement_id), same_suggestion=True)
 
     # -- everything one job's page shows, read together ------------------------------------
 
     def job_snapshot(self, job_id: str) -> dict[str, Any]:
         """The job, its requirements, notes, the current CV per language (with the draft it grew
         from, whether its inputs are current and its approval and final PDF, if still valid),
-        the latest gap check, current saved material, the stored sponsor answer for the job's words
+        the latest gap check per language, current saved material, the stored sponsor answer for the job's words
         (None when not assessed: nothing is assessed while reading) and this job's recent tasks,
         from one transaction, so they agree with each other."""
         with self._transaction() as connection:
@@ -2207,7 +2391,8 @@ class UserWorkspace:
                 'sponsorship': self._saved_answer(connection, job['jd'].get('text')),
                 'job': job, 'requirements': self._requirements(connection, job_id),
                 'notes': {name: self._note(connection, job_id, name) for name in NOTE_NAMES},
-                'cv': cvs, 'cv_languages': self._languages(connection), 'gaps': self._gaps(connection, job_id),
+                'cv': cvs, 'cv_languages': self._languages(connection),
+                'gaps': {language: self._gaps(connection, job_id, language) for language in LANGUAGES},
                 'confirmed': [(fact['id'], fact['version']) for fact in self._list_facts(connection)],
                 'tasks': [_task_view(row, connection) for row in connection.execute(
                     '''SELECT * FROM tasks WHERE user_id = ? AND job_id = ? AND dismissed = 0
@@ -2531,6 +2716,21 @@ class UserWorkspace:
         ``used`` and ``limit`` are in the active mode's measure: legacy units or tokens."""
         with self._transaction() as connection:
             return _account_usage(connection, self.user_id, _today())
+
+
+def _suggested(gaps: dict, requirement_id: str) -> Any:
+    """What adopting a check's suggestion for a requirement would add (gaps.addition: its place
+    and words), or None: two checks offer the same there exactly when these are equal, whether it
+    was adopted since or not."""
+    row = next((item for item in gaps.get('requirements') or []
+                if isinstance(item, dict) and item.get('requirement_id') == requirement_id), None)
+    suggestion = row.get('suggestion') if row else None
+    if not isinstance(suggestion, dict):
+        return None
+    try:
+        return addition(suggestion)
+    except (KeyError, TypeError):
+        return suggestion
 
 
 def _short_of(scope: str, unit: str, needed: int, left: int, limit: int, day: str) -> Refused:
@@ -2896,16 +3096,19 @@ def public_board_age(path: Path, provider: str, board: str) -> tuple[str | None,
 QUEUE_WAIT = timedelta(minutes=15)
 
 
-def claim_tasks(path: Path, *, total: int, pdf: int, deadline: timedelta) -> list[dict[str, Any]]:
+def claim_tasks(path: Path, *, total: int, pdf: int, deadline: timedelta, busy: Iterable[str] = ()) -> list[dict[str, Any]]:
     """Start up to ``total`` queued tasks (at most ``pdf`` of them PDF printing), oldest first,
-    one per user at a time and never for a disabled account. Each gets a new execution token:
-    only the holder of that token can publish its result."""
+    one per user at a time and never for a disabled account. A user is busy while a task of
+    theirs is running here, and while the runner says (``busy``) that one of theirs is still
+    executing although it has ended here: cancelled or timed out, its handler not yet returned.
+    Each claimed task gets a new execution token: only the holder of that token can publish its
+    result."""
     claimed: list[dict[str, Any]] = []
     if total <= 0:
         return claimed
     now = _clock()
     with transaction(path, write=True) as connection:
-        busy = {row['user_id'] for row in connection.execute("SELECT user_id FROM tasks WHERE status = 'running'")}
+        busy = set(busy) | {row['user_id'] for row in connection.execute("SELECT user_id FROM tasks WHERE status = 'running'")}
         queued = connection.execute(
             "SELECT t.* FROM tasks t JOIN users u ON u.user_id = t.user_id "
             "WHERE t.status = 'queued' AND u.active = 1 ORDER BY t.created_at, t.task_id").fetchall()

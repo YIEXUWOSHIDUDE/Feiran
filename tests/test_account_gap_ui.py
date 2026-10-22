@@ -7,6 +7,47 @@ from tests import test_sponsor_ui as ui
 class AccountGapUITests(unittest.TestCase):
     check_js = ui.SponsorUITests.check_js
 
+    def test_local_editor_keeps_failed_text_and_binds_save_to_visible_words(self):
+        for mode in ("v1", "v2"):
+            with self.subTest(mode=mode):
+                self.check_js(r'''
+run(`__view={job_id:"j"}; __refreshes=0; __fail=true;
+globalThis.crypto={randomUUID:()=>"synthetic-editor-action"};
+__cv={lines:[{block:"b",text:"Original line",where:"Project"}]};
+api=async(path,options)=>{__calls.push({path,...options}); if(__fail) throw new Error("Changed in another tab"); return {};};`);
+const editor=run('cvLineEditor(__view,"en",__cv,async()=>{__refreshes++})');
+const input=find(editor,n=>n.tagName==="textarea"); input.value="My edited line";
+await button(editor,"Save in this CV").fire("click");
+assert.equal(input.value,"My edited line");
+assert.equal(sandbox.__refreshes,0);
+assert.deepEqual(JSON.parse(sandbox.__calls[0].body),{text:"My edited line",expected_text:"Original line"});
+run('__fail=false');
+await button(editor,"Save in this CV").fire("click");
+assert.equal(sandbox.__calls[1].headers["Idempotency-Key"],sandbox.__calls[0].headers["Idempotency-Key"]);
+assert.equal(sandbox.__refreshes,1);
+run(`__edit={id:"e",block:"b",text:"My edited line",can_save:true,can_undo:true,latest:true,placed:true};`);
+const row=run('localEditRow(__view,"en",__edit,async()=>{})');
+await button(row,"Save to my profile").fire("click");
+assert.equal(sandbox.__calls.at(-1).path,"/api/jobs/j/cv/en/lines/b/save");
+assert.deepEqual(JSON.parse(sandbox.__calls.at(-1).body),{expected_text:"My edited line"});
+await button(row,"Undo").fire("click");
+assert.deepEqual(JSON.parse(sandbox.__calls.at(-1).body),{undone:true});
+for(const key of ["Save in this CV","Save to my profile","Changes saved in this CV"]) assert(sandbox.WorkbenchChinese[key]);
+''', mode=mode)
+
+    def test_adopted_requirement_lists_local_changes_without_another_model_request(self):
+        self.check_js(r'''
+run(`__view={job_id:"j",gaps:{places:[{id:"entry:k",kind:"bullet",where:"Project"}]}};
+__item={requirement_id:"r",text:"SQL",status:"recheck",verdict:"none",evidence:[],suggestion_status:"open",
+suggestion_adopted:true,adopted:[{id:"e",block:"b",text:"Built SQL pipelines",can_undo:true,can_save:true,latest:true,placed:true}]};`);
+const row=run('coverageRow(__view,"en",__item,async()=>{},()=>{})');
+assert(row.textContent.includes("Added to this CV."));
+assert(row.textContent.includes("Built SQL pipelines"));
+assert(row.textContent.includes("Write your own line"));
+assert(!row.textContent.includes("AI suggested entry"));
+assert.equal(sandbox.__calls.length,0);
+''')
+
     def test_ai_is_first_reuses_saved_answer_and_adopts_edited_content(self):
         self.check_js(r'''
 run(`api = async (path, options = {}) => { __calls.push({path, ...options}); return {}; };
@@ -143,7 +184,7 @@ for (const key of ["Changed since this check", "to check again", "as it read whe
             with self.subTest(mode=mode):
                 self.check_js(r'''
 run(`api = async (path, options = {}) => { __calls.push({path, ...options}); return options.method ? {} : __view; };
-__view = {job_id:"j", language:"en", gaps:{stale:true, language:"en", evidence_check:{}, suggesting:{},
+__view = {job_id:"j", language:"en", gaps:{stale:true, language:"en", version:7, evidence_check:{}, suggesting:{},
  places:[{id:"skill:s", kind:"skill", where:"Frameworks and tools: FastAPI"}, {id:"entry:k", kind:"bullet", where:"Acme Labs"}],
  counts:{shown:0, recheck:5, not_shown:0, related:0, none:0, unchecked:0},
  requirements:[
@@ -193,14 +234,106 @@ if (MODE === "v1") {
   assert(rowOf("Docker and Kubernetes").textContent.includes("Docker, Kubernetes"));
   await button(rowOf("Docker and Kubernetes"), "Adopt and add to my CV").fire("click");
 }
+// With the language and the version of the check shown, so it never lands in the other CV.
 assert.deepEqual([sandbox.__calls[0].path, JSON.parse(sandbox.__calls[0].body)],
-  ["/api/jobs/j/gaps/docker/write", {place:"skill:s", text:"Docker, Kubernetes"}]);
+  ["/api/jobs/j/gaps/docker/write", {language:"en", gaps_version:7, place:"skill:s", text:"Docker, Kubernetes"}]);
 const ask = button(rowOf("CI pipelines"), "AI suggested entry");
 assert(!ask.disabled);
 await ask.fire("click");
 assert.equal(sandbox.__calls[1].path, "/api/jobs/j/gaps/ci/suggest");
+assert.deepEqual(JSON.parse(sandbox.__calls[1].body), {language:"en", gaps_version:7});
 assert.equal(sandbox.WorkbenchChinese[marked], "以下建议针对上次核验发现的不足；此后简历已更新，请只采用仍需要的内容。");
 ''', mode=mode)
+
+    def test_a_suggestion_read_after_another_tab_switched_language_is_never_offered_here(self):
+        # Codex review of round 1: the page asked for an English suggestion, another tab switched
+        # the job to Chinese, and the job read afterwards went into the English panel, whose
+        # adoption then wrote to the Chinese CV (language zh, place skill:zh-s).
+        self.check_js(r'''
+run(`__view = {job_id:"j",language:"en",gaps:{language:"en",version:1,places:[{id:"skill:s",kind:"skill",where:"Tools: Python"}]}};
+__item = {requirement_id:"r",text:"SQL",status:"none",evidence:[],suggestion_status:"open",suggestion:null};
+api = async (path, options = {}) => { __calls.push({path, ...options});
+  return options.method ? {} : {job_id:"j",language:"zh",gaps:{language:"zh",version:2,
+    places:[{id:"skill:zh-s",kind:"skill",where:"技术: Python"}],
+    requirements:[{...__item,suggestion:{kind:"skill",fact_id:"zh-s",items:["SQL"],where:"技术: Python",new_text:"技术: Python, SQL"}}]}};
+};`);
+const row = run('coverageRow(__view,"en",__item,async()=>{},()=>{})');
+const manual = find(row, n => n.tagName === "textarea");
+manual.value = "SQL, SQLite";
+await button(row, "AI suggested entry").fire("click");
+assert.deepEqual(JSON.parse(sandbox.__calls[0].body), {language:"en", gaps_version:1});
+assert.equal(run('message.textContent'), "This page is out of date; reload it");
+assert(!row.textContent.includes("技术"), row.textContent);
+assert(!button(row, "Adopt and add to my CV"));
+assert(!nodes(row).some(n => n.tagName === "option" && n.attributes.value === "skill:zh-s"));
+assert.equal(manual.value, "SQL, SQLite");  // what the user typed stays
+// What the panel still offers acts on the English check it shows.
+await button(row, "Add to my CV").fire("click");
+assert.deepEqual(sandbox.__calls.filter(c => c.path.endsWith("/write")).map(c => JSON.parse(c.body)),
+  [{language:"en", gaps_version:1, place:"skill:s", text:"SQL, SQLite"}]);
+''')
+
+    def test_a_suggestion_made_for_this_language_is_offered_and_adopted_with_its_check(self):
+        self.check_js(r'''
+run(`__view = {job_id:"j",language:"en",gaps:{language:"en",version:1,places:[{id:"skill:s",kind:"skill",where:"Tools: Python"}]}};
+__item = {requirement_id:"r",text:"SQL",status:"none",evidence:[],suggestion_status:"open",suggestion:null};
+api = async (path, options = {}) => { __calls.push({path, ...options});
+  return options.method ? {} : {...__view, gaps:{...__view.gaps, version:2, requirements:[{...__item, ai_checked:true,
+    suggestion:{kind:"skill",fact_id:"s",items:["SQL"],where:"Tools: Python",new_text:"Tools: Python, SQL"}}]}};
+};`);
+const row = run('coverageRow(__view,"en",__item,async()=>{},()=>{})');
+await button(row, "AI suggested entry").fire("click");
+assert(row.textContent.includes("Tools: Python"));
+await button(row, "Adopt and add to my CV").fire("click");
+// The check now holds the suggestion (version 2): adopting names that one, in English.
+assert.deepEqual(JSON.parse(sandbox.__calls.find(c => c.path.endsWith("/write")).body),
+  {language:"en", gaps_version:2, place:"skill:s", text:"SQL"});
+await button(row, "AI suggested entry").fire("click");  // shown again from the panel, not asked for
+assert.equal(sandbox.__calls.filter(c => c.path.endsWith("/suggest")).length, 1);
+''')
+
+    def test_a_check_of_changed_requirements_shows_no_result_and_offers_only_check_again(self):
+        for mode in ("v1", "v2"):
+            with self.subTest(mode=mode):
+                self.check_js(r'''
+run(`api = async (path, options = {}) => { __calls.push({path, ...options}); return {}; };
+__view = {job_id:"j", language:"en", gaps:{state:"requirements_changed", requirements_changed:true, stale:true, language:"en",
+ version:4, places:[], evidence_check:{fallback_reason:"old answer"}, suggesting:{fallback_reason:"old answer"},
+ counts:{shown:0, recheck:0, not_shown:0, related:0, none:0, unchecked:0}, requirements:[]}};`);
+const panel = run('gapsPanel(__view, async () => {})');
+const changed = "The job's requirements changed after this check, so its results no longer apply. Choose Check again to compare this CV with the current requirements.";
+assert(panel.textContent.includes(changed), panel.textContent);
+for (const claim of ["Your CV or facts changed", "Not checked:", "No suggestions this time", "shows something for every requirement"]) {
+  assert(!panel.textContent.includes(claim), claim);
+}
+assert.deepEqual(nodes(panel).filter(n => n.tagName === "button").map(n => n.textContent), ["Check again"]);
+await button(panel, "Check again").fire("click");
+assert.deepEqual([sandbox.__calls[0].path, JSON.parse(sandbox.__calls[0].body)], ["/api/jobs/j/gaps", {language:"en", gaps_version:4}]);
+assert(sandbox.WorkbenchChinese[changed]);
+''', mode=mode)
+
+    def test_a_check_kept_before_it_named_its_requirements_says_so_and_keeps_its_suggestions(self):
+        self.check_js(r'''
+run(`api = async (path, options = {}) => { __calls.push({path, ...options}); return {}; };
+__view = {job_id:"j", language:"en", gaps:{state:"unbound", stale:true, language:"en", version:2, evidence_check:{}, suggesting:{},
+ places:[{id:"skill:s", kind:"skill", where:"Tools: Python"}], counts:{shown:0, recheck:1, not_shown:0, related:0, none:0, unchecked:0},
+ requirements:[{requirement_id:"docker", text:"Docker", strength:"required", status:"recheck", verdict:"none", missing:null,
+   evidence:[], suggestion_status:"open", ai_checked:true,
+   suggestion:{kind:"skill", fact_id:"s", items:["Docker"], where:"Tools: Python", new_text:"Tools: Python, Docker"}}]}};`);
+const panel = run('gapsPanel(__view, async () => {})');
+const said = ["This check was saved before checks recorded which requirements they used, so it is not known to match the current ones. Choose Check again to update the result.",
+  "Whether this CV still shows this is not known until it is checked again. Use Check again.",
+  "Suggested for what the last check found missing. That check may be out of date; adopt only what you still need."];
+for (const words of said) {
+  assert(panel.textContent.includes(words), words);
+  assert(sandbox.WorkbenchChinese[words], words);
+}
+for (const claim of ["Your CV changed after this check", "Your CV has changed since", "Your CV or facts changed"]) {
+  assert(!panel.textContent.includes(claim), claim);  // the CV may be just as it was
+}
+await button(panel, "Adopt and add to my CV").fire("click");
+assert.deepEqual(JSON.parse(sandbox.__calls[0].body), {language:"en", gaps_version:2, place:"skill:s", text:"Docker"});
+''')
 
     def test_profile_page_has_no_literal_null_when_empty_or_after_saving(self):
         # Dogfood 2026-10-20: V1 has no account panel, and its null was written out as "null".

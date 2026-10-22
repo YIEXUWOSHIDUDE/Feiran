@@ -551,7 +551,9 @@ def _line_content_valid(line: dict[str, Any], fact: dict[str, Any]) -> bool:
 
 
 def verify_draft(draft: Any, facts_db: Path) -> dict[str, dict[str, Any]]:
-    """Every line must still rest on the current version of its source entry.
+    """Every line must still rest on the current version of its source entry, except a line the
+    job's CV holds on its own (``local``, see cv_edit), which has no saved entry behind it and
+    is checked for its format only.
 
     Returns those current facts, keyed by ID, for callers that need their tags. ``facts_db``
     is the single-user database or a fact source (facts.fact_source).
@@ -577,6 +579,11 @@ def verify_draft(draft: Any, facts_db: Path) -> dict[str, dict[str, Any]]:
         for section in draft["sections"]:
             for entry in section["entries"]:
                 for line in entry["lines"]:
+                    if line.get("local") is True:
+                        if (not isinstance(line["fact_id"], str) or line["fact_id"] in versions
+                                or line["fact_version"] != 0 or not _valid_line(line["text"])):
+                            problems.append(str(line["fact_id"]))
+                        continue
                     fact = current.get(line["fact_id"])
                     if (fact is None or versions.get(line["fact_id"]) != line["fact_version"]
                             or not _line_content_valid(line, fact)):

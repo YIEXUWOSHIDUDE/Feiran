@@ -26,6 +26,7 @@ from web_v2 import MAX_BODY, BodyLimit, RequestTooLarge, V2Settings, create_v2_a
 HOST = "feiran.example"
 JD_TEXT = (Path(__file__).resolve().parent.parent / "examples" / "synthetic_jd_zh.txt").read_text(encoding="utf-8")
 CONTACT = {"name": "Alex Example", "location": "Los Angeles, CA", "email": "alex@example.com", "links": []}
+EN = {"language": "en"}  # what the page sends to check its English CV
 
 
 def pdf_of(lines):
@@ -90,6 +91,12 @@ class V2Case(unittest.TestCase):
         token = re.search(r'name="workbench-token" content="([^"]+)"', page.text).group(1)
         self.assertIn('name="workbench-mode" content="v2"', page.text)
         return client, {"X-Workbench-Token": token}
+
+    def shown(self, client, headers, job_id):
+        """What the page sends with an action on a check: the CV language and the version of the
+        check it shows."""
+        gaps = client.get(f"/api/jobs/{job_id}", headers=headers).json()["gaps"]
+        return {"language": gaps["language"], "gaps_version": gaps["version"]}
 
     def settle(self, client, headers, response):
         """Follow a queued task to its end, as the page does; returns the final task."""
@@ -233,7 +240,7 @@ class FlowTests(V2Case):
         cv = view["cv"]["en"]
         self.assertEqual((cv["head"], cv["stale"]), ("tailored", False))
         self.assertEqual([stage["status"] for stage in cv["stages"]], ["done", "done", "fallback"])
-        gaps = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        gaps = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
         self.assertEqual(gaps["status"], "succeeded")
         self.assertEqual(client.get(f"/api/jobs/{job_id}", headers=headers).json()["gaps"]["counts"]["none"], 3)
         preview = client.get(f"/preview/{job_id}/en", params={"v": cv["content_sha256"]}, headers=headers)
@@ -388,12 +395,12 @@ class FlowTests(V2Case):
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
         set_setting(self.database, "user_daily_units", "4")  # already used: 1 upload + 3 for the job
-        refused = client.post(f"/api/jobs/{job_id}/gaps", headers=headers)
+        refused = client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN)
         self.assertEqual((refused.status_code, refused.json()["code"]), (429, "quota_exhausted"))
         self.assertEqual(refused.headers["Retry-After"], "60")
         set_setting(self.database, "user_daily_units", "40")
         set_setting(self.database, "tasks_enabled", "0")
-        paused = client.post(f"/api/jobs/{job_id}/gaps", headers=headers)
+        paused = client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN)
         self.assertEqual((paused.status_code, paused.json()["code"]), (503, "tasks_paused"))
 
 
@@ -407,8 +414,9 @@ class IsolationTests(V2Case):
         export = a.post(f"/api/jobs/{job_id}/cv/en/export", headers=a_headers)
         self.settle(a, a_headers, export)
         task_id = export.json()["task"]["task_id"]
-        gaps = self.settle(a, a_headers, a.post(f"/api/jobs/{job_id}/gaps", headers=a_headers))
+        gaps = self.settle(a, a_headers, a.post(f"/api/jobs/{job_id}/gaps", headers=a_headers, json=EN))
         requirement = a.get(f"/api/jobs/{job_id}", headers=a_headers).json()["gaps"]["requirements"][0]["requirement_id"]
+        page = self.shown(a, a_headers, job_id)
         fact = a.get("/api/facts", headers=a_headers).json()["facts"][0]
         before = (a.get(f"/api/jobs/{job_id}", headers=a_headers).json(), a.get("/api/facts", headers=a_headers).json())
         b, b_headers = self.browser("bob")
@@ -421,9 +429,13 @@ class IsolationTests(V2Case):
             ("post", f"/api/jobs/{job_id}/cv/en/export", None), ("post", f"/api/jobs/{job_id}/cv/en/prepare", None),
             ("post", f"/api/jobs/{job_id}/cv/en/tailor", None), ("post", f"/api/jobs/{job_id}/cv/en/plan", None),
             ("post", f"/api/jobs/{job_id}/cv/en/change", {"change_id": "x", "undone": True}),
-            ("post", f"/api/jobs/{job_id}/gaps", None), ("post", f"/api/jobs/{job_id}/gaps/{requirement}/accept", None),
-            ("post", f"/api/jobs/{job_id}/gaps/{requirement}/decline", None),
+            ("post", f"/api/jobs/{job_id}/gaps", None), ("post", f"/api/jobs/{job_id}/gaps", EN),
+            ("post", f"/api/jobs/{job_id}/gaps/{requirement}/accept", None),
+            ("post", f"/api/jobs/{job_id}/gaps/{requirement}/accept", page),
+            ("post", f"/api/jobs/{job_id}/gaps/{requirement}/decline", page),
+            ("post", f"/api/jobs/{job_id}/gaps/{requirement}/suggest", page),
             ("post", f"/api/jobs/{job_id}/gaps/{requirement}/write", {"place": "x", "text": "y"}),
+            ("post", f"/api/jobs/{job_id}/gaps/{requirement}/write", {"place": "x", "text": "y", **page}),
             ("post", f"/api/jobs/{job_id}/requirements/decide", {"confirm": [], "exclude": [], "expected_version": 1}),
             ("post", f"/api/jobs/{job_id}/requirements/add", {"text": "熟悉Python", "expected_version": 1}),
             ("post", f"/api/jobs/{job_id}/requirements/find", {"expected_version": 1}),
@@ -537,23 +549,26 @@ class MoreRouteTests(V2Case):
         job_id = self.new_job(client, headers)
         view = self.job(client, headers, job_id)
         self.assertIsNotNone(view['cv']['en']['head'])
-        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
         view = self.job(client, headers, job_id)
         rid = next(r['requirement_id'] for r in view['gaps']['requirements'] if r['text'] == '熟悉Python，了解SQL')
         text = 'Led backend development over 3 years, building Python services and SQL data pipelines.'
         self.chat.gap_suggestions = lambda ids: [{'requirement': rid, 'kind': 'bullet',
             'entry': 's1e0', 'text': text, 'tags': ['Python', 'SQL']}]
-        generated = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps/{rid}/suggest", headers=headers))
+        generated = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps/{rid}/suggest", headers=headers,
+                                                             json=self.shown(client, headers, job_id)))
         self.assertEqual(generated['status'], 'succeeded')
         view = self.job(client, headers, job_id)
         row = next(r for r in view['gaps']['requirements'] if r['requirement_id'] == rid)
         self.assertEqual(row['suggestion']['text'], text)
         place = next(p['id'] for p in view['gaps']['places'] if p['kind'] == 'bullet')
-        adopted = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps/{rid}/write",
-            json={'place': place, 'text': text}, headers=headers))
-        self.assertEqual(adopted['status'], 'succeeded')
+        adopted = client.post(f"/api/jobs/{job_id}/gaps/{rid}/write",
+            json={'place': place, 'text': text, **self.shown(client, headers, job_id)}, headers=headers)
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        self.assertNotIn('task', adopted.json())
+        self.assertIn(text, client.get(f'/preview/{job_id}/en').text)
         after = client.get('/api/facts', headers=headers).json()['facts']
-        self.assertEqual(sum(f['text'] == text for f in after), 1)
+        self.assertEqual(sum(f['text'] == text for f in after), 0)
         self.assertTrue(any(f['status'] == 'pending' for f in after))
         view = self.job(client, headers, job_id)
         approved = client.post(f"/api/jobs/{job_id}/cv/en/approve",
@@ -566,21 +581,23 @@ class MoreRouteTests(V2Case):
     def test_targeted_suggestion_is_private_cached_and_never_confirms_a_fact(self):
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
-        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
         before = client.get("/api/facts", headers=headers).json()
         view = self.job(client, headers, job_id)
         rid = next(r["requirement_id"] for r in view["gaps"]["requirements"] if r["text"] == "熟悉Python，了解SQL")
         self.chat.gap_suggestions = lambda ids: [{"requirement": ids["熟悉Python，了解SQL"], "kind": "skill",
             "line": "fact-skills-languages", "items": ["SQL"]}]
         url = f"/api/jobs/{job_id}/gaps/{rid}/suggest"
+        page = self.shown(client, headers, job_id)
         other, other_headers = self.browser("other")
         self.assertEqual(other.post(url, headers=other_headers).status_code, 404)
-        response = client.post(url, headers={**headers, "Idempotency-Key": "one-suggestion"})
+        self.assertEqual(other.post(url, headers=other_headers, json=page).status_code, 404)
+        response = client.post(url, headers={**headers, "Idempotency-Key": "one-suggestion"}, json=page)
         self.assertEqual(self.settle(client, headers, response)["status"], "succeeded")
         self.assertEqual(client.get("/api/facts", headers=headers).json(), before)
         usage = client.get("/api/me", headers=headers).json()["usage"]["tokens"]["calls"]
         for _ in range(2):
-            saved = client.post(url, headers={**headers, "Idempotency-Key": "one-suggestion"})
+            saved = client.post(url, headers={**headers, "Idempotency-Key": "one-suggestion"}, json=page)
             self.assertEqual(saved.status_code, 200)
         self.assertEqual(client.get("/api/me", headers=headers).json()["usage"]["tokens"]["calls"], usage)
         row = next(r for r in saved.json()["gaps"]["requirements"] if r["requirement_id"] == rid)
@@ -590,18 +607,19 @@ class MoreRouteTests(V2Case):
     def test_empty_suggestion_fails_and_can_retry_complete_content(self):
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
-        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
         before = client.get('/api/facts', headers=headers).json()
         rid = next(r['requirement_id'] for r in self.job(client, headers, job_id)['gaps']['requirements']
                    if r['text'] == '熟悉Python，了解SQL')
         url = f'/api/jobs/{job_id}/gaps/{rid}/suggest'
-        self.assertEqual(self.settle(client, headers, client.post(url, headers=headers))['status'], 'failed')
+        page = self.shown(client, headers, job_id)
+        self.assertEqual(self.settle(client, headers, client.post(url, headers=headers, json=page))['status'], 'failed')
         self.chat.gap_suggestions = lambda ids: [{"requirement": rid, "kind": "skill",
             "line": "fact-skills-languages", "items": ["SQL"]}]
-        self.assertEqual(self.settle(client, headers, client.post(url, headers=headers))['status'], 'succeeded')
+        self.assertEqual(self.settle(client, headers, client.post(url, headers=headers, json=page))['status'], 'succeeded')
         usage = client.get('/api/me', headers=headers).json()['usage']['tokens']['calls']
         for _ in range(2):
-            response = client.post(url, headers=headers)
+            response = client.post(url, headers=headers, json=page)
             self.assertEqual(response.status_code, 200)
             row = next(r for r in response.json()['gaps']['requirements'] if r['requirement_id'] == rid)
             self.assertEqual(row['suggestion']['items'], ['SQL'])
@@ -612,16 +630,16 @@ class MoreRouteTests(V2Case):
     def test_targeted_suggestion_is_not_published_after_inputs_change(self):
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
-        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
         view = self.job(client, headers, job_id)
         rid = view["gaps"]["requirements"][0]["requirement_id"]
         uid = tenant_store.provision_user(self.database, issuer=ISSUER, subject="alice")
         user = UserWorkspace(self.database, uid)
         def change_during_call(ids):
-            user.decline_gap(job_id, rid)
+            user.decline_gap(job_id, rid, language="en", shown_version=view["gaps"]["version"])
             return [{"requirement": rid, "kind": "skill", "line": "fact-skills-languages", "items": ["SQL"]}]
         self.chat.gap_suggestions = change_during_call
-        response = client.post(f"/api/jobs/{job_id}/gaps/{rid}/suggest", headers=headers)
+        response = client.post(f"/api/jobs/{job_id}/gaps/{rid}/suggest", headers=headers, json=self.shown(client, headers, job_id))
         self.assertEqual(self.settle(client, headers, response)["status"], "superseded")
         row = next(r for r in self.job(client, headers, job_id)["gaps"]["requirements"] if r["requirement_id"] == rid)
         self.assertEqual(row["suggestion_status"], "declined")
@@ -724,22 +742,24 @@ class MoreRouteTests(V2Case):
         with tenant_store.transaction(self.database) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'").fetchone()[0], 0)
 
-    def test_answers_to_gaps_become_confirmed_lines_and_the_cv_is_prepared_again(self):
+    def test_answers_to_gaps_change_only_this_cv_without_regeneration(self):
         self.chat.gap_suggestions = lambda ids: [
             {"requirement": ids["熟悉Python，了解SQL"], "kind": "skill", "line": "fact-skills-languages", "items": ["SQL"]}]
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
-        self.assertEqual(self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))["status"],
+        self.assertEqual(self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))["status"],
                          "succeeded")
         gaps = self.job(client, headers, job_id)["gaps"]
         by_text = {item["text"]: item for item in gaps["requirements"]}
         python = by_text["熟悉Python，了解SQL"]
         self.assertEqual(python["suggestion"]["items"], ["SQL"])
-        accepted = client.post(f"/api/jobs/{job_id}/gaps/{python['requirement_id']}/accept", headers=headers)
-        self.assertEqual(self.settle(client, headers, accepted)["status"], "succeeded")
+        accepted = client.post(f"/api/jobs/{job_id}/gaps/{python['requirement_id']}/accept", headers=headers,
+                               json={"language": "en", "gaps_version": gaps["version"]})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertNotIn("task", accepted.json())
         facts = client.get("/api/facts", headers=headers).json()["facts"]
         skills = next(fact for fact in facts if fact["text"].startswith("Languages:"))
-        self.assertEqual((skills["text"], skills["status"], skills["version"]), ("Languages: Python, Java, SQL", "confirmed", 2))
+        self.assertEqual((skills["text"], skills["status"], skills["version"]), ("Languages: Python, Java", "confirmed", 1))
         view = self.job(client, headers, job_id)
         self.assertFalse(view["cv"]["en"]["stale"])
         # The adopted line made the check out of date: no row reads as missing now, also when the
@@ -750,19 +770,23 @@ class MoreRouteTests(V2Case):
             rows = {item["text"]: item for item in gaps["requirements"]}
             self.assertEqual({text: (row["status"], row["verdict"]) for text, row in rows.items()},
                              {text: ("recheck", "none") for text in by_text})
-            self.assertEqual(rows["熟悉Python，了解SQL"]["suggestion_status"], "added")
+            self.assertTrue(rows["熟悉Python，了解SQL"]["suggestion_adopted"])
         self.assertEqual(len(self.chat.sent), sent)
         degree = by_text["本科及以上学历，计算机相关专业"]
-        declined = client.post(f"/api/jobs/{job_id}/gaps/{degree['requirement_id']}/decline", headers=headers)
+        declined = client.post(f"/api/jobs/{job_id}/gaps/{degree['requirement_id']}/decline", headers=headers,
+                               json=self.shown(client, headers, job_id))
         self.assertEqual(declined.status_code, 200)
         place = next(item for item in view["gaps"]["places"] if item["kind"] == "bullet")
         weekly = by_text["每周至少实习4天"]
         written = client.post(f"/api/jobs/{job_id}/gaps/{weekly['requirement_id']}/write", headers=headers,
-                              json={"place": place["id"], "text": "Worked four days a week during the internship."})
-        self.assertEqual(self.settle(client, headers, written)["status"], "succeeded")
+                              json={"place": place["id"], "text": "Worked four days a week during the internship.",
+                                    **self.shown(client, headers, job_id)})
+        self.assertEqual(written.status_code, 200, written.text)
+        self.assertNotIn("task", written.json())
         own = [fact for fact in client.get("/api/facts", headers=headers).json()["facts"]
                if fact["text"] == "Worked four days a week during the internship."]
-        self.assertEqual([fact["status"] for fact in own], ["confirmed"])
+        self.assertEqual(own, [])
+        self.assertIn("Worked four days a week during the internship.", client.get(f"/preview/{job_id}/en").text)
 
     def test_after_one_adoption_another_suggestion_is_asked_for_and_adopted_without_a_check(self):
         # Dogfood round 3: adopting one line made the check out of date, and the next requirement
@@ -770,29 +794,36 @@ class MoreRouteTests(V2Case):
         from gaps import EVIDENCE_RULES
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
-        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers))
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
         gaps = self.job(client, headers, job_id)["gaps"]
         rows = {row["text"]: row for row in gaps["requirements"]}
         python, weekly = rows["熟悉Python，了解SQL"]["requirement_id"], rows["每周至少实习4天"]["requirement_id"]
         place = next(item["id"] for item in gaps["places"] if item["kind"] == "bullet")
         first = client.post(f"/api/jobs/{job_id}/gaps/{python}/write", headers=headers,
-                            json={"place": place, "text": "Built Python services with SQL data pipelines."})
-        self.assertEqual(self.settle(client, headers, first)["status"], "succeeded")
+                            json={"place": place, "text": "Built Python services with SQL data pipelines.",
+                                  **self.shown(client, headers, job_id)})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertNotIn("task", first.json())
         self.assertTrue(self.job(client, headers, job_id)["gaps"]["stale"])
         checks = self.chat.systems.count(EVIDENCE_RULES)
         text = "Worked four days a week throughout the internship."
         self.chat.gap_suggestions = lambda ids: [{"requirement": weekly, "kind": "bullet", "entry": "s1e0", "text": text, "tags": []}]
-        asked = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps/{weekly}/suggest", headers=headers))
+        asked = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps/{weekly}/suggest", headers=headers,
+                                                         json=self.shown(client, headers, job_id)))
         self.assertEqual(asked["status"], "succeeded", asked)
         row = next(row for row in self.job(client, headers, job_id)["gaps"]["requirements"] if row["requirement_id"] == weekly)
         self.assertEqual((row["status"], row["verdict"], row["suggestion"]["text"]), ("recheck", "none", text))
-        adopted = client.post(f"/api/jobs/{job_id}/gaps/{weekly}/write", headers=headers, json={"place": place, "text": text})
-        self.assertEqual(self.settle(client, headers, adopted)["status"], "succeeded")
+        left_open = self.shown(client, headers, job_id)  # a tab that shows the suggestion, before it is adopted
+        adopted = client.post(f"/api/jobs/{job_id}/gaps/{weekly}/write", headers=headers,
+                              json={"place": place, "text": text, **left_open})
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        self.assertNotIn("task", adopted.json())
         self.assertEqual(self.chat.systems.count(EVIDENCE_RULES), checks)  # no check ran in between
         facts = client.get("/api/facts", headers=headers).json()["facts"]
-        self.assertEqual(sum(fact["text"] == text for fact in facts), 1)
+        self.assertEqual(sum(fact["text"] == text for fact in facts), 0)
+        self.assertIn(text, client.get(f"/preview/{job_id}/en").text)
         # Accepting it again (a tab left open) saves nothing and queues no new preparation.
-        again = client.post(f"/api/jobs/{job_id}/gaps/{weekly}/accept", headers=headers)
+        again = client.post(f"/api/jobs/{job_id}/gaps/{weekly}/accept", headers=headers, json=left_open)
         self.assertEqual(again.status_code, 200, again.text)
         self.assertNotIn("task", again.json())
         self.assertEqual(client.get("/api/facts", headers=headers).json()["facts"], facts)
@@ -979,3 +1010,128 @@ class StartupTests(unittest.TestCase):
         (self.data / ".workbench-format").write_text("3\n", encoding="utf-8")
         with self.assertRaises(DataFormatError):
             claim_v2_format(self.data)
+
+
+
+class CheckLanguageTests(V2Case):
+    """A check stands only for the requirements it judged, each CV language keeps its own, and a
+    page acts only on the check it shows (docs/architecture-handoff.md round 1 A and B): the real
+    app, runner and store, the scripted model."""
+
+    def job(self, client, headers, job_id):
+        return client.get(f"/api/jobs/{job_id}", headers=headers).json()
+
+    def use(self, client, headers, job_id, language):
+        response = client.post(f"/api/jobs/{job_id}/language", json={"language": language}, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def bilingual_job(self):
+        """A signed-in user with an English and a Chinese CV, and a job with both prepared."""
+        client, headers = self.ready_user()
+        task = self.settle(client, headers, client.post("/api/cv/upload?language=zh", content=pdf_of(LINES),
+                                                        headers={**headers, "Content-Type": "application/pdf"}))
+        self.assertEqual(task["status"], "succeeded", task)
+        saved = client.post(f"/api/cv/uploads/{task['result']['upload_id']}/save", json=CONTACT, headers=headers)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        job_id = self.new_job(client, headers)
+        for language in ("en", "zh"):
+            if not self.job(client, headers, job_id)["cv"][language]["head"]:
+                prepared = client.post(f"/api/jobs/{job_id}/cv/{language}/prepare", headers=headers)
+                self.assertEqual(self.settle(client, headers, prepared)["status"], "succeeded")
+        return client, headers, job_id
+
+    def test_after_the_requirements_change_the_old_check_is_no_result_and_nothing_is_taken_from_it(self):
+        self.chat.gap_suggestions = lambda ids: [
+            {"requirement": ids["熟悉Python，了解SQL"], "kind": "skill", "line": "fact-skills-languages", "items": ["SQL"]}]
+        client, headers = self.ready_user()
+        job_id = self.new_job(client, headers)
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
+        view = self.job(client, headers, job_id)
+        page = self.shown(client, headers, job_id)
+        rows = {row["text"]: row for row in view["gaps"]["requirements"]}
+        self.assertEqual(view["gaps"]["state"], "current")
+        removed = "每周至少实习4天"
+        by_text = {item["text"]: item for item in view["candidates"]}
+        decided = client.post(f"/api/jobs/{job_id}/requirements/decide", headers=headers, json={
+            "confirm": [item["id"] for text, item in by_text.items() if text != removed],
+            "exclude": [by_text[removed]["id"]], "expected_version": view["requirements_version"]})
+        self.assertEqual(self.settle(client, headers, decided)["status"], "succeeded")  # the CV is prepared again
+        self.assertFalse(self.job(client, headers, job_id)["cv"]["en"]["stale"])
+        self.assertEqual(sorted(item["text"] for item in self.job(client, headers, job_id)["selected_requirements"]),
+                         sorted(set(rows) - {removed}))
+        sent = len(self.chat.sent)
+        for _ in range(2):  # opened again, refreshed
+            gaps = self.job(client, headers, job_id)["gaps"]
+            self.assertEqual((gaps["state"], gaps["requirements_changed"], gaps["stale"], gaps["requirements"]),
+                             ("requirements_changed", True, True, []))
+            self.assertNotIn(removed, json.dumps(gaps, ensure_ascii=False))
+        self.assertEqual(len(self.chat.sent), sent)  # no model call
+        facts = client.get("/api/facts", headers=headers).json()
+        python = rows["熟悉Python，了解SQL"]["requirement_id"]
+        place = next(item["id"] for item in view["gaps"]["places"] if item["kind"] == "bullet")
+        for action, body in (("accept", page), ("decline", page), ("suggest", page),
+                             ("write", {"place": place, "text": "Wrote SQL reports in Python.", **page})):
+            response = client.post(f"/api/jobs/{job_id}/gaps/{python}/{action}", headers=headers, json=body)
+            self.assertEqual(response.status_code, 409, (action, response.text))
+        self.assertEqual(client.get("/api/facts", headers=headers).json(), facts)
+        self.assertEqual(len(self.chat.sent), sent)
+        # Checking again gives the result for the requirements of now.
+        again = client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN)
+        self.assertEqual(self.settle(client, headers, again)["status"], "succeeded")
+        gaps = self.job(client, headers, job_id)["gaps"]
+        self.assertEqual(gaps["state"], "current")
+        self.assertEqual(sorted(row["text"] for row in gaps["requirements"]), sorted(set(rows) - {removed}))
+
+    def test_each_language_keeps_its_own_check_through_switches_refreshes_and_reopening(self):
+        client, headers, job_id = self.bilingual_job()
+        self.use(client, headers, job_id, "en")
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
+        en = self.job(client, headers, job_id)["gaps"]
+        self.assertNotIn("gaps", self.use(client, headers, job_id, "zh"))  # never checked in Chinese: nothing borrowed
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json={"language": "zh"}))
+        zh = self.job(client, headers, job_id)["gaps"]
+        self.assertEqual((en["language"], zh["language"]), ("en", "zh"))
+        self.assertLess(en["version"], zh["version"])
+        sent = len(self.chat.sent)
+        for language, expected in (("en", en), ("zh", zh), ("en", en)):
+            switched = self.use(client, headers, job_id, language)["gaps"]
+            for shown in (switched, self.job(client, headers, job_id)["gaps"]):  # switched, then reloaded
+                self.assertEqual((shown["language"], shown["version"], shown["state"], shown["requirements"]),
+                                 (language, expected["version"], "current", expected["requirements"]))
+        self.assertEqual(len(self.chat.sent), sent)  # no model call
+
+    def test_a_page_left_open_in_one_language_never_writes_to_the_others_check_or_cv(self):
+        client, headers, job_id = self.bilingual_job()
+        self.use(client, headers, job_id, "en")
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
+        english = self.job(client, headers, job_id)  # the English page, left open
+        page = self.shown(client, headers, job_id)
+        rid = english["gaps"]["requirements"][0]["requirement_id"]
+        place = next(item["id"] for item in english["gaps"]["places"] if item["kind"] == "bullet")
+        # Another tab switches the job to Chinese and checks that CV.
+        self.use(client, headers, job_id, "zh")
+        self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json={"language": "zh"}))
+        chinese = self.shown(client, headers, job_id)
+        user = UserWorkspace(self.database, tenant_store.provision_user(self.database, issuer=ISSUER, subject="alice"))
+        before = user.job_snapshot(job_id)
+        profiles = {language: user.get_profile(language)["version"] for language in ("en", "zh")}
+        line = "Built Python services backed by SQL reports."
+        # A language with the other language's check version, or no say at all, changes nothing.
+        for body in ({"place": place, "text": line, "language": "en", "gaps_version": chinese["gaps_version"]},
+                     {"place": place, "text": line}):
+            refused = client.post(f"/api/jobs/{job_id}/gaps/{rid}/write", headers=headers, json=body)
+            self.assertEqual(refused.status_code, 409, refused.text)
+        self.assertEqual(user.job_snapshot(job_id)["gaps"], before["gaps"])
+        # What the English page sends goes to the English check and CV only.
+        written = client.post(f"/api/jobs/{job_id}/gaps/{rid}/write", headers=headers,
+                              json={"place": place, "text": line, **page})
+        self.assertEqual(written.status_code, 200, written.text)
+        self.assertNotIn("task", written.json())  # no model task was queued
+        after = user.job_snapshot(job_id)
+        self.assertEqual(after["gaps"]["zh"], before["gaps"]["zh"])
+        self.assertEqual(after["gaps"]["en"], before["gaps"]["en"])
+        self.assertEqual({language: user.get_profile(language)["version"] for language in ("en", "zh")},
+                         profiles)
+        self.assertEqual(after["cv"]["zh"]["material"]["material_id"], before["cv"]["zh"]["material"]["material_id"])
+        self.assertIn(line, json.dumps(after["cv"]["en"]["material"]["draft"], ensure_ascii=False))

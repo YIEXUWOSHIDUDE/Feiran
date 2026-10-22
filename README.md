@@ -45,6 +45,14 @@ Choose an uploaded Chinese or English CV for each job. Uploading again replaces 
 
 All regions share one listings database; Mainland China, other regions and unknown-location filters use explicit workplace locations. You can also add Tencent's public board at `https://careers.tencent.com/zh-cn/search.html`. Its list contains responsibility summaries; full requirements are fetched on selection. BOSS, ByteDance and Alibaba automatic refresh adapters are not yet included; paste their full descriptions instead. Cached postings reflect the time they were fetched; check the official page before applying.
 
+### Local editing on the current branch (2026-10-22)
+
+Adopting or writing an entry changes only this job’s CV, word for word, without preparing the whole CV again. Use **Edit this CV** to change individual lines, undo or redo local changes, and **Save to my profile** only when you want to reuse a line across jobs. Changed CVs need approval again.
+
+Unsaved words survive task polling and navigation within the same tab. Reloading or closing the tab clears unsaved drafts. A conflicting save keeps your text; copy it or use **Discard unsaved changes** to load the latest line. Missing original lines keep recoverable unsaved text. Drafts are held in memory, not browser persistent storage.
+
+These changes were checked in a local V2 browser with synthetic data and real DeepSeek calls; they have not been deployed. The generated English PDF passed text and visual checks, but the browser download click was blocked by the client. See [development evidence and limits](docs/development.md).
+
 ## Your information and your decisions
 
 - Your experience and saved materials stay in the private data directory of your Feiran instance. In a cloud workspace, this is on the cloud host; local operation stores it on your computer.

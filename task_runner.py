@@ -6,6 +6,11 @@ claims queued tasks in short transactions and runs each handler in a worker thre
 inside a database transaction, and a handler's results are published only while its execution
 token is valid. There is deliberately no second process, Redis or Celery: one Uvicorn worker
 runs this app (see docs/v2-plan.md for when that would change).
+
+Those limits count the handlers actually running, each execution (task, token) on its own: a
+task cancelled or timed out in the database may still have its handler waiting on a call, and
+until that handler returns it keeps its slot and its user's turn, even when the same task is
+queued again meanwhile.
 """
 
 import logging
@@ -111,7 +116,9 @@ class TaskRunner:
         self.total, self.pdf, self.deadline, self.poll = total, pdf, deadline, poll_seconds
         self.model = model
         self._wake = threading.Condition()
-        self._running: dict[str, str] = {}  # task_id -> heavy kind, for this process's slots
+        # (task_id, execution token) -> (user_id, heavy kind): one entry per handler running in
+        # this process, from its claim until it returns, whatever the database says meanwhile.
+        self._running: dict[tuple[str, str], tuple[str, str]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._pool = ThreadPoolExecutor(max_workers=total, thread_name_prefix="task")
@@ -138,6 +145,7 @@ class TaskRunner:
             self._wake.notify_all()
 
     def idle(self) -> bool:
+        """Whether no handler runs in this process (a cancelled one still running counts)."""
         with self._wake:
             return not self._running
 
@@ -154,12 +162,14 @@ class TaskRunner:
         tenant_store.expire_tasks(self.database)
         with self._wake:
             free = self.total - len(self._running)
-            free_pdf = self.pdf - sum(kind == "pdf" for kind in self._running.values())
+            free_pdf = self.pdf - sum(kind == "pdf" for _user, kind in self._running.values())
+            busy = {user for user, _kind in self._running.values()}
         if free <= 0:
             return
-        for claimed in tenant_store.claim_tasks(self.database, total=free, pdf=free_pdf, deadline=self.deadline):
+        for claimed in tenant_store.claim_tasks(self.database, total=free, pdf=free_pdf, deadline=self.deadline,
+                                                busy=busy):
             with self._wake:
-                self._running[claimed["task_id"]] = claimed["heavy"]
+                self._running[(claimed["task_id"], claimed["token"])] = (claimed["user_id"], claimed["heavy"])
             self._pool.submit(self._run, claimed)
 
     def _run(self, claimed: dict[str, Any]) -> None:
@@ -188,8 +198,8 @@ class TaskRunner:
             run_log.event(log, "task_error", level=logging.ERROR, error=True, operation=claimed["operation"])
             self._end(context, "internal_error", "Something went wrong; try again, or report it if it happens again")
         finally:
-            with self._wake:
-                self._running.pop(claimed["task_id"], None)
+            with self._wake:  # only this execution's place: a retry of the same task keeps its own
+                self._running.pop((claimed["task_id"], claimed["token"]), None)
                 self._wake.notify_all()
         run_log.event(log, "task", operation=claimed["operation"], outcome=outcome)
 

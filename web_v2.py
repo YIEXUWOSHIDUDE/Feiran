@@ -36,10 +36,11 @@ from starlette.routing import Match
 import run_log
 import tenant_store
 from cv import CVError, rejected_lines, render_html, rewritten_lines
+from cv_edit import edits_view, lines_view, shown_places, with_adoptions
 from cv_import import MAX_PDF_BYTES, CVImportError, read_pdf_limited
 from cv_status import CANDIDATE_FIELDS, describe_fallbacks, explained
 from facts import FactStoreError, parse_fact_refs, tag_finder
-from gaps import GAPS_VERSION, coverage, places, suggestion_target
+from gaps import coverage, suggestion_target
 from identity import Identity, IdentityError, OIDCSettings
 from job_search import SearchError, check_board, fetch_board, parse_board_link, parse_posting_link, prepare_pasted_jd
 from job_url import normalize_url
@@ -231,9 +232,31 @@ class ApproveRequest(BaseModel):
     expected_content_sha256: str
 
 
-class WriteLineRequest(BaseModel):
+class GapRequest(BaseModel):
+    """Which check a gap action is about, as the page showed it: the CV language and, for an
+    action on one requirement, the version of that language's check. Another tab may have
+    switched the job's language or checked again since; a page that does not say is out of date."""
+    language: str | None = None
+    gaps_version: int | None = None
+
+
+class WriteLineRequest(GapRequest):
     place: str
     text: str
+
+
+class LineEditRequest(BaseModel):
+    """New words for one line of a job's CV, and the words the page showed for it."""
+    text: str
+    expected_text: str
+
+
+class EditUndoRequest(BaseModel):
+    undone: bool = True
+
+
+class SaveLineRequest(BaseModel):
+    expected_text: str
 
 
 class ConsentRequest(BaseModel):
@@ -921,66 +944,109 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
                       job_id=job_id)
         return queued(task, **job_view(user, job_id))
 
+    def shown_language(body: GapRequest | None) -> str:
+        """The CV language whose check the page acted on; a page that does not say is out of date."""
+        if body is None or body.language is None:
+            raise Conflict(PAGE_OUT_OF_DATE)
+        return _language(body.language)
+
+    def shown_check(user: UserWorkspace, job_id: str, body: GapRequest | None) -> tuple[str, int]:
+        """The language and the version of the check the page acted on, once the job is found
+        (another user's job is not found, whatever the page sent)."""
+        user.get_job(job_id)
+        language = shown_language(body)
+        if body.gaps_version is None:
+            raise Conflict(PAGE_OUT_OF_DATE)
+        return language, body.gaps_version
+
     @app.post("/api/jobs/{job_id}/gaps")
-    def check_gaps(request: Request, job_id: str) -> JSONResponse:
+    def check_gaps(request: Request, job_id: str, body: GapRequest | None = None) -> JSONResponse:
+        """Check the job's CV in the language the page showed (another tab may have switched the
+        job to the other one since) against the current requirements and that language's last check."""
         user = workspace(request)
         snapshot = user.job_snapshot(job_id)
-        view = build_job_view(snapshot)
-        head = snapshot["cv"][view["language"]]
+        language = shown_language(body)
+        head = snapshot["cv"][language]
         if head is None:
             raise StoreError("请先准备这个岗位的简历，再检查缺口")
-        version = snapshot["gaps"]["version"] if snapshot["gaps"] else 0
+        last = snapshot["gaps"][language]
+        version = last["version"] if last else 0
         facts = hashlib.sha256(json.dumps(snapshot["confirmed"]).encode()).hexdigest()[:16]
-        task = submit(request, "check_gaps", {"job_id": job_id},
-                      context={"language": view["language"], "base_gaps_version": version},
-                      key=f"gaps:{job_id}:{head['material']['material_id']}:{version}:{facts}", job_id=job_id)
-        return queued(task, **view)
+        task = submit(request, "check_gaps", {"job_id": job_id, "language": language},
+                      context={"language": language, "base_gaps_version": version},
+                      key=f"gaps:{job_id}:{language}:{head['material']['material_id']}:{version}:{facts}", job_id=job_id)
+        return queued(task, **build_job_view(snapshot))
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/suggest", response_model=None)
-    def suggest_entry(request: Request, job_id: str, requirement_id: str) -> dict | JSONResponse:
+    def suggest_entry(request: Request, job_id: str, requirement_id: str,
+                      body: GapRequest | None = None) -> dict | JSONResponse:
         user = workspace(request)
-        snapshot = user.job_snapshot(job_id)
-        view = build_job_view(snapshot)
-        inputs = user.gaps_inputs(job_id, view['language'])
+        language, shown = shown_check(user, job_id, body)
+        if user.gaps_language(job_id, shown) != language:
+            raise Conflict(PAGE_OUT_OF_DATE)
+        inputs = user.gaps_inputs(job_id, language)
         if not inputs['gaps'] or not inputs['head'] or not inputs['requirements']:
             raise StoreError('Check this CV against the requirements first.')
         try:
             item = suggestion_target(inputs['gaps']['gaps'], inputs['requirements']['decided'],
-                                     inputs['head']['draft'], requirement_id)
+                                     inputs['head']['draft'], requirement_id, inputs['requirements']['version'])
         except ValueError as exc:
             raise Conflict(str(exc)) from exc
         if item.get('suggestion') or item['status'] in ('added', 'declined'):
             return job_view(user, job_id)
         version = inputs['gaps']['version']
-        task = submit(request, 'suggest_gap', {'job_id': job_id, 'requirement_id': requirement_id},
-                      context={'language': view['language'], 'base_gaps_version': version,
+        task = submit(request, 'suggest_gap', {'job_id': job_id, 'requirement_id': requirement_id, 'language': language},
+                      context={'language': language, 'base_gaps_version': version,
                                'checked_head': inputs['head']['material_id'],
                                'requirements_version': inputs['requirements']['version']},
-                      key=f'suggestion:{job_id}:{requirement_id}:{version}', job_id=job_id)
+                      key=f'suggestion:{job_id}:{language}:{requirement_id}:{version}', job_id=job_id)
         return queued(task)
 
-    def gap_change(request: Request, job_id: str, change: Callable[[UserWorkspace], dict]) -> JSONResponse:
-        user = workspace(request)
-        changed = change(user)
-        view = job_view(user, job_id)
-        cv = view["cv"].get(changed["language"]) or {}
-        if not changed["changed"] and cv.get("head") and not cv.get("stale"):
-            # The same line again, already in the prepared CV: preparing again would only replace it.
-            return JSONResponse(view)
-        return then_prepare(request, job_id, changed["language"], view)
+    # Adopting puts the words on this job's CV in the check's language, and nowhere else: nothing
+    # is prepared again, and the profile changes only when the user saves a line to it (below).
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/accept")
-    def accept_suggestion(request: Request, job_id: str, requirement_id: str) -> JSONResponse:
-        return gap_change(request, job_id, lambda user: user.accept_gap(job_id, requirement_id))
+    def accept_suggestion(request: Request, job_id: str, requirement_id: str, body: GapRequest | None = None) -> dict:
+        user = workspace(request)
+        language, shown = shown_check(user, job_id, body)
+        user.accept_gap(job_id, requirement_id, language=language, shown_version=shown, request_id=client_key(request))
+        return job_view(user, job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/write")
-    def write_own_line(request: Request, job_id: str, requirement_id: str, body: WriteLineRequest) -> JSONResponse:
-        return gap_change(request, job_id, lambda user: user.write_gap_line(job_id, requirement_id, body.place, body.text))
+    def write_own_line(request: Request, job_id: str, requirement_id: str, body: WriteLineRequest) -> dict:
+        user = workspace(request)
+        language, shown = shown_check(user, job_id, body)
+        user.write_gap_line(job_id, requirement_id, body.place, body.text, language=language, shown_version=shown,
+                            request_id=client_key(request))
+        return job_view(user, job_id)
+
+    # -- the job CV's own lines: edit, undo or redo, save to the profile ---------------------
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/lines/{block}")
+    def cv_edit_line(request: Request, job_id: str, language: str, block: str, body: LineEditRequest) -> dict:
+        user = workspace(request)
+        user.edit_cv_line(job_id, _language(language), block, body.text, expected_text=body.expected_text,
+                          request_id=client_key(request))
+        return job_view(user, job_id)
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/lines/{block}/save")
+    def cv_save_line(request: Request, job_id: str, language: str, block: str, body: SaveLineRequest) -> dict:
+        user = workspace(request)
+        user.save_cv_line(job_id, _language(language), block, expected_text=body.expected_text,
+                          request_id=client_key(request))
+        return job_view(user, job_id)
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/edits/{edit_id}")
+    def cv_set_edit(request: Request, job_id: str, language: str, edit_id: str, body: EditUndoRequest) -> dict:
+        user = workspace(request)
+        user.set_cv_edit(job_id, _language(language), edit_id, body.undone, request_id=client_key(request))
+        return job_view(user, job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/decline")
-    def decline_suggestion(request: Request, job_id: str, requirement_id: str) -> dict:
+    def decline_suggestion(request: Request, job_id: str, requirement_id: str, body: GapRequest | None = None) -> dict:
         user = workspace(request)
-        user.decline_gap(job_id, requirement_id)
+        language, shown = shown_check(user, job_id, body)
+        user.decline_gap(job_id, requirement_id, language=language, shown_version=shown)
         return job_view(user, job_id)
 
     # -- preview and download --------------------------------------------------------------
@@ -1034,10 +1100,10 @@ def build_job_view(snapshot: dict) -> dict:
             steps.append(f"cv-{cv['head']}-{lang}")
         if cv["final_pdf"]:
             steps.append(f"cv-final-{lang}")
-    gaps = snapshot["gaps"]
+    gaps = snapshot["gaps"][language]  # this language's own check: the other's is never shown for it
     if gaps:
         steps.append("gaps")
-        view["gaps"] = _gaps_view(snapshot, gaps["gaps"]) if gaps["gaps"].get("language") == language else {"outdated": True}
+        view["gaps"] = _gaps_view(snapshot, gaps, language)
     view["steps"] = steps
     view["tasks"] = snapshot["tasks"]
     return view
@@ -1066,19 +1132,28 @@ def _cv_view(snapshot: dict, language: str) -> dict:
     if "plan" in head:
         undone = set(head["plan"]["undone"])
         view["changes"] = [{**item, "undone": item["id"] in undone} for item in head["plan"]["changes"]]
+    view["edits"] = edits_view(head)
+    view["lines"] = lines_view(head)
     if approval:
         view["approved_at"] = approval["approved_at"]
     return view
 
 
-def _gaps_view(snapshot: dict, gaps: dict) -> dict:
-    cv = snapshot["cv"].get(gaps.get("language", "en"))
-    if gaps.get("gaps_version") != GAPS_VERSION or cv is None:
+def _gaps_view(snapshot: dict, record: dict, language: str) -> dict:
+    """The last check of the job's CV in ``language`` as far as it still stands for the CV and
+    the requirements now (gaps.coverage), with its version: the page sends that and the language
+    back with whatever it does with the check."""
+    cv = snapshot["cv"][language]
+    if cv is None:
         return {"outdated": True}
+    gaps, requirements = record["gaps"], snapshot["requirements"] or {}
     head = cv["material"]["draft"]
-    return {**coverage(gaps, head, snapshot["confirmed"]), "language": gaps["language"],
-            "created_at": gaps["created_at"],
-            "places": [{key: place[key] for key in ("id", "kind", "where")} for place in places(head)],
+    shown = coverage(gaps, head, snapshot["confirmed"], requirements.get("decided"), requirements.get("version"))
+    if shown.get("outdated"):
+        return {"outdated": True}
+    return {**shown, "requirements": with_adoptions(shown["requirements"], head),
+            "version": record["version"], "language": language, "created_at": gaps["created_at"],
+            "places": [{key: place[key] for key in ("id", "kind", "where")} for place in shown_places(head)],
             "evidence_check": explained(gaps.get("evidence_check")), "suggesting": explained(gaps.get("suggesting"))}
 
 

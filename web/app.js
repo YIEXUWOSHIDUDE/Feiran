@@ -12,6 +12,53 @@ const message = document.getElementById("message");
 const TERMINAL = new Set(["succeeded", "failed", "interrupted", "superseded", "cancelled"]);
 let pendingWarning = null; // shown once the current action has finished, over its success message
 
+// Page generations reject replies from a route that has already been left, including A→B→A.
+let pageGeneration = 0;
+function pageGuard() {
+  const generation = pageGeneration, hash = location.hash;
+  return () => generation === pageGeneration && hash === location.hash;
+}
+
+// Unsaved words live only in this tab's memory. Keep their original comparison value: a
+// refresh may reveal a newer server line, but must never authorize overwriting it silently.
+const editorDrafts = new Map();
+const editorOpen = new Map();
+function draftField(input, key, value, expected = value) {
+  let draft = editorDrafts.get(key);
+  if (!draft || !draft.dirty) draft = { value, expected, dirty: false };
+  editorDrafts.set(key, draft);
+  input.value = draft.value;
+  input.setAttribute("data-draft-key", key);
+  input.addEventListener("input", () => { draft.value = input.value; draft.dirty = true; });
+  input.addEventListener("change", () => { draft.value = input.value; draft.dirty = true; });
+  return {
+    expected: () => draft.expected,
+    saved: (submitted, nextExpected = submitted) => {
+      if (draft.value === submitted || !draft.dirty) editorDrafts.delete(key);
+      else draft.expected = nextExpected;
+    },
+  };
+}
+function draftDetails(key, attributes, ...children) {
+  const node = el("details", attributes, ...children);
+  if (editorOpen.has(key)) node.open = editorOpen.get(key);
+  node.addEventListener("toggle", () => editorOpen.set(key, node.open));
+  return node;
+}
+function editorFocus() {
+  const input = document.activeElement;
+  const key = input && input.getAttribute("data-draft-key");
+  if (!key) return () => {};
+  const start = input.selectionStart, end = input.selectionEnd;
+  return () => {
+    const next = [...app.querySelectorAll("[data-draft-key]")].find(node => node.getAttribute("data-draft-key") === key);
+    if (next) {
+      next.focus({ preventScroll: true });
+      if (typeof start === "number") next.setSelectionRange(start, end);
+    }
+  };
+}
+
 // A request that names the user's action (an Idempotency-Key) can safely be sent again when its
 // answer was lost: the server finds the same task instead of starting the work twice.
 const RESEND_AFTER_MS = [1000, 3000];
@@ -142,16 +189,17 @@ function clearMessage() {
 let flash = null; // shown once after the next page change
 
 async function run(action) {
+  const current = pageGuard();
   clearMessage();
   try {
     await action();
   } catch (error) {
-    show(I18n.serverText(error.message));
+    if (current()) show(I18n.serverText(error.message));
   } finally {
     await refreshUsage();
   }
   if (pendingWarning) {
-    show(pendingWarning, "warning");
+    if (current()) show(pendingWarning, "warning");
     pendingWarning = null;
   }
 }
@@ -285,7 +333,9 @@ function factEditor(fact) {
 }
 
 async function renderFacts() {
+  const current = pageGuard();
   const [{ facts, interrupted }, { languages }] = await Promise.all([api("/api/facts"), api("/api/cv/languages")]);
+  if (!current()) return;
   const rows = facts.map((fact) => el("tr", { class: "fact-row" },
     el("td", {}, el("code", {}, fact.id), el("div", { class: "muted" }, t`v${fact.version} · ${t(fact.fact_type)}`)),
     el("td", {}, fact.text, el("div", { class: "tags" }, fact.tags.map((tag) => el("span", { class: "tag" }, tag))), factEditor(fact)),
@@ -318,7 +368,9 @@ function field(label, input, hint) {
 }
 
 async function renderJobs() {
+  const current = pageGuard();
   const { jobs } = await api("/api/jobs");
+  if (!current()) return;
   const postingURL = el("input", { type: "url", required: true, placeholder: t("Paste a job posting URL") });
   const importLabel = MODE === "v2" ? t("Read and review") : t("Read and generate");
   const importURL = el("button", { type: "submit" }, importLabel);
@@ -535,6 +587,8 @@ function listingRow(item, rank) {
 }
 
 async function renderFind() {
+  const current = pageGuard();
+  let listRequest = 0;
   let sourcesRequest = null;
   const readSources = () => {
     if (!sourcesRequest) sourcesRequest = api("/api/sources").catch(error => {
@@ -592,10 +646,15 @@ async function renderFind() {
   }, true);
 
   async function drawList() {
+    const ticket = ++listRequest;
     const params = new URLSearchParams({
       title: find.title, location: find.location, region: find.region, sponsorship: find.sponsorship, limit: String(find.limit), hide_senior: String(find.hideSenior),
     });
-    const [data, { sources }] = await Promise.all([api(`/api/listings?${params}`), readSources()]);
+    let result;
+    try { result = await Promise.all([api(`/api/listings?${params}`), readSources()]); }
+    catch (error) { if (current() && ticket === listRequest) throw error; else return; }
+    if (!current() || ticket !== listRequest) return;
+    const [data, { sources }] = result;
     const newest = sources.map((source) => source.fetched_at).filter(Boolean).sort().pop();
     if (!find.refreshing) I18n.setText(status, t`${data.total} roles from ${sources.length} companies · updated ${ago(newest)}`);
     const notes = [];
@@ -625,6 +684,7 @@ async function renderFind() {
 
   async function drawCompanies() {
     const { sources } = await readSources();
+    if (!current()) return;
     const link = el("input", { type: "text", placeholder: t("Paste a job board link, e.g. https://jobs.lever.co/palantir") });
     const add = actionButton(t("Add company"), async () => {
       const { added } = await api("/api/sources", { method: "POST", body: JSON.stringify({ link: link.value }) });
@@ -687,7 +747,7 @@ async function renderFind() {
   );
   await Promise.all([drawList(), drawCompanies()]);
   const { sources } = await readSources();
-  await refreshNow(sources.filter((source) => source.stale));
+  if (current()) await refreshNow(sources.filter((source) => source.stale));
 }
 
 const STEP_LABELS = [["decided", t("Requirements")], ["cv-approved-en", t("CV (EN)")], ["cv-approved-zh", t("CV (ZH)")]];
@@ -712,13 +772,21 @@ function decidedLabel(item) {
 }
 
 function requirementsPanel(view, refresh) {
-  const choices = new Map();
+  const choiceKey = `requirements:${view.job_id}`;
+  const stored = editorDrafts.get(choiceKey);
+  const choices = stored ? new Map(stored.value) : new Map();
+  const expectedVersion = stored ? stored.expected : view.requirements_version;
+  const decide = (id, status) => {
+    choices.set(id, status);
+    editorDrafts.set(choiceKey, { value: [...choices], expected: expectedVersion, dirty: true });
+  };
   const rows = (view.candidates || []).map((item) => {
-    const confirm = el("input", { type: "radio", name: item.id, checked: item.status === "confirmed" });
-    const exclude = el("input", { type: "radio", name: item.id, checked: item.status === "excluded" });
-    if (item.status === "confirmed" || item.status === "excluded") choices.set(item.id, item.status);
-    confirm.addEventListener("change", () => choices.set(item.id, "confirmed"));
-    exclude.addEventListener("change", () => choices.set(item.id, "excluded"));
+    const status = choices.get(item.id) || item.status;
+    const confirm = el("input", { type: "radio", name: item.id, checked: status === "confirmed" });
+    const exclude = el("input", { type: "radio", name: item.id, checked: status === "excluded" });
+    if (status === "confirmed" || status === "excluded") choices.set(item.id, status);
+    confirm.addEventListener("change", () => decide(item.id, "confirmed"));
+    exclude.addEventListener("change", () => decide(item.id, "excluded"));
     return el("tr", {},
       el("td", {}, item.text, el("div", { class: "muted" }, I18n.join([strengthLabel(item.strength), item.section, decidedLabel(item)].filter(Boolean), " · "))),
       el("td", { class: "choice" }, el("label", {}, confirm, t(" Requirement"))),
@@ -726,15 +794,20 @@ function requirementsPanel(view, refresh) {
     );
   });
   const missed = el("input", { type: "text", placeholder: t("Copy a line or phrase exactly from the job description") });
+  const missedDraft = draftField(missed, `missed:${view.job_id}`, "", view.requirements_version);
   const add = actionButton(t("Add missed requirement"), async () => {
-    await api(`/api/jobs/${view.job_id}/requirements/add`, { method: "POST", body: JSON.stringify({ text: missed.value, expected_version: view.requirements_version }) });
+    const text = missed.value;
+    await api(`/api/jobs/${view.job_id}/requirements/add`, { method: "POST", body: JSON.stringify({ text, expected_version: missedDraft.expected() }) });
+    missedDraft.saved(text);
     await refresh();
     show(t("Added. It counts, and the CV was prepared again."), "ok");
   }, true);
   const save = actionButton(t("Save"), async () => {
+    const submitted = JSON.stringify([...choices]);
     const confirm = [...choices].filter(([, status]) => status === "confirmed").map(([id]) => id);
     const exclude = [...choices].filter(([, status]) => status === "excluded").map(([id]) => id);
-    await api(`/api/jobs/${view.job_id}/requirements/decide`, { method: "POST", body: JSON.stringify({ confirm, exclude, expected_version: view.requirements_version }) });
+    await api(`/api/jobs/${view.job_id}/requirements/decide`, { method: "POST", body: JSON.stringify({ confirm, exclude, expected_version: expectedVersion }) });
+    if (JSON.stringify(editorDrafts.get(choiceKey)?.value) === submitted) editorDrafts.delete(choiceKey);
     await refresh();
     show(t`Saved: ${confirm.length} requirement(s). The CV was prepared again for them.`, "ok");
   });
@@ -759,7 +832,7 @@ function requirementsPanel(view, refresh) {
   return el("section", { class: "panel step-panel requirements-panel" },
     el("h2", {}, t("1. What this job asks for")),
     el("p", { class: "muted" }, foundBy, t(" All of them count, and your CV below is adjusted to them. If a line is not really a requirement, choose Not a requirement and Save; saving also marks the list as reviewed by you.")),
-    counted ? el("details", {}, el("summary", {}, summary), body) : body,
+    counted ? draftDetails(choiceKey, {}, el("summary", {}, summary), body) : body,
   );
 }
 
@@ -800,6 +873,62 @@ function changeRow(view, language, change, refresh, editable) {
 
 const STAGE_MARKS = { done: "✓", fallback: "!", failed: "✕", skipped: "–" };
 
+// One editor keeps its request key after an uncertain response. A changed payload is a new
+// action; failed requests leave its text in place. This also works in the local file store.
+function cvEditAction(view, language, action, body, refresh, saved = () => {}) {
+  let previous, key;
+  return async () => {
+    const payload = JSON.stringify(typeof body === "function" ? body() : body);
+    if (payload !== previous) { previous = payload; key = actionKey(); }
+    await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`, {
+      method: "POST", headers: { "Idempotency-Key": key }, body: payload,
+    });
+    saved(JSON.parse(payload));
+    await refresh();
+  };
+}
+
+function localEditRow(view, language, edit, refresh) {
+  const buttons = [];
+  if (edit.can_undo || edit.can_redo) buttons.push(actionButton(edit.can_redo ? t("Redo") : t("Undo"),
+    cvEditAction(view, language, `edits/${edit.id}`, { undone: !edit.undone }, refresh), true));
+  if (edit.can_save) buttons.push(actionButton(t("Save to my profile"),
+    cvEditAction(view, language, `lines/${edit.block}/save`, { expected_text: edit.text }, refresh), true));
+  return el("div", { class: edit.undone ? "local-edit undone" : "local-edit" },
+    el("p", {}, edit.where ? `${edit.where}: ` : "", edit.text),
+    el("p", { class: "muted" }, !edit.placed ? t("Kept in history; its original place is no longer on this CV.")
+      : edit.undone ? t("Undone in this CV.") : !edit.latest ? t("An earlier version of this line.")
+      : edit.saved ? t("Saved to your profile for reuse.") : t("Saved in this CV only.")),
+    el("div", { class: "toolbar" }, buttons));
+}
+
+function cvLineEditor(view, language, cv, refresh) {
+  const prefix = `cv:${view.job_id}:${language}:`;
+  const visible = new Set((cv.lines || []).map(line => prefix + line.block));
+  const recover = [...editorDrafts].filter(([key, draft]) => key.startsWith(prefix) && draft.dirty && (cv.stale || !visible.has(key)))
+    .map(([key, draft]) => {
+      const input = el("textarea", { rows: 3, "aria-label": t("Unsaved text") });
+      draftField(input, key, draft.value, draft.expected);
+      return el("div", {}, el("p", { class: "warning" }, t("The original line is unavailable. Copy your unsaved text before discarding it.")), input);
+    });
+  if (cv.stale && !recover.length) return null;
+  const lines = (cv.stale ? [] : cv.lines || []).map((line) => {
+    const input = el("textarea", { rows: 3, "aria-label": t("CV line") });
+    const draft = draftField(input, `cv:${view.job_id}:${language}:${line.block}`, line.text);
+    return el("div", { class: "write-own" }, field(line.where || t("CV line"), input),
+      actionButton(t("Save in this CV"), cvEditAction(view, language, `lines/${line.block}`,
+        () => ({ text: input.value, expected_text: draft.expected() }), refresh, ({ text }) => draft.saved(text)), true),
+      actionButton(t("Discard unsaved changes"), async () => {
+        editorDrafts.delete(prefix + line.block);
+        await refresh();
+      }, true));
+  });
+  return draftDetails(`cv:${view.job_id}:${language}`, { class: "cv-line-editor" }, el("summary", {}, t("Edit this CV")),
+    el("p", { class: "muted" }, t("Edits stay in this job's CV. Save a line to your profile separately to reuse it. Changed CVs need approval again.")),
+    el("p", { class: "muted" }, t("Unsaved words stay while you navigate within this tab. Reloading or closing the tab clears them. After a conflict, copy them or discard them to load the latest line.")),
+    lines, recover);
+}
+
 // How the latest preparation went, stage by stage, so a usable CV is never mistaken for a
 // tailored one.
 function stageList(stages) {
@@ -837,7 +966,7 @@ function cvBlock(view, language, refresh) {
   }
   const notes = [];
   if (cv.stale) notes.push(el("p", { class: "warning" }, t("Your profile or facts changed. This is an old draft. Start over and review the new version.")));
-  if (approved) notes.push(el("p", { class: "ok-text" }, t`Approved ${I18n.date(cv.approved_at, true)}. To change anything, use Start over and approve again.`));
+  if (approved) notes.push(el("p", { class: "ok-text" }, t`Approved ${I18n.date(cv.approved_at, true)}. Editing this CV requires approval again.`));
   if (cv.stages) notes.push(stageList(cv.stages));
   else if (cv.head === "draft") notes.push(el("p", { class: "warning" }, t("This is your usual CV: DeepSeek could not reword or adjust it yet. Use the buttons above.")));
   else if (cv.head === "tailored") notes.push(el("p", { class: "warning" }, t("Reworded, but not adjusted for this job yet: DeepSeek could not plan it. Use Adjust for this job.")));
@@ -880,7 +1009,11 @@ function cvBlock(view, language, refresh) {
     class: "preview", sandbox: "", title: t`${title} preview`,
     src: `/preview/${view.job_id}/${language}?v=${encodeURIComponent(cv.content_sha256)}${tokenQuery("&")}`,
   });
-  return el("div", { class: "cv-block" }, el("h3", {}, title), el("div", { class: "toolbar" }, tools), notes, approval, preview);
+  const edits = (cv.edits || []).length ? el("details", { open: true },
+    el("summary", {}, t("Changes saved in this CV")),
+    cv.edits.map((edit) => localEditRow(view, language, edit, refresh))) : null;
+  return el("div", { class: "cv-block" }, el("h3", {}, title), el("div", { class: "toolbar" }, tools), notes,
+    cvLineEditor(view, language, cv, refresh), edits, approval, preview);
 }
 
 function cvPanel(view, refresh) {
@@ -906,6 +1039,15 @@ function cvPanel(view, refresh) {
         el("summary", {}, t`${CV_TITLES[other]} for this job`), cvBlock(view, other, refresh))
       : null,
   );
+}
+
+// Which check a gap action is about, as this page shows it: the CV language and that check's
+// version. The server refuses an action on a check the page no longer shows (another tab
+// switched the language, changed the requirements or checked again) instead of applying it to
+// whatever is newest, which could be the other language's CV.
+function shownCheck(view) {
+  const gaps = view.gaps && !view.gaps.outdated ? view.gaps : null;
+  return gaps ? { language: gaps.language, gaps_version: gaps.version } : { language: view.language };
 }
 
 function suggestionText(suggestion) {
@@ -974,6 +1116,7 @@ function evidenceLine(view, language, line, refresh) {
 }
 
 function suggestionBlock(item, post) {
+  if (item.suggestion_adopted) return el("p", { class: "ok-text" }, t("Added to this CV."));
   if (item.suggestion_status === "added") return el("p", { class: "ok-text" }, t("Added to your profile and this CV."));
   if (item.suggestion_status === "declined") return el("p", { class: "muted" }, t("Not adopted — kept off your CV."));
   if (!completeSuggestion(item.suggestion)) return null;
@@ -992,19 +1135,23 @@ function writeOwn(view, item, places, refresh, ai = false) {
   const select = el("select", {}, places.map((place) => el("option", { value: place.id, selected: place.id === suggested.place },
     place.kind === "skill" ? t`Add to skills line: ${place.where}` : t`New line under ${place.where}`)));
   const input = el("textarea", { rows: 4, "aria-label": t("CV entry") });
-  input.value = suggested.text;
+  const key = `gap:${view.job_id}:${view.gaps.language}:${item.requirement_id}:${ai}`;
+  const words = draftField(input, key, suggested.text, shownCheck(view));
+  const placeDraft = draftField(select, key + ":place", select.value);
   const hint = () => {
     I18n.attribute(input, "placeholder", select.value.startsWith("skill:") ? t("Skills to add, separated by commas") : t("The line as it should read on your CV"));
   };
   select.addEventListener("change", hint);
   hint();
   const add = actionButton(ai ? t("Adopt and add to my CV") : t("Add to my CV"), async () => {
+    const text = input.value, place = select.value;
     await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/write`, {
-      method: "POST", body: JSON.stringify({ place: select.value, text: input.value }),
+      method: "POST", body: JSON.stringify({ ...words.expected(), place, text }),
     });
+    words.saved(text, words.expected()); placeDraft.saved(place);
     await refresh();
   });
-  return el("details", { class: "write-own", open: ai },
+  return draftDetails(key, { class: "write-own", open: ai },
     el("summary", {}, ai ? t("Edit the suggested entry") : t("Write your own line")),
     el("p", { class: "muted" }, t("Use the complete suggestion as written, or edit it before adding it to your CV.")),
     el("div", { class: "write-row" }, select, input, add));
@@ -1013,7 +1160,7 @@ function writeOwn(view, item, places, refresh, ai = false) {
 // Reuse a saved proposal; generate only on an explicit click. Replace this panel alone so
 // requesting AI help never erases text the user has already typed into the manual editor.
 function aiEntry(view, item, refresh) {
-  if (item.suggestion_status === "added" || item.suggestion_status === "declined") return suggestionBlock(item, () => {});
+  if (item.suggestion_adopted || item.suggestion_status === "added" || item.suggestion_status === "declined") return suggestionBlock(item, () => {});
   const content = el("div", {});
   let opened = false;
   const result = (currentView, currentItem) => {
@@ -1030,10 +1177,17 @@ function aiEntry(view, item, refresh) {
       result(view, item);
       return;
     }
-    await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/suggest`, { method: "POST" });
+    const asked = shownCheck(view);
+    await api(`/api/jobs/${view.job_id}/gaps/${item.requirement_id}/suggest`, { method: "POST", body: JSON.stringify(asked) });
     const latest = await api(`/api/jobs/${view.job_id}`);
-    const found = latest.gaps && !latest.gaps.outdated
-      && latest.gaps.requirements.find((row) => row.requirement_id === item.requirement_id);
+    const current = latest.gaps && !latest.gaps.outdated ? latest.gaps : null;
+    // The job reads in the CV language chosen last, which another tab may have switched: then
+    // that language's check and places are not this panel's, and nothing of them is offered or
+    // adopted here. The panel stays as it is, with whatever the user typed.
+    if (latest.language !== asked.language || (current && current.language !== asked.language)) {
+      throw new Error(t("This page is out of date; reload it"));
+    }
+    const found = current && current.requirements.find((row) => row.requirement_id === item.requirement_id);
     if (!found) throw new Error(t("Your CV or facts changed since this check. Choose Check again to update the result."));
     if (!completeSuggestion(found.suggestion)) throw new Error(t("No usable suggestion was returned. Try AI suggested entry again."));
     // Cache only a complete suggestion; historical empty results remain retryable.
@@ -1066,8 +1220,13 @@ function coverageRow(view, language, item, refresh, post) {
   const notes = [];
   if (item.status === "related") notes.push(el("p", { class: "muted" }, t`Missing: ${item.missing || item.text}`));
   if (item.status === "unchecked") notes.push(el("p", { class: "muted" }, t("DeepSeek gave no usable answer for this requirement, so it does not count as shown. Use Check again.")));
+  // A check saved before checks recorded their requirements version is to check again although
+  // the CV may be just as it was, so its rows do not say the CV changed.
+  const unbound = view.gaps && view.gaps.state === "unbound";
   if (item.status === "recheck") {
-    notes.push(el("p", { class: "muted" }, t("Your CV changed after this check, so whether it still shows this is not known yet. Use Check again.")));
+    notes.push(el("p", { class: "muted" }, unbound
+      ? t("Whether this CV still shows this is not known until it is checked again. Use Check again.")
+      : t("Your CV changed after this check, so whether it still shows this is not known yet. Use Check again.")));
     if (LAST_CHECK[item.verdict]) notes.push(el("p", { class: "muted" }, t`Last check: ${LAST_CHECK[item.verdict]}`));
   }
   const gap = item.status === "related" || item.status === "none";
@@ -1077,15 +1236,19 @@ function coverageRow(view, language, item, refresh, post) {
   const undecided = !["added", "declined"].includes(item.suggestion_status);
   return el("div", { class: `requirement ${item.status} ${gap ? item.suggestion_status : ""}` },
     el("div", { class: "requirement-text" }, item.status === "none" ? t`Missing: ${item.missing || item.text}` : item.text, strength), lines, notes,
-    flagged && undecided ? el("p", { class: "muted" }, t("Suggested for what the last check found missing. Your CV has changed since; adopt only what you still need.")) : null,
+    flagged && undecided ? el("p", { class: "muted" }, unbound
+      ? t("Suggested for what the last check found missing. That check may be out of date; adopt only what you still need.")
+      : t("Suggested for what the last check found missing. Your CV has changed since; adopt only what you still need.")) : null,
     gap || flagged ? suggestionArea(view, item, refresh, post) : null,
-    gap || flagged ? writeOwn(view, item, view.gaps.places || [], refresh) : null);
+    gap || flagged ? writeOwn(view, item, view.gaps.places || [], refresh) : null,
+    (item.adopted || []).map((edit) => localEditRow(view, language, edit, refresh)));
 }
 
 function gapsPanel(view, refresh) {
   const gaps = view.gaps && !view.gaps.outdated ? view.gaps : null;
+  const acted = shownCheck(view);
   const post = (path, body) => async () => {
-    await api(`/api/jobs/${view.job_id}/gaps${path}`, { method: "POST", ...(body ? { body: JSON.stringify(body) } : {}) });
+    await api(`/api/jobs/${view.job_id}/gaps${path}`, { method: "POST", body: JSON.stringify({ ...acted, ...(body || {}) }) });
     await refresh();
   };
   const check = actionButton(gaps ? t("Check again") : t("Check now"), post(""), Boolean(gaps));
@@ -1093,19 +1256,26 @@ function gapsPanel(view, refresh) {
   const intro = el("p", { class: "muted" },
     t("DeepSeek compares each requirement with your profile and the current CV. "),
     t("Use AI suggested entry to get complete wording for a requirement. "),
-    t("Adopt a suggestion to save it and prepare the CV again."));
+    t("Adopting changes this CV only. Save a line to your profile separately to reuse it."));
   if (!gaps) {
     return el("section", { class: "panel step-panel gaps-panel" }, heading, intro,
       el("p", { class: "muted" }, t("Not checked yet. Choose Check now to compare this CV with the requirements.")), el("div", { class: "toolbar" }, check));
   }
   const notes = [];
-  if (gaps.stale) notes.push(el("p", { class: "warning" }, t("Your CV or facts changed since this check. Choose Check again to update the result.")));
-  const checking = gaps.evidence_check || {};
+  // A check of other requirements shows no rows at all: none of its findings is a result now.
+  if (gaps.requirements_changed) {
+    notes.push(el("p", { class: "warning" }, t("The job's requirements changed after this check, so its results no longer apply. Choose Check again to compare this CV with the current requirements.")));
+  } else if (gaps.state === "unbound") {
+    notes.push(el("p", { class: "warning" }, t("This check was saved before checks recorded which requirements they used, so it is not known to match the current ones. Choose Check again to update the result.")));
+  } else if (gaps.stale) {
+    notes.push(el("p", { class: "warning" }, t("Your CV or facts changed since this check. Choose Check again to update the result.")));
+  }
+  const checking = gaps.requirements_changed ? {} : gaps.evidence_check || {};
   if (checking.fallback_reason) {
     notes.push(el("p", { class: "warning" }, t`Not checked: ${I18n.serverText(checking.message || checking.fallback_reason)} `,
       t("Nothing counts as shown until it is checked. Use Check again.")));
   }
-  if (gaps.suggesting && gaps.suggesting.fallback_reason) {
+  if (!gaps.requirements_changed && gaps.suggesting && gaps.suggesting.fallback_reason) {
     notes.push(el("p", { class: "warning" }, t`No suggestions this time: ${I18n.serverText(gaps.suggesting.message || gaps.suggesting.fallback_reason)} Use Check again.`));
   }
   const language = gaps.language || view.language;
@@ -1155,6 +1325,8 @@ function interruptedNote(interrupted) {
 function unfinishedNote(notice, refresh) {
   const text = notice.kind === "save_cv"
     ? I18n.join([t("Saving an uploaded CV did not finish. Some lines may already have been saved, and "), t("your CV layout may still be the old one. Upload the same PDF again and save: lines already saved are reused, "), t("never added twice.")])
+    : notice.kind === "save_line"
+      ? t`Saving “${notice.line}” to your profile did not finish. Retry saving the same line to finish without duplicates.`
     : notice.kind === "add_line"
       ? I18n.join([t`Adding “${notice.line}” for “${notice.requirement}” did not finish. If that requirement below still offers `, t("to add it, add it again with the same words: it will not be added twice. If it says the line was added, "), t("prepare the CV again so the CV shows it.")])
       : I18n.join([t("A change did not finish, and its record could not be read. Check your facts and your CV, and repeat what "), t("you were doing.")]);
@@ -1163,6 +1335,10 @@ function unfinishedNote(notice, refresh) {
     await refresh();
   };
   const tools = [];
+  if (notice.kind === "save_line" && notice.job_id && notice.language && notice.block) {
+    tools.push(actionButton(t("Retry saving to my profile"), cvEditAction({ job_id: notice.job_id }, notice.language,
+      `lines/${notice.block}/save`, { expected_text: notice.line }, refresh), true));
+  }
   if (notice.kind === "add_line" && notice.job_id && notice.language) {
     // Once the CV is prepared again with the line recorded, adding it is done: the notice goes.
     tools.push(actionButton(t("Prepare the CV again"), async () => {
@@ -1214,9 +1390,18 @@ function jobReviewPanel(view, refresh, needsPreparation) {
 }
 
 async function renderJob(jobId) {
+  const current = pageGuard();
+  let refreshRequest = 0, poll = null;
   // Opening a saved role is read-only in both modes. Paid checks require an explicit action.
   const refresh = async (checked = false) => {
-    const view = await api(`/api/jobs/${jobId}`);
+    if (!current()) return;
+    clearTimeout(poll);
+    const ticket = ++refreshRequest;
+    let view;
+    try { view = await api(`/api/jobs/${jobId}`); }
+    catch (error) { if (current() && ticket === refreshRequest) throw error; else return; }
+    if (!current() || ticket !== refreshRequest) return;
+    const restoreFocus = editorFocus();
     const jd = view.jd;
     const needsPreparation = MODE === "v2" && !view.requirements_version && !Object.values(view.cv || {}).some((cv) => cv.head);
     app.replaceChildren(
@@ -1238,9 +1423,10 @@ async function renderJob(jobId) {
       ...(view.review ? [jobReviewPanel(view, refresh, needsPreparation)] : []),
       ...(needsPreparation ? [] : [requirementsPanel(view, refresh), cvPanel(view, refresh), gapsPanel(view, refresh)]),
     );
+    restoreFocus();
     // V2: while this job's work runs on the server, look again shortly; the page stays usable.
     if ((view.tasks || []).some((task) => !TERMINAL.has(task.status))) {
-      setTimeout(() => { if (location.hash === `#job/${jobId}`) run(() => refresh(true)); }, 2000);
+      poll = setTimeout(() => { if (current()) run(() => refresh(true)); }, 2000);
       return view;
     }
     return view;
@@ -1344,11 +1530,14 @@ const routes = { facts: renderFacts, find: renderFind, jobs: renderJobs };
 
 // With no page chosen, any saved profile content can continue to job discovery.
 async function openDefault() {
+  const current = pageGuard();
   const { facts } = await api("/api/facts");
+  if (!current()) return;
   location.replace(facts.length ? "#find" : "#facts");
 }
 
 function route() {
+  pageGeneration += 1;
   const [name, id] = location.hash.slice(1).split("/");
   for (const link of document.querySelectorAll("nav a")) {
     link.classList.toggle("active", link.dataset.route === (name === "job" ? "jobs" : name));

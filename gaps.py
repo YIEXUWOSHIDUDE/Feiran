@@ -325,14 +325,14 @@ def _suggestion_key(requirement: str, suggestion: dict[str, Any]) -> str:
     return json.dumps([requirement, suggestion.get("kind"), claim], ensure_ascii=False)
 
 
-def suggestion_target(gaps: dict, decided: dict, cv: dict, requirement_id: str) -> dict:
-    """Validate the saved check before reusing or requesting a row's suggestion: the same
-    requirements and CV language, and a row the check found missing or only related. The CV may
-    have changed since (another line adopted), so one adoption never forces a new check: a
-    suggestion is asked with the CV as it is now, and the page says the row awaits a new check."""
-    expected = [(r['id'], r['text'], r.get('strength') or 'unclear') for r in decided['selected_requirements']]
-    actual = [(r['requirement_id'], r['text'], r['strength']) for r in gaps.get('requirements', [])]
-    if gaps.get('gaps_version') != GAPS_VERSION or expected != actual or gaps.get('language') != cv['language']:
+def suggestion_target(gaps: dict, decided: dict, cv: dict, requirement_id: str,
+                      requirements_version: int | None = None) -> dict:
+    """Validate the saved check before reusing or requesting a row's suggestion: still usable
+    for this CV's language and the job's current requirements (applies), and a row the check
+    found missing or only related. The CV may have changed since (another line adopted), so one
+    adoption never forces a new check: a suggestion is asked with the CV as it is now, and the
+    page says the row awaits a new check."""
+    if unusable(gaps, cv['language'], decided, requirements_version):
         raise ValueError('The CV, facts or requirements changed. Check again before requesting a suggestion.')
     item = _gap(gaps, requirement_id)
     if item['evidence'] not in ('related', 'none'):
@@ -341,12 +341,12 @@ def suggestion_target(gaps: dict, decided: dict, cv: dict, requirement_id: str) 
 
 
 def suggest_gap(gaps: dict, decided: dict, cv: dict, facts_db: Any, requirement_id: str,
-                chat: Callable[..., dict], private: Iterable[str] = ()) -> dict:
+                chat: Callable[..., dict], private: Iterable[str] = (), requirements_version: int | None = None) -> dict:
     """Generate complete copy for one row; reuse full proposals but retry old empty/templates.
     The returned check contains proposals only; no saved material or CV is changed. The request
     carries only the CV and the requirement; ``facts_db`` stays for the callers' signature."""
     updated = copy.deepcopy(gaps)
-    item = suggestion_target(updated, decided, cv, requirement_id)
+    item = suggestion_target(updated, decided, cv, requirement_id, requirements_version)
     if item.get('suggestion') or item['status'] in ('added', 'declined'):
         return updated
     private = sorted({*private_terms(cv), *private}, key=len, reverse=True)
@@ -436,6 +436,74 @@ def find_gaps(
 
 
 STATUSES = ("not_shown", "related", "none", "unchecked", "recheck", "shown")
+# How a saved check stands now (check_state), from usable as it is to not usable at all.
+CHECK_STATES = ("current", "cv_changed", "unbound", "requirements_changed", "outdated")
+# What every row of a check in this format holds (find_gaps).
+ROW_KEYS = frozenset({"requirement_id", "text", "strength", "evidence", "sets", "related", "missing",
+                      "suggestion", "status"})
+
+
+def judged_requirements(decided: dict[str, Any] | None) -> list[tuple[str, str, str]]:
+    """The requirements a check of ``decided`` judges: each selected one's ID, text and strength,
+    in order, as find_gaps records them in its rows."""
+    return [(item["id"], item["text"], item.get("strength") or "unclear")
+            for item in ((decided or {}).get("selected_requirements") or [])]
+
+
+def _bound_version(gaps: dict[str, Any]) -> Any:
+    """The requirements version a check was made from, if it was saved with one (V2 records it
+    in ``inputs`` when it keeps the check)."""
+    inputs = gaps.get("inputs")
+    return inputs.get("requirements_version") if isinstance(inputs, dict) else None
+
+
+def unusable(gaps: Any, language: str | None, decided: dict[str, Any] | None,
+             requirements_version: int | None = None) -> str | None:
+    """Why a saved check cannot be used at all for a CV in ``language`` and the job's current
+    requirements (``decided``; ``requirements_version`` where requirements are versioned), or None.
+
+    "outdated": another format or rules version (GAPS_VERSION), another language, or a record
+    missing what it is read by. "requirements_changed": the requirements it judged are not the
+    current ones (one added, removed or reworded), or it names the requirements version it read
+    and they were saved again since, even in the same words. Neither is ever read as a result for
+    the job now; the record itself stays."""
+    if not isinstance(gaps, dict) or gaps.get("gaps_version") != GAPS_VERSION or gaps.get("language") != language:
+        return "outdated"
+    rows = gaps.get("requirements")
+    if not (isinstance(rows, list) and isinstance(gaps.get("items"), dict) and isinstance(gaps.get("checked_facts"), list)
+            and isinstance(gaps.get("checked_cv"), list)
+            and all(isinstance(row, dict) and ROW_KEYS <= row.keys() for row in rows)):
+        return "outdated"
+    bound = _bound_version(gaps)
+    if ([(row["requirement_id"], row["text"], row["strength"]) for row in rows] != judged_requirements(decided)
+            or (requirements_version is not None and bound is not None and bound != requirements_version)):
+        return "requirements_changed"
+    return None
+
+
+def check_state(gaps: Any, cv: dict[str, Any], confirmed: Iterable[tuple[str, int]], decided: dict[str, Any] | None,
+                requirements_version: int | None = None) -> str:
+    """How a saved check stands for this CV, the current facts (``confirmed``, all (ID, version)
+    pairs) and the job's requirements now: the one rule that showing a check, asking for a
+    suggestion and adopting or skipping one share (CHECK_STATES).
+
+    - "outdated" or "requirements_changed" (see unusable): nothing it found is shown as a result
+      and nothing is adopted from it until the job is checked again.
+    - "cv_changed": the CV's lines or the facts changed since (an adopted line, say): its rows are
+      to check again, and its suggestions stay usable.
+    - "unbound": the same requirements in the same words, but saved before checks recorded the
+      requirements version they read (only where ``requirements_version`` is given), so it cannot
+      show it was made from the current one: to check again like "cv_changed", never current.
+    - "current": none of these."""
+    reason = unusable(gaps, cv.get("language"), decided, requirements_version)
+    if reason:
+        return reason
+    if (sorted([fact_id, version] for fact_id, version in confirmed) != gaps["checked_facts"]
+            or sorted({_item_key(item) for item in _cv_items(cv)}) != gaps["checked_cv"]):
+        return "cv_changed"
+    if requirements_version is not None and _bound_version(gaps) is None:
+        return "unbound"
+    return "current"
 
 
 def _shown_now(cv: dict[str, Any]) -> tuple[dict[tuple[str, int, str], str], dict[str, str]]:
@@ -506,24 +574,34 @@ def _left_out(
     return "not_on_cv", []
 
 
-def coverage(gaps: dict[str, Any], cv: dict[str, Any], confirmed: Iterable[tuple[str, int]]) -> dict[str, Any]:
+def coverage(gaps: dict[str, Any], cv: dict[str, Any], confirmed: Iterable[tuple[str, int]],
+             decided: dict[str, Any] | None, requirements_version: int | None = None) -> dict[str, Any]:
     """What this CV shows for each requirement, from the CV as it is shown now (so undoing a
-    cut changes it at once) and the verdicts found by ``find_gaps``.
+    cut changes it at once) and the verdicts found by ``find_gaps``, as far as the check still
+    stands (``state``, see check_state: ``decided`` and ``requirements_version`` are the job's
+    current requirements).
 
-    A requirement is "shown" when a whole group of lines that shows it is on the CV in the words
-    and entries that were judged, "not_shown" when its evidence is cut, reworded or not on this
-    CV (with the changes to undo to show it), and otherwise "related", "none" or "unchecked" as
-    judged. ``confirmed`` is the legacy name for all current (fact ID, version) pairs: the check is
-    ``stale`` once they, or anything the CV could show, differ from what was judged. A stale check
-    never judged the CV's new words or lines, so evidence it no longer finds word for word, and its
-    "related" and "none" verdicts, are "recheck" (why "changed", nothing to undo), never left out or
-    missing: the CV may show it now. ``verdict`` keeps what that check found.
+    An outdated check gives only ``outdated``. A check of other requirements gives no rows at all
+    (``requirements_changed``): none of its verdicts is a result for the requirements now.
+    Otherwise a requirement is "shown" when a whole group of lines that shows it is on the CV in
+    the words and entries that were judged, "not_shown" when its evidence is cut, reworded or not
+    on this CV (with the changes to undo to show it), and otherwise "related", "none" or
+    "unchecked" as judged. A ``stale`` check (any state but "current") never judged the CV's new
+    words or lines, or cannot show it judged these requirements, so evidence it no longer finds
+    word for word, and its "related" and "none" verdicts, are "recheck" (why "changed", nothing
+    to undo), never left out or missing: the CV may show it now. ``verdict`` keeps what that
+    check found.
     """
+    state = check_state(gaps, cv, confirmed, decided, requirements_version)
+    if state == "outdated":
+        return {"state": state, "outdated": True}
+    if state == "requirements_changed":
+        return {"state": state, "stale": True, "requirements_changed": True,
+                "counts": {name: 0 for name in STATUSES}, "requirements": []}
     lines, entries = _shown_now(cv)
     items = gaps["items"]
     # Cuts, reordering and undos only change which of the judged words are shown.
-    stale = (sorted([fact_id, version] for fact_id, version in confirmed) != gaps["checked_facts"]
-             or sorted({_item_key(item) for item in _cv_items(cv)}) != gaps["checked_cv"])
+    stale = state != "current"
     undoable = _undoable(cv)
 
     def described(ref: str) -> dict[str, Any]:
@@ -556,6 +634,7 @@ def coverage(gaps: dict[str, Any], cv: dict[str, Any], confirmed: Iterable[tuple
             "ai_checked": bool(record.get("ai_checked") and record.get("suggestion")),
         })
     return {
+        "state": state,
         "stale": stale,
         "counts": {name: sum(item["status"] == name for item in requirements) for name in STATUSES},
         "requirements": requirements,
