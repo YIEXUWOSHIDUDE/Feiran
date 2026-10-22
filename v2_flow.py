@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from cv import CVError, build_draft, export_pdf, print_with_chrome, tailor_draft
+from cv_preparation import prepare_steps
+from cv_edit import carry_over, without_edits
 from cv_import import CVImportError, structure_cv
 from cv_plan import plan_draft
 from cv_status import STAGE_FAILED, STAGES, adjusted, job_language, reason, reworded, stage_entry, stage_failure
@@ -122,27 +124,14 @@ def prepare_cv(ctx: Any, job_id: str, language: str, *, explicit: bool, result: 
         else:
             ctx.finish("succeeded", result={**(result or {}), "cv": "not_prepared", "reason": reason(exc)})
         return
-    documents = [("draft", draft)]
+    previous = head["draft"] if head else None
+    documents = [("draft", carry_over(previous, draft))]
     stages = [stage_entry("draft", "done", "Built from your saved material.")]
-    head_document = draft
-    ctx.stage("rewording")
-    started = time.monotonic()
-    try:
-        # Thinking off: on a real CV it gave the same result in 2 s instead of 8 s (2026-09).
-        head_document = tailor_draft(draft, inputs["facts"], job=decided, chat=ctx.chat, effort="none",
-                                     private=inputs["private"])
-        documents.append(("tailored", head_document))
-        stages.append(_logged(reworded(head_document), started))
-    except CVError as exc:
-        stages.append(_logged(stage_failure("rewording", exc), started))
-    ctx.stage("layout")
-    started = time.monotonic()
-    try:
-        planned = plan_draft(head_document, decided, chat=ctx.chat, private=inputs["private"])
-        documents.append(("planned", planned))
-        stages.append(_logged(adjusted(planned), started))
-    except CVError as exc:
-        stages.append(_logged(stage_failure("layout", exc), started))
+    for step in prepare_steps(draft, inputs["facts"], decided, chat=ctx.chat, private=inputs["private"],
+                              previous=previous, tailor=tailor_draft, plan=plan_draft, on_stage=ctx.stage):
+        if step.document is not None:
+            documents.append((step.kind, step.document))
+        stages.append(_logged(step.status, step.started))
     ctx.user.publish_cv(task_id=ctx.task_id, token=ctx.token, job_id=job_id, language=language,
                         base_head=base, documents=documents, profile_version=inputs["profile"]["version"],
                         requirements_version=requirements["version"], stages=stages,
@@ -151,7 +140,8 @@ def prepare_cv(ctx: Any, job_id: str, language: str, *, explicit: bool, result: 
 
 def _redo_stage(ctx: Any, stage: str) -> None:
     """Reword again (from the draft) or adjust again (from the reworded CV, else the draft) and
-    publish the result as the newest version; a failure keeps the CV and records why."""
+    publish the result as the newest version, with the job's own changes of the current CV applied
+    again (the model sees the CV as prepared, without them); a failure keeps the CV and records why."""
     job_id, language = ctx.request["job_id"], ctx.request["language"]
     inputs = ctx.user.cv_inputs(job_id, language)
     head = inputs["head"]
@@ -169,7 +159,7 @@ def _redo_stage(ctx: Any, stage: str) -> None:
     if stage == "rewording":
         base = root
         try:
-            document = tailor_draft(root["draft"], inputs["facts"], job=decided, chat=ctx.chat,
+            document = tailor_draft(without_edits(root["draft"]), inputs["facts"], job=decided, chat=ctx.chat,
                                     private=inputs["private"])
             entry = _logged(reworded(document), started)
         except CVError as exc:
@@ -184,7 +174,7 @@ def _redo_stage(ctx: Any, stage: str) -> None:
     else:
         base = next((item for item in chain if item["stage"] == "tailored"), root)
         try:
-            document = plan_draft(base["draft"], decided, chat=ctx.chat, private=inputs["private"])
+            document = plan_draft(without_edits(base["draft"]), decided, chat=ctx.chat, private=inputs["private"])
             entry = _logged(adjusted(document), started)
         except CVError as exc:
             earlier = any(item["stage"] == "planned" for item in chain)
@@ -197,7 +187,7 @@ def _redo_stage(ctx: Any, stage: str) -> None:
         kind, not_run = "planned", ()
     stages = _stages_after(inputs["status"], root["material_id"], entry, not_run)
     ctx.user.publish_cv(task_id=ctx.task_id, token=ctx.token, job_id=job_id, language=language,
-                        base_head=head["material_id"], documents=[(kind, document)],
+                        base_head=head["material_id"], documents=[(kind, carry_over(head["draft"], document))],
                         profile_version=head["profile_version"], requirements_version=head["requirements_version"],
                         stages=stages, draft_id=base["material_id"],
                         result={"job_id": job_id, "language": language})
@@ -304,6 +294,7 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         prepare_cv(ctx, ctx.request["job_id"], ctx.request["language"], explicit=True)
 
     def run_check_gaps(ctx: Any) -> None:
+        """Check the job's CV in the language asked for, against that language's last check."""
         request = ctx.request
         inputs = ctx.user.gaps_inputs(request["job_id"], request["language"])
         if inputs["head"] is None:
@@ -315,7 +306,7 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         gaps = find_gaps(decided, inputs["head"]["draft"], inputs["facts"], ctx.chat, private=inputs["private"],
                          previous=inputs["gaps"]["gaps"] if inputs["gaps"] else None)
         ctx.user.publish_gaps(task_id=ctx.task_id, token=ctx.token, job_id=request["job_id"],
-                              base_version=request["base_gaps_version"], gaps=gaps,
+                              language=request["language"], base_version=request["base_gaps_version"], gaps=gaps,
                               checked_head=inputs["head"]["material_id"],
                               requirements_version=inputs["requirements"]["version"])
 
@@ -332,11 +323,12 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         try:
             gaps = suggest_gap(inputs['gaps']['gaps'], inputs['requirements']['decided'],
                                inputs['head']['draft'], inputs['facts'], request['requirement_id'],
-                               ctx.chat, private=inputs['private'])
+                               ctx.chat, private=inputs['private'],
+                               requirements_version=inputs['requirements']['version'])
         except ValueError as exc:
             raise TaskFailed(str(exc), 'inputs_changed') from exc
         ctx.user.publish_gaps(task_id=ctx.task_id, token=ctx.token, job_id=request['job_id'],
-                              base_version=request['base_gaps_version'], gaps=gaps,
+                              language=request['language'], base_version=request['base_gaps_version'], gaps=gaps,
                               checked_head=inputs['head']['material_id'],
                               requirements_version=inputs['requirements']['version'],
                               facts_read=sorted([fact['id'], fact['version']] for fact in inputs['facts'].listed()))

@@ -7,7 +7,8 @@ from cv import build_draft, tailor_draft
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError
 from facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
-from gaps import suggest_gap, EVIDENCE_RULES, SUGGEST_RULES, accept_gap, addition, coverage, decline_gap, find_gaps, places, write_line
+from gaps import (suggest_gap, EVIDENCE_RULES, SUGGEST_RULES, accept_gap, addition, check_state, coverage, decline_gap,
+                  find_gaps, places, suggestion_target, write_line)
 from requirement_flow import apply_requirement_decisions, propose_requirements
 from tests.test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
 from tests.test_cv_plan import FakePlanner
@@ -419,7 +420,7 @@ class GapTests(unittest.TestCase):
 
         gaps, _ = self.gaps()
         ids = {item["text"]: item["requirement_id"] for item in gaps["requirements"]}
-        before = coverage(gaps, self.draft, confirmed())
+        before = coverage(gaps, self.draft, confirmed(), decided_job())
         self.assertEqual(({item["text"]: item["status"] for item in before["requirements"]}, before["stale"]), ({
             "Experience with Python": "shown", "Hands-on Docker and Kubernetes": "none",
             "3+ years of backend experience": "related", "Writing integration tests for services": "related"}, False))
@@ -427,7 +428,7 @@ class GapTests(unittest.TestCase):
         updated, _ = accept_gap(updated, ids["Hands-on Docker and Kubernetes"], self.database, profile)
         cv = build_draft(profile, self.database, "en")  # the CV prepared again with both
         for _ in range(2):  # and the same when the page is opened again
-            shown = coverage(updated, cv, confirmed())
+            shown = coverage(updated, cv, confirmed(), decided_job())
             self.assertTrue(shown["stale"])
             rows = {item["text"]: item for item in shown["requirements"]}
             self.assertEqual({text: (row["status"], row["verdict"], row["suggestion_status"]) for text, row in rows.items()}, {
@@ -469,7 +470,7 @@ class CoverageTests(unittest.TestCase):
 
     def shown(self, gaps, cv):
         confirmed = [(fact["id"], fact["version"]) for fact in list_facts(self.database) if fact["status"] == "confirmed"]
-        return coverage(gaps, cv, confirmed)
+        return coverage(gaps, cv, confirmed, decided_job())
 
     def requirement(self, gaps, cv, text):
         return next(item for item in self.shown(gaps, cv)["requirements"] if item["text"] == text)
@@ -743,7 +744,7 @@ class TargetedSuggestionTests(unittest.TestCase):
                                       entry, written, self.cv, self.db, PROFILE)
         cv = build_draft(profile, self.db, "en")  # the CV prepared again with the new line
         confirmed = [(fact["id"], fact["version"]) for fact in list_facts(self.db)]
-        self.assertTrue(coverage(updated, cv, confirmed)["stale"])
+        self.assertTrue(coverage(updated, cv, confirmed, self.decided)["stale"])
         rid = self.ids["3+ years of backend experience"]
         chat = FakeDeepSeek(lambda ids: [{"requirement": rid, "kind": "bullet", "entry": "s1e0",
             "text": "Built backend services over 3 years with REST APIs.", "tags": []}])
@@ -764,3 +765,76 @@ class TargetedSuggestionTests(unittest.TestCase):
         with self.assertRaises(DeepSeekError):
             suggest_gap(self.checked, self.decided, self.cv, self.db, rid, chat)
         self.assertNotIn("ai_checked", next(r for r in self.checked["requirements"] if r["requirement_id"] == rid))
+
+
+class CheckStateTests(unittest.TestCase):
+    """A saved check stands only for the requirements it judged (docs/architecture-handoff.md,
+    round 1 A): the one rule that showing it, asking for a suggestion and adopting share."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.database = make_store(self.directory.name)
+        self.decided = decided_job()
+        self.cv = build_draft(PROFILE, self.database, "en")
+        self.gaps = find_gaps(self.decided, self.cv, self.database, FakeDeepSeek(lambda ids: []))
+        self.confirmed = [(fact["id"], fact["version"]) for fact in list_facts(self.database)]
+
+    def state(self, gaps=None, decided=None, version=None):
+        return check_state(self.gaps if gaps is None else gaps, self.cv, self.confirmed,
+                           self.decided if decided is None else decided, version)
+
+    def changed(self, edit):
+        decided = copy.deepcopy(self.decided)
+        edit(decided["selected_requirements"])
+        return decided
+
+    def test_added_removed_reworded_or_reweighted_requirements_leave_no_verdict_shown(self):
+        # The CV's words stay the same: only the requirements differ from what was judged.
+        changes = {
+            "added": lambda rows: rows.append({**rows[0], "id": "req-sql", "text": "Experience with SQL"}),
+            "removed": lambda rows: rows.pop(0),
+            "reworded": lambda rows: rows[0].update(id="req-python-go", text="Experience with Python and Go"),
+            "reweighted": lambda rows: rows[0].update(strength="preferred"),
+        }
+        self.assertEqual(self.state(), "current")
+        for name, edit in changes.items():
+            with self.subTest(name):
+                decided = self.changed(edit)
+                self.assertEqual(self.state(decided=decided), "requirements_changed")
+                shown = coverage(self.gaps, self.cv, self.confirmed, decided)
+                self.assertEqual((shown["requirements_changed"], shown["stale"], shown["requirements"]), (True, True, []))
+                self.assertEqual(set(shown["counts"].values()), {0})
+                with self.assertRaises(ValueError):  # no suggestion is asked for from it either
+                    suggestion_target(self.gaps, decided, self.cv, self.gaps["requirements"][1]["requirement_id"])
+
+    def test_a_check_naming_its_requirements_version_stands_for_that_version_only(self):
+        bound = {**self.gaps, "inputs": {"requirements_version": 2, "material_id": "m"}}
+        self.assertEqual(self.state(bound, version=2), "current")
+        # Saved again, even in the same words: another version, so the check is not a result now.
+        self.assertEqual(self.state(bound, version=3), "requirements_changed")
+
+    def test_a_check_kept_without_its_requirements_version_is_never_current_where_versions_exist(self):
+        self.assertEqual(self.state(version=2), "unbound")
+        shown = coverage(self.gaps, self.cv, self.confirmed, self.decided, 2)
+        self.assertEqual((shown["state"], shown["stale"]), ("unbound", True))
+        # As for a check of a CV that changed since: what it found missing is to check again
+        # (with its suggestions still offered), and only evidence still on the CV word for word shows.
+        self.assertEqual({row["text"]: row["status"] for row in shown["requirements"]}, {
+            "Experience with Python": "shown", "Hands-on Docker and Kubernetes": "recheck",
+            "3+ years of backend experience": "recheck", "Writing integration tests for services": "recheck"})
+        target = next(row["requirement_id"] for row in self.gaps["requirements"] if "Docker" in row["text"])
+        self.assertEqual(suggestion_target(self.gaps, self.decided, self.cv, target, 2)["requirement_id"], target)
+        # The single-user app keeps no requirement versions: the same requirements are its binding.
+        self.assertEqual(self.state(), "current")
+
+    def test_a_record_missing_what_it_is_read_by_is_outdated_never_current(self):
+        for missing in ("checked_cv", "checked_facts", "items", "requirements", "language", "gaps_version"):
+            with self.subTest(missing=missing):
+                broken = {key: value for key, value in self.gaps.items() if key != missing}
+                self.assertEqual(self.state(broken), "outdated")
+                self.assertEqual(coverage(broken, self.cv, self.confirmed, self.decided), {"state": "outdated", "outdated": True})
+        row = copy.deepcopy(self.gaps)
+        del row["requirements"][0]["strength"]
+        self.assertEqual(self.state(row), "outdated")
+        self.assertEqual(check_state(self.gaps, {**self.cv, "language": "zh"}, self.confirmed, self.decided), "outdated")

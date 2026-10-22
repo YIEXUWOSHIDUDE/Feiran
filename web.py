@@ -61,22 +61,28 @@ from cv_status import (
     stage_entry as _stage,
     stage_failure as _stage_failure,
 )
+from cv_preparation import prepare_steps
+from cv_edit import (
+    StaleEdit,
+    adopt_for,
+    already_saved,
+    carry_over,
+    change_line,
+    edits_view,
+    lines_view,
+    mark_saved,
+    save_plan,
+    save_target,
+    set_edit,
+    shown_places,
+    with_adoptions,
+    without_edits,
+)
 from cv_plan import plan_draft, set_change
 from deepseek_client import DeepSeekError, chat_json
-from facts import DEFAULT_DATABASE, FactStoreError, confirm_facts, import_facts, list_facts, parse_fact_refs, revise_fact
-from gaps import (
-    GAPS_VERSION,
-    accept_gap,
-    addition,
-    coverage,
-    decline_gap,
-    find_gaps,
-    line_to_write,
-    places,
-    suggest_gap,
-    suggested_addition,
-    write_line,
-)
+from facts import (DEFAULT_DATABASE, FactStoreError, confirm_facts, fact_source, import_facts, list_facts,
+                   parse_fact_refs, revise_fact)
+from gaps import _gap, coverage, decline_gap, find_gaps, suggest_gap, unusable
 from job_search import (
     SearchError,
     fetch_board,
@@ -146,13 +152,20 @@ OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload")
 # told to try again.
 CHANGE_WAIT_SECONDS = 90
 BUSY = "Another change is still being made (DeepSeek can take a minute). Try again in a moment."
+PAGE_OUT_OF_DATE = "This page is out of date; reload it"
 # Changes that span the fact store, the CV profile and a job's files: saving an uploaded CV, and
-# adding a line the user confirmed. Each has a file in unfinished/ while it runs, which stays as
-# the notice if it does not finish.
-OPERATIONS = ("save_cv", "add_line")
+# saving a line of a job's CV to the profile ("add_line": how earlier releases adopted a line, kept
+# so a notice they left is still shown). Each has a file in unfinished/ while it runs, which stays
+# as the notice if it does not finish.
+OPERATIONS = ("save_cv", "add_line", "save_line")
 UNFINISHED = "unfinished"
 NOTICE_ID = re.compile(r"[0-9a-f]{16}")
 UPLOAD_KEEP_SECONDS = 24 * 3600
+
+
+class StalePage(Exception):
+    """The page acted on a check it no longer shows (another tab switched the CV language or
+    changed the requirements): answered 409, before anything is written."""
 
 
 class ConfirmRequest(BaseModel):
@@ -195,7 +208,13 @@ class StartListingRequest(BaseModel):
     job_id: str
 
 
-class WriteLineRequest(BaseModel):
+class GapRequest(BaseModel):
+    """The CV language of the check the page showed. The page sends it (with the check's version,
+    which this app does not keep); a request without it acts on the job's check as it is."""
+    language: str | None = None
+
+
+class WriteLineRequest(GapRequest):
     place: str
     text: str
 
@@ -203,6 +222,20 @@ class WriteLineRequest(BaseModel):
 class ChangeRequest(BaseModel):
     change_id: str
     undone: bool = True
+
+
+class LineEditRequest(BaseModel):
+    """New words for one line of a job's CV, and the words the page showed for it."""
+    text: str
+    expected_text: str
+
+
+class EditUndoRequest(BaseModel):
+    undone: bool = True
+
+
+class SaveLineRequest(BaseModel):
+    expected_text: str
 
 
 class DismissRequest(BaseModel):
@@ -394,14 +427,6 @@ def create_app(
         finally:
             running.discard(name)
 
-    def added_line(gaps: dict, requirement_id: str, adds: dict) -> dict:
-        """How a notice names a line being added: its requirement and the line, and in the key
-        a fingerprint of what goes where (see gaps.addition). So another line is another action,
-        and the same line, accepted or written, the same one."""
-        requirement = next((item for item in gaps["requirements"] if item["requirement_id"] == requirement_id), {})
-        digest = hashlib.sha256(json.dumps(adds, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-        return {"key": f"{requirement_id}:{digest[:12]}", "requirement": requirement.get("text"), "line": adds["text"],
-                "language": gaps.get("language")}
     # Next to the fact store by default, so tests with a temporary fact store stay temporary too.
     listings_db = Path(listings_db or Path(facts_db).parent / "listings.db")
     initialize(listings_db, load_starter() if starter is None else starter)
@@ -523,6 +548,11 @@ def create_app(
     async def domain_error(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
+    @app.exception_handler(StalePage)
+    @app.exception_handler(StaleEdit)
+    async def stale_page(_request: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+
     @app.exception_handler(sqlite3.OperationalError)
     async def database_busy(_request: Request, exc: sqlite3.OperationalError) -> JSONResponse:
         """SQLite waits up to 30 seconds for another writer; after that the page is told to retry.
@@ -587,17 +617,37 @@ def create_app(
         return view
 
     def gaps_view(job_id: str, gaps: dict) -> dict:
-        """What the CV shows for each requirement, worked out from the CV as it is now. A check
-        in an older format, or for a CV that no longer exists, is only marked out of date, so
-        the page checks again."""
+        """What the CV shows for each requirement, worked out from the CV as it is now, as far as
+        the check still stands for the job's requirements (gaps.coverage, the rule V2 uses too). A
+        check in an older format, or for a CV that no longer exists, is only marked out of date,
+        so the page checks again."""
         _, head = cv_head(job_id, gaps.get("language", "en"))
-        if gaps.get("gaps_version") != GAPS_VERSION or head is None:
+        if head is None:
             return {"outdated": True}
         confirmed = [(fact["id"], fact["version"]) for fact in list_facts(facts_db) ] \
             if Path(facts_db).exists() else []
-        return {**coverage(gaps, head, confirmed), "language": gaps["language"], "created_at": gaps["created_at"],
-                "places": [{key: place[key] for key in ("id", "kind", "where")} for place in places(head)],
+        shown = coverage(gaps, head, confirmed, workspace.read(job_id, "decided"))
+        if shown.get("outdated"):
+            return {"outdated": True}
+        return {**shown, "requirements": with_adoptions(shown["requirements"], head),
+                "language": gaps["language"], "created_at": gaps["created_at"],
+                "places": [{key: place[key] for key in ("id", "kind", "where")} for place in shown_places(head)],
                 "evidence_check": _explained(gaps.get("evidence_check")), "suggesting": _explained(gaps.get("suggesting"))}
+
+    def acted_check(job_id: str, shown: GapRequest | None) -> dict:
+        """The job's check the page acts on. Refused (409, nothing written) when the page showed a
+        check of the other CV language, and when the check no longer applies to the job's
+        requirements (gaps.unusable). This app keeps one check per job: checking the other
+        language moves it to the job's history."""
+        gaps = require(job_id, "gaps")
+        if shown is not None and shown.language is not None and shown.language != gaps.get("language"):
+            raise StalePage(PAGE_OUT_OF_DATE)
+        reason = unusable(gaps, gaps.get("language"), workspace.read(job_id, "decided"))
+        if reason == "requirements_changed":
+            raise StalePage("The job's requirements changed after this check; check again before adding from it")
+        if reason:
+            raise StalePage("This check is out of date; check again first")
+        return gaps
 
     def check_language(language: str) -> str:
         if language not in CV_LANGUAGES:
@@ -611,6 +661,25 @@ def create_app(
             if data is not None:
                 return step, data
         return None, None
+
+    def editable_cv(job_id: str, language: str) -> tuple[str, dict]:
+        """The job's CV to change in a language, and its step: the newest prepared step, the one
+        an approval, if any, was made of. Writing it moves that approval and the final PDF to the
+        job's history, so a changed CV is approved again before it is final."""
+        for step in ("planned", "tailored", "draft"):
+            name = f"cv-{step}-{check_language(language)}"
+            document = workspace.read(job_id, name)
+            if document is not None:
+                return name, document
+        raise WorkspaceError("请先准备这个岗位的简历")
+
+    def edit_cv(job_id: str, language: str, change: Callable[[dict], tuple[dict, bool]]) -> None:
+        """One change of the job's own CV in a language (cv_edit; see editable_cv). Nothing is
+        written when nothing changed; the profile and other jobs are never touched."""
+        name, document = editable_cv(job_id, language)
+        updated, changed = change(document)
+        if changed:
+            workspace.write(job_id, name, updated)
 
     def cv_view(job_id: str, language: str) -> dict:
         head_step, head = cv_head(job_id, language)
@@ -640,6 +709,9 @@ def create_app(
         if head and "plan" in head:
             undone = set(head["plan"]["undone"])
             view["changes"] = [{**item, "undone": item["id"] in undone} for item in head["plan"]["changes"]]
+        if head:
+            view["edits"] = edits_view(head)
+            view["lines"] = lines_view(head)
         if head_step == "approved":
             view["approved_at"] = head["approval"]["approved_at"]
         return view
@@ -753,8 +825,11 @@ def create_app(
     def prepare_cv(job_id: str, language: str) -> None:
         """Draft, reword and adjust one language's CV for this job, recording how each stage
         went. When DeepSeek cannot reword or adjust, the CV stays at the last stage that worked
-        and the page says why, so a usable CV is never mistaken for a tailored one."""
+        and the page says why, so a usable CV is never mistaken for a tailored one. The job's own
+        changes of the CV until now (adopted and edited lines) go on again, word for word, after
+        what the model did (cv_edit.carry_over); the model sees the CV without them."""
         job = require(job_id, "decided")
+        previous = cv_head(job_id, check_language(language))[1]
         started = time.monotonic()
         try:
             if not Path(facts_db).exists():
@@ -771,34 +846,14 @@ def create_app(
                 _stage(name, "skipped", f"{STAGE_FAILED[name]}: the CV could not be drafted.", output=earlier)
                 for name in ("rewording", "layout"))])
             raise
-        workspace.write(job_id, f"cv-draft-{language}", head)
+        workspace.write(job_id, f"cv-draft-{language}", carry_over(previous, head))
         stages = [log_stage(job_id, language, _stage("draft", "done", "Built from your saved material."), started)]
-        private = known_private_terms()
-        started = time.monotonic()
-        try:
-            # Thinking off: on a real CV it gave the same result in 2 s instead of 8 s (2026-09).
-            head = tailor_draft(head, facts_db, job=job, chat=chat, effort="none", private=private)
-            workspace.write(job_id, f"cv-tailored-{language}", head)
-            stages.append(log_stage(job_id, language, _reworded(head), started))
-        except CVError as exc:
-            stages.append(log_stage(job_id, language, _stage_failure("rewording", exc), started))
-        started = time.monotonic()
-        try:
-            planned = plan_draft(head, job, chat=chat, private=private)
-            workspace.write(job_id, f"cv-planned-{language}", planned)
-            stages.append(log_stage(job_id, language, _adjusted(planned), started))
-        except CVError as exc:
-            stages.append(log_stage(job_id, language, _stage_failure("layout", exc), started))
+        for step in prepare_steps(head, facts_db, job, chat=chat, private=known_private_terms(),
+                                  previous=previous, tailor=tailor_draft, plan=plan_draft):
+            if step.document is not None:
+                workspace.write(job_id, f"cv-{step.kind}-{language}", step.document)
+            stages.append(log_stage(job_id, language, step.status, step.started))
         record_stages(job_id, language, stages)
-
-    def prepare_again(job_id: str, language: str) -> None:
-        """Prepare the CV again after a line was saved. The line stays saved even when the CV
-        cannot be prepared (for example while another fact waits for confirmation): the CV
-        panel says why, so the save is never reported as refused."""
-        try:
-            prepare_cv(job_id, language)
-        except (CVError, FactStoreError):
-            pass
 
     def cv_languages() -> list[str]:
         available = []
@@ -1116,12 +1171,14 @@ def create_app(
         draft = build_draft(
             load_profile(check_language(language)), facts_db, language, job=workspace.read(job_id, "decided")
         )
-        workspace.write(job_id, f"cv-draft-{language}", draft)
+        workspace.write(job_id, f"cv-draft-{language}", carry_over(cv_head(job_id, language)[1], draft))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/cv/{language}/tailor")
     def cv_tailor(job_id: str, language: str) -> dict:
-        draft = require(job_id, f"cv-draft-{check_language(language)}")
+        """Reword again from the draft as prepared; the job's own changes go on again after."""
+        draft = without_edits(require(job_id, f"cv-draft-{check_language(language)}"))
+        previous = cv_head(job_id, language)[1]
         started = time.monotonic()
         try:
             tailored = tailor_draft(draft, facts_db, job=workspace.read(job_id, "decided"), chat=chat,
@@ -1130,15 +1187,18 @@ def create_app(
             earlier = workspace.read(job_id, f"cv-tailored-{language}") is not None
             update_stage(job_id, language, log_stage(job_id, language, _stage_failure("rewording", exc, earlier), started))
             raise
-        workspace.write(job_id, f"cv-tailored-{language}", tailored)
+        workspace.write(job_id, f"cv-tailored-{language}", carry_over(previous, tailored))
         update_stage(job_id, language, log_stage(job_id, language, _reworded(tailored), started), not_run=("layout",))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps")
-    def check_gaps(job_id: str) -> dict:
+    def check_gaps(job_id: str, shown: GapRequest | None = None) -> dict:
         """What the CV, as it is now, has behind each requirement, with suggestions for what
-        nothing shows. A suggestion declined before stays declined."""
+        nothing shows. A suggestion declined before stays declined. A page showing the CV language
+        another tab has switched away from is out of date: its check would not be shown."""
         language = job_cv_language(require(job_id, "input")["jd"]["text"], job_id)
+        if shown is not None and shown.language is not None and shown.language != language:
+            raise StalePage(PAGE_OUT_OF_DATE)
         _, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历，再检查缺口")
@@ -1147,11 +1207,11 @@ def create_app(
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/suggest", response_model=None)
-    def suggest_entry(job_id: str, requirement_id: str) -> dict | JSONResponse:
+    def suggest_entry(job_id: str, requirement_id: str, shown: GapRequest | None = None) -> dict | JSONResponse:
         """Complete wording for one requirement the check found missing or only related, made
         when the user asks, with the CV as it is now. A complete answer is saved and reused; a
         failed or empty one saves nothing, so the next click asks again."""
-        gaps = require(job_id, "gaps")
+        gaps = acted_check(job_id, shown)
         _, head = cv_head(job_id, gaps.get("language", "en"))
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历")
@@ -1164,57 +1224,95 @@ def create_app(
             workspace.write(job_id, "gaps", updated)
         return job_view(job_id)
 
-    def saved_and_prepared(job_id: str, gaps: dict, updated: dict, profile: dict | None) -> bool:
-        """Whether adding a line changed nothing (a second click, a tab left open) and the CV is
-        already prepared with it: preparing it again would only replace it, and with it any
-        change the user has undone since."""
-        if updated != gaps or profile is not None:
-            return False
-        _, head = cv_head(job_id, gaps["language"])
-        try:
-            if head is None:
-                return False
-            require_current_cv(head, gaps["language"])
-        except (CVError, FactStoreError):
-            return False
-        return True
+    def action_key(http: Request) -> str | None:
+        """The page's key for the user's action (Idempotency-Key), if it sent one: the same action
+        again changes nothing more (cv_edit)."""
+        supplied = http.headers.get("idempotency-key")
+        if supplied is not None and not (0 < len(supplied) <= 128 and supplied.isprintable()):
+            raise ValueError("Invalid Idempotency-Key")
+        return supplied
+
+    # Adopting puts the words on this job's CV in the check's language, and nowhere else: nothing
+    # is prepared again, and the profile changes only when the user saves a line to it (below).
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/accept")
-    def accept_suggestion(job_id: str, requirement_id: str) -> dict:
-        """The user says the suggested line is true: it becomes a confirmed fact on the CV."""
-        gaps = require(job_id, "gaps")
-        adds = suggested_addition(gaps, requirement_id)
-        with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
-            updated, profile = accept_gap(gaps, requirement_id, facts_db, load_profile(gaps["language"]))
-            if saved_and_prepared(job_id, gaps, updated, profile):
-                return job_view(job_id)
-            if profile is not None:
-                save_profile(profile, gaps["language"])
-            workspace.write(job_id, "gaps", updated)
-            prepare_again(job_id, gaps["language"])  # the notice stays until the CV has been prepared again
+    def accept_suggestion(http: Request, job_id: str, requirement_id: str, shown: GapRequest | None = None) -> dict:
+        """The user adopts the suggestion as it is, into this CV only (cv_edit.adopt_for)."""
+        gaps = acted_check(job_id, shown)
+        row, key = _gap(gaps, requirement_id), action_key(http)
+        edit_cv(job_id, gaps["language"], lambda document: adopt_for(document, row, request=key))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/write")
-    def write_own_line(job_id: str, requirement_id: str, request: WriteLineRequest) -> dict:
-        """The user writes what shows a requirement themselves: it becomes a confirmed fact on the CV."""
-        gaps = require(job_id, "gaps")
-        _, head = cv_head(job_id, gaps["language"])
-        if head is None:
-            raise WorkspaceError("请先准备这个岗位的简历")
-        adds = addition(line_to_write(gaps, requirement_id, request.place, request.text, head))  # refused before any write
-        with operation("add_line", job_id, **added_line(gaps, requirement_id, adds)):
-            updated, profile = write_line(gaps, requirement_id, request.place, request.text, head, facts_db, load_profile(gaps["language"]))
-            if saved_and_prepared(job_id, gaps, updated, profile):
-                return job_view(job_id)
-            if profile is not None:
-                save_profile(profile, gaps["language"])
-            workspace.write(job_id, "gaps", updated)
-            prepare_again(job_id, gaps["language"])  # the notice stays until the CV has been prepared again
+    def write_own_line(http: Request, job_id: str, requirement_id: str, request: WriteLineRequest) -> dict:
+        """The user's own words for a requirement (or the suggestion as they edited it), adopted
+        word for word into this CV only."""
+        gaps = acted_check(job_id, request)
+        row, key = _gap(gaps, requirement_id), action_key(http)
+        edit_cv(job_id, gaps["language"], lambda document: adopt_for(
+            document, row, place=request.place, text=request.text, request=key))
+        return job_view(job_id)
+
+    # -- the job CV's own lines: edit, undo or redo, save to the profile ---------------------
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/lines/{block}")
+    def cv_edit_line(http: Request, job_id: str, language: str, block: str, request: LineEditRequest) -> dict:
+        """New words for one line of this CV only; refused (409) when the line no longer reads
+        what the page showed."""
+        key = action_key(http)
+        edit_cv(job_id, language, lambda document: change_line(
+            document, block, request.text, expected_text=request.expected_text, request=key))
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/edits/{edit_id}")
+    def cv_set_edit(http: Request, job_id: str, language: str, edit_id: str, request: EditUndoRequest) -> dict:
+        key = action_key(http)
+        edit_cv(job_id, language, lambda document: set_edit(document, edit_id, request.undone, request=key))
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/lines/{block}/save")
+    def cv_save_line(job_id: str, language: str, block: str, request: SaveLineRequest) -> dict:
+        """The user saves one line of this CV to their profile, for their other CVs too
+        (cv_edit.save_plan): a pending saved entry, never a confirmed one. Checked before anything
+        is written; the facts, the profile and this CV are then written in turn, with a notice that
+        stays if that is cut short (saving again finishes it without adding anything twice). This
+        CV stays current if it was; other CVs made from the profile before are not any more."""
+        name, document = editable_cv(job_id, language)
+        key = f"{language}:{block}:{hashlib.sha256(request.expected_text.encode()).hexdigest()}"
+        if already_saved(document, block, request.expected_text):
+            # The CV write completed but removing the notice (or returning the answer) did not.
+            with operation("save_line", job_id, key=key, block=block, line=request.expected_text, language=language):
+                pass
+            return job_view(job_id)
+        target = save_target(document, block)
+        profile = load_profile(language)
+        plan = save_plan(target, profile, language, fact_source(facts_db))
+        before_hash = _profile_hash(profile)
+        after_hash = _profile_hash(plan["profile"]) if plan["profile"] is not None else before_hash
+        earlier = next((notice for notice in read_notices() if notice.get("kind") == "save_line"
+                        and notice.get("job_id") == job_id and notice.get("key") == key), None)
+        current = document.get("profile_sha256") == before_hash
+        if earlier:
+            current = (document.get("profile_sha256") == earlier.get("profile_before")
+                       and before_hash in (earlier.get("profile_before"), earlier.get("profile_after")))
+        with operation("save_line", job_id, key=key, block=block, line=target["text"], language=language,
+                       profile_before=before_hash, profile_after=after_hash):
+            fact = plan["fact"]
+            if plan["create"]:
+                fact = import_facts(facts_db, [{"id": block, "text": target["text"], "type": target["fact_type"],
+                                                "tags": plan["tags"]}])[0][0]
+            elif plan["revise"]:
+                fact = revise_fact(facts_db, block, text=target["text"], tags=plan["tags"],
+                                   expected_version=fact["version"])[0]
+            profile_hash = after_hash if current else None
+            if plan["profile"] is not None:
+                save_profile(plan["profile"], language)
+            workspace.write(job_id, name, mark_saved(document, block, fact["version"], profile_sha256=profile_hash))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/gaps/{requirement_id}/decline")
-    def decline_suggestion(job_id: str, requirement_id: str) -> dict:
-        workspace.write(job_id, "gaps", decline_gap(require(job_id, "gaps"), requirement_id))
+    def decline_suggestion(job_id: str, requirement_id: str, shown: GapRequest | None = None) -> dict:
+        workspace.write(job_id, "gaps", decline_gap(acted_check(job_id, shown), requirement_id))
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/cv/{language}/prepare")
@@ -1224,16 +1322,18 @@ def create_app(
 
     @app.post("/api/jobs/{job_id}/cv/{language}/plan")
     def cv_plan(job_id: str, language: str) -> dict:
-        """Adjust (again) for this job, starting from the reworded CV, or the draft if none."""
+        """Adjust (again) for this job, starting from the reworded CV, or the draft if none, as
+        prepared; the job's own changes go on again after."""
         base = workspace.read(job_id, f"cv-tailored-{check_language(language)}") or require(job_id, f"cv-draft-{language}")
+        previous = cv_head(job_id, language)[1]
         started = time.monotonic()
         try:
-            planned = plan_draft(base, require(job_id, "decided"), chat=chat, private=known_private_terms())
+            planned = plan_draft(without_edits(base), require(job_id, "decided"), chat=chat, private=known_private_terms())
         except CVError as exc:
             earlier = workspace.read(job_id, f"cv-planned-{language}") is not None
             update_stage(job_id, language, log_stage(job_id, language, _stage_failure("layout", exc, earlier), started))
             raise
-        workspace.write(job_id, f"cv-planned-{language}", planned)
+        workspace.write(job_id, f"cv-planned-{language}", carry_over(previous, planned))
         update_stage(job_id, language, log_stage(job_id, language, _adjusted(planned), started))
         return job_view(job_id)
 
