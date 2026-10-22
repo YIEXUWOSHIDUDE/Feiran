@@ -1969,6 +1969,42 @@ class UserWorkspace:
                 document=changed, facts=facts)
             return self._material(connection, material_id)
 
+    def publish_fit(self, *, task_id: str, token: str, job_id: str, language: str, base_head: str,
+                    document: dict | None, outcome: dict) -> dict:
+        """Publish what fitting the CV on one page (cv_fit) found: the CV with the lines it left
+        out as the next version, when there is one, and the outcome, kept in the CV's status note
+        beside the version it is about. As publish_cv: only while the task holds its token, the
+        CV is still the one it read and that CV's inputs are still current; otherwise nothing is
+        kept and the task is superseded, so a fit never lands on an edit made meanwhile."""
+        with self._transaction(write=True) as connection:
+            _running_task(connection, self.user_id, task_id, token)
+            head = self._head(connection, job_id, language)
+            if (head['material_id'] if head else None) != base_head:
+                _end_task(connection, self.user_id, task_id, 'superseded', error_code='superseded',
+                          message="This CV changed while it was being fitted")
+                return {'superseded': True}
+            if not self._inputs_current(connection, head):
+                _end_task(connection, self.user_id, task_id, 'superseded', error_code='inputs_changed',
+                          message="The facts, profile or requirements changed while this CV was being fitted")
+                return {'superseded': True}
+            material_id, published = head['material_id'], []
+            if document is not None:
+                facts = [(ref['fact_id'], ref['fact_version']) for ref in connection.execute(
+                    'SELECT fact_id, fact_version FROM material_facts WHERE user_id = ? AND material_id = ?',
+                    (self.user_id, head['material_id']))]
+                material_id = self._insert_material(
+                    connection, job_id=job_id, language=language, stage='planned', parent_id=head['material_id'],
+                    profile_version=head['profile_version'], requirements_version=head['requirements_version'],
+                    request_id=f"{task_id}:fit", request_payload=_json([task_id, 'fit']), document=document,
+                    facts=facts)
+                published.append(material_id)
+            name = f'cv-status-{language}'
+            status = self._note(connection, job_id, name) or {'draft_material_id': None, 'stages': []}
+            self._set_note(connection, job_id, name, {**status, 'fit': {**outcome, 'material_id': material_id}})
+            result = {'job_id': job_id, 'language': language, 'fit': outcome['status'], 'materials': published}
+            _end_task(connection, self.user_id, task_id, 'succeeded', result=result)
+            return result
+
     # -- this job's own changes to its CV (cv_edit) ------------------------------------------
 
     def _repeated_edit(self, connection: sqlite3.Connection, request_id: str, request_payload: str) -> dict | None:

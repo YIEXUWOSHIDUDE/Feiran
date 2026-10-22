@@ -866,12 +866,37 @@ function changeRow(view, language, change, refresh, editable) {
   return el("tr", { class: change.undone ? "undone" : "" },
     el("td", { class: "icon" }, CHANGE_ICONS[change.type] || "•"),
     el("td", {}, change.label,
-      change.reason ? el("div", { class: "muted" }, change.reason) : null,
+      change.reason ? el("div", { class: "muted" }, I18n.serverText(change.reason)) : null,
       change.undone ? el("div", { class: "muted" }, t("Undone: your usual CV is shown for this part.")) : null),
     el("td", { class: "choice" }, toggle));
 }
 
 const STAGE_MARKS = { done: "✓", fallback: "!", failed: "✕", skipped: "–" };
+
+// Why lines stayed when one page could not be reached (cv_fit: what is never left out).
+const FIT_KEPT = {
+  matched: t("linked to this job's requirements"), edited: t("added or edited in this CV"),
+  put_back: t("put back by you"), education: t("education details"),
+  one_per_entry: t("the one line a job or the skills keep"),
+};
+
+// How fitting this version of the CV on one page went: shown beside the version it is about.
+function fitNote(fit) {
+  if (!fit) return null;
+  if (fit.status === "fits") return el("p", { class: "ok-text" }, t("Prints on one page; nothing was left out."));
+  if (fit.status === "fitted") {
+    return el("p", { class: "ok-text" },
+      t`Fitted to one page: it printed on ${fit.pages_before} pages, so ${fit.left_out} less related line(s) are left out. Each is listed below; undo any you want back.`);
+  }
+  const kept = Object.entries(fit.kept || {}).filter(([, count]) => count)
+    .map(([name, count]) => I18n.join([count, " ", FIT_KEPT[name] || name]));
+  return el("div", { class: "warning fit-refused" },
+    el("p", {}, fit.tried
+      ? t`Not fitted: even with ${fit.tried} less related line(s) left out${fit.capped ? t(" (at most half of what it shows)") : ""}, this CV prints on ${fit.pages} pages.`
+      : t`Not fitted: this CV prints on ${fit.pages} pages and none of its lines may be left out.`),
+    kept.length ? el("p", {}, t("Lines that stay: "), I18n.join(kept, "; "), ".") : null,
+    el("p", {}, t`Nothing was changed. To get one page, shorten or undo some of your own changes, or keep ${fit.pages_before} pages.`));
+}
 
 // One editor keeps its request key after an uncertain response. A changed payload is a new
 // action; failed requests leave its text in place. This also works in the local file store.
@@ -959,6 +984,8 @@ function cvBlock(view, language, refresh) {
   if (!cv.stale && cv.head === "draft") tools.push(actionButton(t("Reword with DeepSeek"), post("tailor"), true));
   if (!cv.stale && (cv.head === "draft" || cv.head === "tailored")) tools.push(actionButton(t("Adjust for this job"), post("plan")));
   if (!cv.stale && cv.head === "planned") tools.push(actionButton(t("Adjust again"), post("plan"), true));
+  // Leaves out the least related lines until the printed CV fits one page; never rewords.
+  if (!cv.stale) tools.push(actionButton(t("Fit to one page"), post("fit"), true));
   tools.push(actionButton(t("Start over"), post("prepare"), true));
   if (approved && !cv.final_pdf) tools.push(actionButton(t("Create final PDF"), post("export")));
   if (cv.final_pdf) {
@@ -968,6 +995,7 @@ function cvBlock(view, language, refresh) {
   if (cv.stale) notes.push(el("p", { class: "warning" }, t("Your profile or facts changed. This is an old draft. Start over and review the new version.")));
   if (approved) notes.push(el("p", { class: "ok-text" }, t`Approved ${I18n.date(cv.approved_at, true)}. Editing this CV requires approval again.`));
   if (cv.stages) notes.push(stageList(cv.stages));
+  if (cv.fit && !cv.stale) notes.push(fitNote(cv.fit));
   else if (cv.head === "draft") notes.push(el("p", { class: "warning" }, t("This is your usual CV: DeepSeek could not reword or adjust it yet. Use the buttons above.")));
   else if (cv.head === "tailored") notes.push(el("p", { class: "warning" }, t("Reworded, but not adjusted for this job yet: DeepSeek could not plan it. Use Adjust for this job.")));
   if ((cv.language_fallbacks || []).length) {
@@ -1441,7 +1469,7 @@ const TASK_NAMES = {
   start_listing: t("reading the job and preparing the CV"), prepare_cv: t("preparing your CV"),
   tailor_cv: t("rewording your CV"), plan_cv: t("adjusting your CV"), check_gaps: t("checking what your CV shows"),
   suggest_gap: t("suggesting a related experience entry"),
-  export_pdf: t("creating the final PDF"), upload_cv: t("reading your CV"),
+  export_pdf: t("creating the final PDF"), fit_cv: t("fitting your CV on one page"), upload_cv: t("reading your CV"),
 };
 
 function taskNote(task, refresh) {

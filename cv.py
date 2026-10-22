@@ -602,6 +602,21 @@ def _count_pages(data: bytes) -> int | None:
     return count or None
 
 
+def rendered_pages(draft: dict[str, Any], printer: Callable[[Path, Path], None] = print_with_chrome) -> int:
+    """How many pages the CV prints on: the HTML the preview and the final PDF show, printed the
+    same way (the draft watermark is fixed in place, so it moves nothing). Nothing is kept."""
+    with tempfile.TemporaryDirectory(prefix="cv-pages-") as directory:
+        html_path = Path(directory) / "cv.html"
+        pdf_path = Path(directory) / "cv.pdf"
+        html_path.write_text(render_html(draft), encoding="utf-8")
+        printer(html_path, pdf_path)
+        data = pdf_path.read_bytes() if pdf_path.exists() else b""
+    pages = _count_pages(data) if data.startswith(b"%PDF") else None
+    if pages is None:
+        raise CVError("没有生成有效的 PDF，无法确认页数")
+    return pages
+
+
 def content_fingerprint(draft: dict[str, Any]) -> str:
     """What a CV says, as one hash: the page shows it with the CV, and an approval is only for
     the CV that still has it. The approval stamp itself is not part of it."""
@@ -682,7 +697,8 @@ TAILOR_RULES = """You write competitive resume lines for one job application and
 Use the supplied material and job requirements to produce concrete, polished wording in {language}.
 You may develop and extend experience, skills, responsibilities, metrics, impact and seniority
 beyond the supplied lines. Write usable content directly, not questions, placeholders or templates.
-Keep each line concise (at most 300 characters), with no line breaks.
+Keep each line concise: one idea with its result, ideally under 200 characters (at most 300),
+with no line breaks. Do not repeat a phrase, tool list or result another line already states.
 Reply with this json shape, exactly one entry per input line, reusing each fact_id:
 {{"lines": [{{"fact_id": "L1", "text": "resume line"}}]}}"""
 

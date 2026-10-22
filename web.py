@@ -44,9 +44,11 @@ from cv import (
     profile_languages,
     rejected_lines,
     render_html,
+    rendered_pages,
     rewritten_lines,
     tailor_draft,
 )
+from cv_fit import fit_outcome
 from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, structure_cv
 from cv_status import (
     CANDIDATE_FIELDS,
@@ -714,6 +716,9 @@ def create_app(
             view["lines"] = lines_view(head)
         if head_step == "approved":
             view["approved_at"] = head["approval"]["approved_at"]
+        fit = workspace.read_note(job_id, f"cv-fit-{language}")
+        if head and fit and fit.get("content_sha256") == view["content_sha256"]:
+            view["fit"] = {key: value for key, value in fit.items() if key != "content_sha256"}
         return view
 
     def profile_file(language: str | None = None, *, writing: bool = False) -> Path:
@@ -1341,6 +1346,22 @@ def create_app(
     def cv_change(job_id: str, language: str, request: ChangeRequest) -> dict:
         planned = require(job_id, f"cv-planned-{check_language(language)}")
         workspace.write(job_id, f"cv-planned-{language}", set_change(planned, request.change_id, request.undone))
+        return job_view(job_id)
+
+    @app.post("/api/jobs/{job_id}/cv/{language}/fit")
+    def cv_fit(job_id: str, language: str) -> dict:
+        """Leave out the lines that help this job least until the CV prints on one page
+        (cv_fit), as cuts listed with the job's other changes, each undone on its own. The
+        printed page count decides. A CV that already fits, or cannot without leaving out what
+        must stay, is not changed; the page says which, beside this version of the CV. Like every
+        change here, it runs alone (one_change_at_a_time), so no edit lands while it prints."""
+        _name, document = editable_cv(job_id, check_language(language))
+        require_current_cv(document, language)
+        fitted, outcome = fit_outcome(document, require(job_id, "decided"), lambda draft: rendered_pages(draft, printer))
+        if fitted is not None:
+            workspace.write(job_id, f"cv-planned-{language}", fitted)
+        workspace.write_note(job_id, f"cv-fit-{language}",
+                             {**outcome, "content_sha256": content_fingerprint(fitted or document)})
         return job_view(job_id)
 
     @app.post("/api/jobs/{job_id}/cv/{language}/approve", response_model=None)
