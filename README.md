@@ -1,12 +1,12 @@
 # Feiran · 斐然
 
-**AI suggested entry** produces complete, editable CV sentences or skills for each requirement, including content beyond the saved profile. Adopt a suggestion directly or edit it first. Historical empty suggestions are generated again on the next click; there are no fill-in templates or per-line truth confirmations. Saved profile content is immediately available for matching and generation, including older pending entries.
+Prepare a job-specific CV from your profile and a job description. Generate complete suggestions, edit individual lines, and fit the result to one page with reversible content selection.
 
 > What oft was thought, but ne’er so well express’d.
 
 English | [简体中文](README.zh-CN.md)
 
-An AI-powered workspace that helps you prepare competitive, job-specific resumes. Understand what a role asks for, refine how you present your experience, and review every change before exporting.
+An open-source CV workspace with Chinese and English profiles, job-source and sponsorship context, local editing, and PDF export. Use an existing cloud account or run your own copy locally.
 
 ![Feiran — relevant content, clearer stories, brighter next steps](web/feiran-brand.png)
 
@@ -15,29 +15,33 @@ An AI-powered workspace that helps you prepare competitive, job-specific resumes
 - **Understand the role** — identify requirements in the job description and review anything missed or misclassified.
 - **Present relevant experience** — use your profile and AI additions to prepare a CV for each job.
 - **Refine the wording and structure** — review AI suggestions for phrasing, ordering and what to leave out.
-- **Stay in control** — inspect changes, undo them individually, and approve the exact version you want.
+- **Edit locally** — adopt, edit, undo and redo individual entries without regenerating the whole CV; save a line to your shared profile separately.
+- **Fit to one page** — leave out less relevant content using actual PDF page counts, with reversible changes and unchanged font sizes.
 - **Export your CV** — download the PDF after reviewing and approving it.
 
 *Same you. A stronger story.*
 
 ## Use the cloud workspace
 
-**Already have cloud access? Open your Feiran HTTPS address and sign in. You do not need to install Python, download the code or configure a local API key.** The current instance is restricted to its owner; registration is not open. Continue with “Using Feiran” below after signing in.
+**Already have cloud access? Open your Feiran HTTPS address and sign in. You do not need to install Python, download the code or configure a local API key.** The current V2 instance is restricted to configured accounts; self-registration is not open. Continue with “Using Feiran” below after signing in.
 
 Prefer running it on your computer? Complete [local setup instructions](#local-deployment-optional) remain on this page. Local deployment is optional and is not required to use the cloud workspace.
 
-A single-owner Feiran workspace is now deployed on AWS with a public HTTPS address and private login. **There is no public demo or open registration.** The owner can open the workspace in a browser; local operation remains optional. Login protection, synthetic English/Chinese PDF export, persistence across test containers, and backup restoration have been verified on AWS. The cloud DeepSeek secret is connected, and a bounded live API check passed. Full resume quality still requires your review. See [AWS public deployment](docs/aws-public.md) and the [acceptance record](docs/aws-acceptance.md) for the tested scope and remaining checks.
+The V2 workspace is deployed on AWS with HTTPS and Cognito sign-in. The four-round workflow improvements and one-page fitting are included in [release `4c595a7`](https://github.com/YIEXUWOSHIDUDE/Feiran/actions/runs/40027427699), deployed on October 23, 2026. Live English acceptance covered fitting an actual PDF from two pages to one, undo/redo, persistence after refresh, and browser downloads. Font sizes were unchanged, with no clipping or overlap in the inspected PDF. Chinese one-page fitting has not yet been checked in the live browser. See [development evidence and limits](docs/development.md) for details; older deployment records describe earlier releases.
 
 ## Using Feiran
 
-The V2 sponsor hints and review-before-generation flow below are implemented on the local branch and have not yet been deployed to the existing cloud instance.
+The steps below describe the deployed V2 flow. The optional local V1 mode differs where noted.
+
+For the full feature inventory, walkthrough and remaining work, see the [project plan and usage guide (Chinese)](docs/project-plan.md).
 
 Once you have access to a running workspace:
 
 1. **Bring your experience.** Choose Chinese or English when uploading a PDF; both CVs are kept separately. Save the extracted content to use it immediately. Editing saves a new usable version and preserves earlier text in history.
 2. **Choose a job.** In V2, paste a public job URL or description, or browse followed companies, to review the job first. Greenhouse, Lever, Ashby and Tencent use public APIs; other URLs use page content, preferring JobPosting data. Login, CAPTCHA, JavaScript-only or incomplete pages may require pasting the description. Review the sponsor label, original evidence, source and capture time, plus skill words paired with saved experience. Unknown sponsor policies remain visible by default. Click **Prepare CV** when ready to extract requirements and generate a draft. Reading a job uses no model calls or generation allowance. Saved URLs reopen the existing job. V1 local mode keeps its previous read-and-prepare flow.
-3. **Review your tailored CV.** Check the job requirements, proposed wording and layout changes. See which requirements your CV supports, which evidence was left out, and where information is missing. Adopt or edit complete AI suggestions to add relevant content.
-4. **Approve and export.** Read the CV and every change, approve that version, and download the final PDF. Changed content needs a new review.
+3. **Edit your tailored CV.** Use **Check now** when you want to compare the current CV with the requirements. **AI suggested entry** generates complete sentences or skills. Adopt or write an entry directly into this job's CV, then use **Edit this CV** to adjust individual lines. Use **Save to my profile** separately to reuse a line for other jobs.
+4. **Fit it to one page if needed.** Choose **Fit to one page** to leave out less relevant content. Inspect the listed changes and undo any you want back. If protected content prevents a one-page result, the CV stays unchanged and the page explains why.
+5. **Approve and export.** The current version requires **Approve this CV**, then **Create final PDF** and **Download final PDF**. Editing or fitting changes the version and requires approval again. Making this approval optional is planned, not implemented.
 
 Switch between **English** and **简体中文** at the top of the page. The interface remembers your choice; changing the interface language does not translate your job descriptions, experience statements or CV. CV languages depend on the information in your profile.
 
@@ -45,13 +49,15 @@ Choose an uploaded Chinese or English CV for each job. Uploading again replaces 
 
 All regions share one listings database; Mainland China, other regions and unknown-location filters use explicit workplace locations. You can also add Tencent's public board at `https://careers.tencent.com/zh-cn/search.html`. Its list contains responsibility summaries; full requirements are fetched on selection. BOSS, ByteDance and Alibaba automatic refresh adapters are not yet included; paste their full descriptions instead. Cached postings reflect the time they were fetched; check the official page before applying.
 
-### Local editing on the current branch (2026-10-22)
+### Local editing and one-page fitting
 
 Adopting or writing an entry changes only this job’s CV, word for word, without preparing the whole CV again. Use **Edit this CV** to change individual lines, undo or redo local changes, and **Save to my profile** only when you want to reuse a line across jobs. Changed CVs need approval again.
 
 Unsaved words survive task polling and navigation within the same tab. Reloading or closing the tab clears unsaved drafts. A conflicting save keeps your text; copy it or use **Discard unsaved changes** to load the latest line. Missing original lines keep recoverable unsaved text. Drafts are held in memory, not browser persistent storage.
 
-These changes were checked in a local V2 browser with synthetic data and real DeepSeek calls; they have not been deployed. The generated English PDF passed text and visual checks, but the browser download click was blocked by the client. See [development evidence and limits](docs/development.md).
+One-page fitting selects content to leave out; it does not shorten sentences or shrink the font. It protects adopted/edited lines, restored content, essential education details, and minimum experience and skills content. Original profile data remains intact. Fitting uses actual Chromium printing, makes no DeepSeek calls, and leaves the CV unchanged if it cannot fit. Undoing a cut or editing afterward can change the page count; fit or export again to check it. Some whole-section cuts are restored as one change.
+
+Local editing was tested with real DeepSeek calls and a local V2 browser. The changes are deployed, and the October 23 live English check confirmed saved local content, one-page fitting, undo/redo and successful PDF downloads. The earlier client-blocked download observation no longer describes that tested path. V1 and cross-language adoption still need complete browser coverage.
 
 ## Your information and your decisions
 
