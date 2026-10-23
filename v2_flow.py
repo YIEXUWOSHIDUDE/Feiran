@@ -14,7 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from cv import CVError, build_draft, export_pdf, print_with_chrome, tailor_draft
+from cv import CVError, build_draft, export_pdf, print_with_chrome, rendered_pages, tailor_draft
+from cv_fit import fit_outcome
 from cv_preparation import prepare_steps
 from cv_edit import carry_over, without_edits
 from cv_import import CVImportError, structure_cv
@@ -31,12 +32,13 @@ from requirement_flow import RequirementError, apply_requirement_decisions, prop
 # counts as one). 0 also marks work that makes no model call. In tokens mode no units are
 # reserved: each model call reserves its own estimated tokens as it starts (tenant_store.begin_call).
 UNITS = {"upload_cv": 1, "prepare_job": 3, "job_from_url": 3, "start_listing": 3, "prepare_cv": 2,
-         "tailor_cv": 1, "plan_cv": 1, "check_gaps": 2, "suggest_gap": 1, "export_pdf": 1, "read_job_url": 0, "read_listing": 0}
+         "tailor_cv": 1, "plan_cv": 1, "check_gaps": 2, "suggest_gap": 1, "export_pdf": 1, "fit_cv": 1,
+         "read_job_url": 0, "read_listing": 0}
 # The data flow each operation needs the user's agreement to (tenant_store.CONSENT_STAGES).
 CONSENT = {"upload_cv": "upload_parsing", "prepare_job": "job_processing", "job_from_url": "job_processing",
            "start_listing": "job_processing", "prepare_cv": "job_processing", "tailor_cv": "job_processing",
            "plan_cv": "job_processing", "check_gaps": "job_processing", "suggest_gap": "job_processing"}
-HEAVY = {"export_pdf": "pdf"}
+HEAVY = {"export_pdf": "pdf", "fit_cv": "pdf"}  # fitting prints the CV to count its pages; no model call
 
 
 class TaskFailed(Exception):
@@ -350,11 +352,34 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         ctx.user.publish_pdf(task_id=ctx.task_id, token=ctx.token, approval_id=inputs["approval_id"], data=data,
                              pages=summary["pages"])
 
+    def run_fit(ctx: Any) -> None:
+        """Leave out the lines that help the job least until the current CV prints on one page
+        (cv_fit), published as the CV's next version; or, when it already fits or cannot, only
+        how it went, beside the CV it is about."""
+        job_id, language = ctx.request["job_id"], ctx.request["language"]
+        inputs = ctx.user.cv_inputs(job_id, language)
+        head = inputs["head"]
+        if head is None:
+            raise TaskFailed("请先准备这个岗位的简历", "no_cv")
+        if head["material_id"] != ctx.request.get("base_head"):
+            ctx.finish("superseded", error_code="superseded", message="A newer CV was made before this one started")
+            return
+        if not head["inputs_current"]:
+            raise TaskFailed("简历资料已更新，请重新准备并审核这份简历", "stale")
+        ctx.stage("printing")
+        try:
+            document, outcome = fit_outcome(head["draft"], inputs["requirements"]["decided"],
+                                            lambda draft: rendered_pages(draft, printer))
+        except CVError as exc:
+            raise TaskFailed(str(exc), "pdf_failed") from exc
+        ctx.user.publish_fit(task_id=ctx.task_id, token=ctx.token, job_id=job_id, language=language,
+                             base_head=head["material_id"], document=document, outcome=outcome)
+
     return {
         "upload_cv": run_upload, "prepare_job": run_prepare_job, "job_from_url": run_job_from_url,
         "start_listing": run_start_listing, "prepare_cv": run_prepare_cv,
         "read_job_url": lambda ctx: run_job_from_url(ctx, review_only=True),
         "read_listing": lambda ctx: run_start_listing(ctx, review_only=True),
         "tailor_cv": lambda ctx: _redo_stage(ctx, "rewording"), "plan_cv": lambda ctx: _redo_stage(ctx, "layout"),
-        "check_gaps": run_check_gaps, "suggest_gap": run_suggest_gap, "export_pdf": run_export,
+        "check_gaps": run_check_gaps, "suggest_gap": run_suggest_gap, "export_pdf": run_export, "fit_cv": run_fit,
     }

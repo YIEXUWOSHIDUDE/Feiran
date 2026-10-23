@@ -919,6 +919,10 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
     def cv_plan(request: Request, job_id: str, language: str) -> JSONResponse:
         return redo(request, job_id, language, "plan_cv")
 
+    @app.post("/api/jobs/{job_id}/cv/{language}/fit")
+    def cv_fit(request: Request, job_id: str, language: str) -> JSONResponse:
+        return redo(request, job_id, language, "fit_cv")
+
     @app.post("/api/jobs/{job_id}/cv/{language}/change")
     def cv_change(request: Request, job_id: str, language: str, body: ChangeRequest) -> dict:
         user = workspace(request)
@@ -1134,6 +1138,9 @@ def _cv_view(snapshot: dict, language: str) -> dict:
         view["changes"] = [{**item, "undone": item["id"] in undone} for item in head["plan"]["changes"]]
     view["edits"] = edits_view(head)
     view["lines"] = lines_view(head)
+    fit = (status or {}).get("fit")
+    if fit and fit.get("material_id") == material["material_id"]:
+        view["fit"] = {key: value for key, value in fit.items() if key != "material_id"}
     if approval:
         view["approved_at"] = approval["approved_at"]
     return view
