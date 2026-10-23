@@ -2,8 +2,8 @@
 import tempfile
 import unittest
 from pathlib import Path
-from semantic_review import _pairs, _request, DIMENSIONS, observe_rewrites
-from cv import build_draft, tailor_draft
+from feiran.semantic_review import _pairs, _request, DIMENSIONS, observe_rewrites
+from feiran.cv import build_draft, tailor_draft
 from tests.test_cv import PROFILE, make_store, FakeChat
 
 

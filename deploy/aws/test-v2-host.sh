@@ -97,16 +97,32 @@ case "$1" in
         spool=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/backups$|\1|p')
         volume=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/volume$|\1|p')
         check=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/check$|\1|p')
-        # Per release (a or b, the digest's first letter): FAKE_FORMAT_b=2, FAKE_PROBLEMS_b='"x"'.
+        # Per release (a or b, the digest's first letter): FAKE_FORMAT_b=2, FAKE_PROBLEMS_b='"x"';
+        # FAKE_LAYOUT_a=root: a release from before the feiran package.
         release=$(printf '%s\n' "$@" | sed -n 's/.*@sha256:\(.\).*/\1/p' | head -1)
-        format=FAKE_FORMAT_$release problems=FAKE_PROBLEMS_$release
-        case " $* " in
+        format=FAKE_FORMAT_$release problems=FAKE_PROBLEMS_$release layout=FAKE_LAYOUT_$release
+        layout=${!layout:-package}
+        command=" $* "
+        # Each release runs only its own layout, as Python would.
+        case "$command" in
             *" --entrypoint python "*)
-                if [[ "$*" == *web_v2* ]] && [ "${FAKE_NO_V2:-0}" = 1 ]; then exit 1; fi
-                echo "${!format:-1}" ;;
-            *" backup.py verify --data /data "* | *" v2_backup.py verify --data /data "*)
+                code=${!#}
+                if [[ "$code" == *feiran/__init__.py* ]]; then echo "$layout"; exit 0; fi
+                if [ "$layout" = package ]; then expected='from feiran import '; else expected='import '; fi
+                [[ "$code" == "$expected"* ]] || { echo "ModuleNotFoundError in a $layout release: $code" >&2; exit 1; }
+                if [[ "$code" == *web_v2* ]] && [ "${FAKE_NO_V2:-0}" = 1 ]; then exit 1; fi
+                echo "${!format:-1}"; exit 0 ;;
+            *" python -m feiran."*)
+                [ "$layout" = package ] || { echo "No module named feiran in a $layout release" >&2; exit 1; }
+                command=${command/ python -m feiran./ python } ;;
+            *" python "*".py "*)
+                [ "$layout" = root ] || { echo "no such file in a $layout release" >&2; exit 1; }
+                command=${command/.py / } ;;
+        esac
+        case "$command" in
+            *" python backup verify --data /data "* | *" python v2_backup verify --data /data "*)
                 echo "verify by $release while $(cat "$UNIT_STATE")" >> "$CALLS"
-                if [[ "$*" == *"v2_backup.py verify"* ]]; then
+                if [[ "$command" == *" python v2_backup verify"* ]]; then
                     source_copy=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/data$|\1|p')
                     [ -n "$source_copy" ] && [ "$source_copy" != "$WORKBENCH_DATA_DIR" ] || exit 2
                     [ "$(stat -c %a "$source_copy")" = 700 ] || exit 2
@@ -123,15 +139,15 @@ case "$1" in
                 fi
                 printf '{"counts": {}, "problems": [%s], "notes": []}\n' "${!problems:-}"
                 [ -z "${!problems:-}" ] || exit 1 ;;
-            *" backup.py create "*)
+            *" python backup create "*)
                 [ "${FAKE_CREATE_FAILS:-0}" = 0 ] || exit 1
                 touch "$spool/$(basename "${!#}")"
                 [ "${FAKE_DATA_PROBLEMS:-0}" = 0 ] || exit 1 ;;
-            *" backup.py restore "*)
+            *" python backup restore "*)
                 into=${!#}
                 case "$into" in /check/*) into=$check/${into#/check/} ;; *) into=$volume/${into#/volume/} ;; esac
                 mkdir -p "$into" && echo restored > "$into/facts" ;;
-            *" backup.py verify "*) [ "${FAKE_VERIFY_FAILS:-0}" = 0 ] || exit 1 ;;
+            *" python backup verify "*) [ "${FAKE_VERIFY_FAILS:-0}" = 0 ] || exit 1 ;;
         esac ;;
     image)
         if [ "$2" = ls ] && [ -n "${FAKE_IMAGES:-}" ]; then
@@ -226,7 +242,7 @@ export FAKE_FORMAT_a=2 FAKE_FORMAT_b=2
 v2_env
 "$host/install.sh" "$image" > /dev/null
 called 'web_v2.V2_DATA_FORMAT' || fail 'installer checked V1 format'
-called 'python v2_backup.py verify' && fail 'fresh V2 volume was treated as corrupt'
+called 'python -m feiran.v2_backup verify' && fail 'fresh V2 volume was treated as corrupt'
 called 'http://127.0.0.1:8765/api/me' || fail 'install did not check API auth'
 [ "$(running)" = "$image" ] || fail 'fresh V2 was not installed'
 [ "$(unit_state)" = active ] || fail 'fresh V2 not running'
@@ -235,13 +251,13 @@ printf 'synthetic journal' > "$work/volume/data/v2.db-wal"
 printf 'stale wal index' > "$work/volume/data/v2.db-shm"
 : > "$calls"
 "$host/install.sh" "$image" > /dev/null
-called 'python v2_backup.py verify --data /data' || fail 'existing V2 data not verified with V2 tool'
-called 'python backup.py verify' && fail 'V2 data checked by V1 tool'
+called 'python -m feiran.v2_backup verify --data /data' || fail 'existing V2 data not verified with V2 tool'
+called 'feiran.backup verify' && fail 'V2 data checked by V1 tool'
 called 'V2 verify uses a private writable copy' || fail 'verification did not use a private writable copy'
 [ -z "$(find "$work/state" -name 'install-check-*')" ] || fail 'successful install left a data copy'
 : > "$calls"
 if FAKE_FREE_KB=1 "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail 'verified with no staging space'; fi
-called 'python v2_backup.py verify' && fail 'verified before checking staging space'
+called 'python -m feiran.v2_backup verify' && fail 'verified before checking staging space'
 [ "$(unit_state)" = active ] || fail 'low space left the old service stopped'
 [ "$(running)" = "$image" ] || fail 'low space switched the release'
 [ -z "$(find "$work/state" -name 'install-check-*')" ] || fail 'low space left a data copy'
@@ -262,7 +278,7 @@ mv "$work/volume/data/v2.db-wal" "$work/wal"
 ln -s "$work/wal" "$work/volume/data/v2.db-wal"
 : > "$calls"
 if "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail 'followed a journal symlink'; fi
-called 'python v2_backup.py verify' && fail 'verified an unsafe source'
+called 'python -m feiran.v2_backup verify' && fail 'verified an unsafe source'
 [ "$(unit_state)" = active ] || fail 'unsafe source left the old service stopped'
 rm "$work/volume/data/v2.db-wal"
 mv "$work/wal" "$work/volume/data/v2.db-wal"
@@ -299,4 +315,28 @@ fi
 [ "$(running)" = "$image" ] || fail 'missing database switched the release'
 [ -z "$(find "$work/state" -name 'install-check-*')" ] || fail 'missing database left a data copy'
 echo 'ok   V2 install: fresh/existing data paths, image capabilities, format rejection, health plus login/API gates'
+
+# Across the move into the feiran package: release a from before it, b with it. Each runs its own
+# layout, also when the install goes back to a.
+rm -rf "${work:?}/home" "${work:?}/state" "${work:?}/units" "${work:?}/volume/data"
+mkdir -p "$work/home" "$work/state" "$work/units" "$work/volume/data"
+v2_env
+FAKE_LAYOUT_a=root "$host/install.sh" "$image" > /dev/null || fail 'a V2 release from before the package was not installed'
+called "$image -c import web_v2, identity, v2_backup; pass" || fail 'old release V2 support not checked its own way'
+touch "$work/state/last-backup" "$work/volume/data/v2.db" "$work/volume/data/deleted-accounts.jsonl"
+: > "$calls"
+if FAKE_LAYOUT_a=root FAKE_UNHEALTHY=b HEALTH_WAIT_ATTEMPTS=1 HEALTH_WAIT_SECONDS=0 \
+        "$host/install.sh" "$image_b" > "$work/out" 2>&1; then
+    fail 'a V2 release that did not answer was installed'
+fi
+called "$image_b -c from feiran import web_v2, identity, v2_backup; pass" || fail 'new release V2 support not checked with its package'
+called "$image python v2_backup.py verify --data /data" || fail 'last good (old) V2 release did not verify its own way'
+called "$image_b python -m feiran.v2_backup verify --data /data" || fail 'new V2 release did not verify with its package'
+called "$image -c import web_v2, identity; print(web_v2.V2_DATA_FORMAT)" || fail 'going back did not run the old release its own way'
+grep -q 'could not be installed either' "$work/out" && fail 'going back to the V2 release from before the package failed'
+[ "$(running)" = "$image" ] || fail 'the V2 release from before the package was not put back'
+[ "$(unit_state)" = active ] || fail 'the old V2 release put back is not running'
+FAKE_LAYOUT_a=root "$host/install.sh" "$image_b" > /dev/null || fail 'upgrading V2 from a release before the package failed'
+[ "$(running)" = "$image_b" ] || fail 'the V2 release with the package was not switched to'
+echo 'ok   V2 install: old and new layouts each run their own way, upgrading and going back'
 echo 'V2 host scripts: all checks passed'

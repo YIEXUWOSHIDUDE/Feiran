@@ -4,12 +4,12 @@ import tempfile
 from pathlib import Path
 from datetime import timedelta
 
-import tenant_store as ts
-import v2_backup
-from cv import build_draft_from_facts
+from feiran import tenant_store as ts
+from feiran import v2_backup
+from feiran.cv import build_draft_from_facts
 from tests.test_v2_store import StoreCase, run_task
 from tests.test_web_v2 import V2Case
-from web_v2 import MAX_BODY
+from feiran.web_v2 import MAX_BODY
 
 
 def restore_missing_ledger():

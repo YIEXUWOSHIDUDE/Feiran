@@ -2,7 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-from review import build_report
+from feiran.review import build_report
 
 
 SAMPLE = Path(__file__).resolve().parent.parent / "examples" / "synthetic_input.json"

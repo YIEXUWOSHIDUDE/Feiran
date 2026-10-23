@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
-from facts import FactStoreError, load_confirmed_fact_texts, load_search_terms, tag_pattern
+from feiran.facts import FactStoreError, load_confirmed_fact_texts, load_search_terms, tag_pattern
 
 
 API_ROOT = "https://boards-api.greenhouse.io/v1/boards"
@@ -707,7 +707,7 @@ def main(argv: list[str] | None = None) -> int:
                 "source": jd["source"] if jd["source"] is not None else "未知",
                 "line_count": len(jd["text"].splitlines()),
                 "source_status": selected["source_status"],
-                "next_step": "运行 requirement_flow.py propose 提取待确认的 JD 要求",
+                "next_step": "运行 python -m feiran.requirement_flow propose 提取待确认的 JD 要求",
             }
         else:
             result = fetch_selected(args.board, args.job_id, args.provider)
@@ -720,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
                     "fact_count": 0,
                     "fact_confirmation_status": "事实将在要求确认后的匹配阶段按需检索",
                     "selected_requirement_count": 0,
-                    "next_step": "运行 requirement_flow.py propose 提取待确认的 JD 要求",
+                    "next_step": "运行 python -m feiran.requirement_flow propose 提取待确认的 JD 要求",
                 }
     except (OSError, FactStoreError, SearchError, ValueError, json.JSONDecodeError) as exc:
         print(f"搜索失败：{exc}", file=sys.stderr)

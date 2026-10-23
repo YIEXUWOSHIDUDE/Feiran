@@ -13,7 +13,8 @@ See the [acceptance record](aws-acceptance.md).
 ## Deploy
 
 1. Deploy `deploy/aws/workbench.yaml` following the existing guide, install a tested release
-   containing `public_access.py`, and verify its local health check. Never upload `.local`,
+   containing the owner login (`feiran/public_access.py`; `public_access.py` in releases from
+   before the `feiran` package), and verify its local health check. Never upload `.local`,
    CVs or credentials into the image or repository.
 2. Read the EC2 instance's private DNS name and security group and its instance-profile role
    from the base stack. Query the region's managed prefix list named

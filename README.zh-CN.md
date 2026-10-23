@@ -121,7 +121,7 @@ Feiran 用于准备和审核材料，不会提交申请、跟踪投递或预测�
 4. 在同一个 PowerShell 窗口启动：
 
    ```powershell
-   .\.venv\Scripts\python.exe web.py
+   .\.venv\Scripts\python.exe -m feiran.web
    ```
 
    打开 <http://127.0.0.1:8765/>；停止服务按 `Ctrl+C`。以后启动时，进入 `Feiran` 目录，重新设置上述 `$env:DEEPSEEK_API_KEY_FILE` 和 `$env:CHROME_PATH`，再运行启动命令；无需重复安装或重新保存 key。
@@ -155,7 +155,7 @@ Feiran 用于准备和审核材料，不会提交申请、跟踪投递或预测�
 3. 在同一个终端启动工作台：
 
    ```sh
-   .venv/bin/python web.py
+   .venv/bin/python -m feiran.web
    ```
 
    浏览器打开 <http://127.0.0.1:8765/>，按上方流程上传简历并使用。数据默认保存在 `.local/`，停止服务按 `Ctrl+C`。若无法自动找到 Chrome / Chromium，可设置 `CHROME_PATH` 为浏览器可执行文件的完整路径。中文 PDF 导出需要系统安装支持中文的字体。
@@ -163,6 +163,8 @@ Feiran 用于准备和审核材料，不会提交申请、跟踪投递或预测�
 自行部署到 AWS 的说明见 [AWS 公网部署](docs/aws-public.md)。
 
 ## 开发
+
+应用代码和初始公司清单在 [`feiran/`](feiran/)；前端在 [`web/`](web/)；测试在 [`tests/`](tests/)；部署工具在 [`deploy/`](deploy/)；文档在 [`docs/`](docs/)；合成样例在 [`examples/`](examples/)。
 
 离线测试集中在 `tests/`。参见[本地运行、测试命令与开发记录](docs/development.md#本地开发入口)；部署文件位于 `deploy/`，部署说明位于 `docs/`。
 

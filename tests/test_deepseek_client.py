@@ -6,8 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from deepseek_client import API_URL, DeepSeekError, _post, chat_json, load_api_key
-import run_log
+from feiran.deepseek_client import API_URL, DeepSeekError, _post, chat_json, load_api_key
+from feiran import run_log
 
 
 MESSAGES = [
@@ -64,7 +64,7 @@ class DeepSeekClientTests(unittest.TestCase):
 
     def test_missing_key_fails_before_any_request(self):
         post = RecordingPost()
-        with patch.dict(os.environ, {}, clear=True), patch("deepseek_client.sys.platform", "linux"):
+        with patch.dict(os.environ, {}, clear=True), patch("feiran.deepseek_client.sys.platform", "linux"):
             with self.assertRaisesRegex(DeepSeekError, "DEEPSEEK_API_KEY") as raised:
                 chat_json(MESSAGES, post=post)
         self.assertEqual(post.calls, [])
@@ -79,7 +79,7 @@ class DeepSeekClientTests(unittest.TestCase):
                 load_api_key()
         self.assertEqual(raised.exception.reason, "key_rejected")
         self.assertNotIn("synthetic", str(raised.exception))
-        with patch("deepseek_client.urllib.request.urlopen", side_effect=ValueError("Invalid header value b'Bearer sk-x y'")):
+        with patch("feiran.deepseek_client.urllib.request.urlopen", side_effect=ValueError("Invalid header value b'Bearer sk-x y'")):
             with self.assertRaises(DeepSeekError) as header:
                 _post({"model": "deepseek-flash"}, "sk-x y")
         self.assertNotIn("sk-x", str(header.exception))
@@ -87,7 +87,7 @@ class DeepSeekClientTests(unittest.TestCase):
     def test_a_key_file_works_where_there_is_no_keychain(self):
         # On a server the key is handed over as a file, so it never sits in the environment.
         # As on a server, there is no Keychain: a test must never read the developer's real key.
-        with tempfile.TemporaryDirectory() as directory, patch("deepseek_client.sys.platform", "linux"):
+        with tempfile.TemporaryDirectory() as directory, patch("feiran.deepseek_client.sys.platform", "linux"):
             key = Path(directory) / "deepseek"
             key.write_text("sk-synthetic-file\n", encoding="utf-8")
             with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "", "DEEPSEEK_API_KEY_FILE": str(key)}):
@@ -102,7 +102,7 @@ class DeepSeekClientTests(unittest.TestCase):
         with self.assertRaises(DeepSeekError) as unusable:
             chat_json(MESSAGES, api_key="k", post=RecordingPost(reply("not json")))
         self.assertEqual(unusable.exception.reason, "bad_response")
-        with patch("deepseek_client.time.sleep"), patch("deepseek_client.urllib.request.urlopen") as urlopen:
+        with patch("feiran.deepseek_client.time.sleep"), patch("feiran.deepseek_client.urllib.request.urlopen") as urlopen:
             urlopen.side_effect = [URLError("offline")] * 3
             with self.assertRaises(DeepSeekError) as offline:
                 _post({"model": "deepseek-flash"}, "k")
@@ -111,8 +111,8 @@ class DeepSeekClientTests(unittest.TestCase):
                 _post({"model": "deepseek-flash"}, "k")
         self.assertEqual((offline.exception.reason, busy.exception.reason), ("unreachable", "rate_limited"))
 
-    @patch("deepseek_client.time.sleep")
-    @patch("deepseek_client.urllib.request.urlopen")
+    @patch("feiran.deepseek_client.time.sleep")
+    @patch("feiran.deepseek_client.urllib.request.urlopen")
     def test_http_errors_are_retried_and_never_show_the_key(self, urlopen, _sleep):
         overloaded = HTTPError(API_URL, 429, "busy", None, None)
         unauthorized = HTTPError(API_URL, 401, "no", None, None)
@@ -124,8 +124,8 @@ class DeepSeekClientTests(unittest.TestCase):
         self.assertNotIn("sk-secret-test-key", str(raised.exception))
         self.assertEqual(urlopen.call_count, 2)
 
-    @patch("deepseek_client.time.sleep")
-    @patch("deepseek_client.urllib.request.urlopen")
+    @patch("feiran.deepseek_client.time.sleep")
+    @patch("feiran.deepseek_client.urllib.request.urlopen")
     def test_each_retry_is_logged_with_its_reason_never_the_key_or_the_request(self, urlopen, _sleep):
         urlopen.side_effect = [HTTPError(API_URL, 429, "busy", None, None), URLError("offline"), URLError("offline")]
         request = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "Alex Example"}]}

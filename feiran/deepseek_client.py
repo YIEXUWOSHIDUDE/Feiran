@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-import run_log
+from feiran import run_log
 
 
 API_URL = "https://api.deepseek.com/chat/completions"

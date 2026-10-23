@@ -6,8 +6,8 @@ import unittest
 from email.message import Message
 from unittest.mock import Mock, patch
 
-from job_search import SearchError, parse_posting_link
-from job_url import (_connect, _public_ip, extract_job, fetch_html, fetch_job_url,
+from feiran.job_search import SearchError, parse_posting_link
+from feiran.job_url import (_connect, _public_ip, extract_job, fetch_html, fetch_job_url,
                      normalize_url, MAX_PAGE_BYTES)
 
 URL = "https://careers.example.org/jobs/backend?id=42"
@@ -77,7 +77,7 @@ class ExtractionTests(unittest.TestCase):
         html = '<h1>后端开发</h1><div><h2>岗位职责</h2><p>' + '负责开发和维护后端服务，与团队一起完成需求分析和接口测试。' * 4 + '</p><h2>岗位要求</h2>熟悉 <b>Python</b> 和数据库。</div>'
         self.assertIn("熟悉 Python 和数据库。", extract_job(html, URL)["jd"]["text"])
 
-    @patch("job_url.fetch_html", return_value=(HTML, URL))
+    @patch("feiran.job_url.fetch_html", return_value=(HTML, URL))
     def test_final_source_and_original_url_both_retained(self, read):
         result = fetch_job_url("https://example.org/redirect#fragment")
         self.assertEqual(result["jd"]["source"], URL)
@@ -102,7 +102,7 @@ class PublicURLTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(SearchError):
                 normalize_url(url)
 
-    @patch("job_url.socket.getaddrinfo")
+    @patch("feiran.job_url.socket.getaddrinfo")
     def test_dns_private_or_mixed_answers_rejected(self, resolve):
         public = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
         private = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))
@@ -113,8 +113,8 @@ class PublicURLTests(unittest.TestCase):
         resolve.return_value = [public]
         self.assertEqual(_public_ip("careers.example.org", 443), "93.184.216.34")
 
-    @patch("job_url.ssl.create_default_context")
-    @patch("job_url.socket.create_connection")
+    @patch("feiran.job_url.ssl.create_default_context")
+    @patch("feiran.job_url.socket.create_connection")
     def test_connection_pins_ip_and_checks_tls_original_hostname(self, connect, context):
         connection = _connect("careers.example.org", 443, "93.184.216.34", True)
         self.assertEqual(connect.call_args.args[0], ("93.184.216.34", 443))
@@ -124,8 +124,8 @@ class PublicURLTests(unittest.TestCase):
 
 class FetchTests(unittest.TestCase):
     def setUp(self):
-        self.ip = patch("job_url._public_ip", return_value="93.184.216.34").start()
-        self.connect = patch("job_url._connect").start()
+        self.ip = patch("feiran.job_url._public_ip", return_value="93.184.216.34").start()
+        self.connect = patch("feiran.job_url._connect").start()
         self.addCleanup(patch.stopall)
 
     def test_html_and_no_credentials_headers(self):

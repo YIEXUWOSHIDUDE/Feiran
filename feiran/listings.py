@@ -15,9 +15,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-from facts import load_search_terms, tag_finder
-from job_search import SearchError, check_board, fetch_board
-from sponsorship import RULE_VERSION as SPONSOR_RULE_VERSION, STATUSES, assess_sponsorship, shown
+from feiran.facts import load_search_terms, tag_finder
+from feiran.job_search import SearchError, check_board, fetch_board
+from feiran.sponsorship import RULE_VERSION as SPONSOR_RULE_VERSION, STATUSES, assess_sponsorship, shown
 
 
 DEFAULT_DATABASE = Path(".local/listings.db")

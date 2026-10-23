@@ -1,6 +1,6 @@
 import unittest
 
-from cv_layout import describe_changes, effective_layout, guarded_layout, shown_sections
+from feiran.cv_layout import describe_changes, effective_layout, guarded_layout, shown_sections
 
 
 def line(fact_id):

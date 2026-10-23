@@ -890,7 +890,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"{fact['id']}@{fact['version']}"
                 for fact, _ in imported if fact["status"] == "pending"
             ))
-            command = ["python3", "facts.py", "confirm", *pending_refs]
+            command = ["python3", "-m", "feiran.facts", "confirm", *pending_refs]
             if args.db != DEFAULT_DATABASE:
                 command += ["--db", str(args.db)]
             result = {

@@ -11,17 +11,17 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import tenant_store
-from identity import Identity, OIDCSettings
-from tenant_store import UserWorkspace, set_setting, set_user_active
+from feiran import tenant_store
+from feiran.identity import Identity, OIDCSettings
+from feiran.tenant_store import UserWorkspace, set_setting, set_user_active
 from tests.fake_identity import CLIENT_ID, DOMAIN, ISSUER, ORIGIN, FakeCognito
 from tests.test_cv import FakePrinter
 from tests.test_cv_import import ANSWER, LINES, minimal_pdf
 from tests.test_listings import MONGODB_DUBLIN, MONGODB_GERMANY, FakeBoards, posting
 from tests.test_web import FakeDeepSeek
-from v2_flow import make_handlers
-from cv_import import MAX_PDF_BYTES
-from web_v2 import MAX_BODY, BodyLimit, RequestTooLarge, V2Settings, create_v2_app
+from feiran.v2_flow import make_handlers
+from feiran.cv_import import MAX_PDF_BYTES
+from feiran.web_v2 import MAX_BODY, BodyLimit, RequestTooLarge, V2Settings, create_v2_app
 
 HOST = "feiran.example"
 JD_TEXT = (Path(__file__).resolve().parent.parent / "examples" / "synthetic_jd_zh.txt").read_text(encoding="utf-8")
@@ -76,7 +76,7 @@ class V2Case(unittest.TestCase):
             "captured_at": "2026-09-30T00:00:00+00:00"}, "source_status": "test"}
 
     def read_page(self, url):
-        from job_search import SearchError
+        from feiran.job_search import SearchError
         raise SearchError("测试：网页没有职位正文")
 
     def browser(self, subject="alice"):
@@ -791,7 +791,7 @@ class MoreRouteTests(V2Case):
     def test_after_one_adoption_another_suggestion_is_asked_for_and_adopted_without_a_check(self):
         # Dogfood round 3: adopting one line made the check out of date, and the next requirement
         # could get no suggestion until the user paid for a new check.
-        from gaps import EVIDENCE_RULES
+        from feiran.gaps import EVIDENCE_RULES
         client, headers = self.ready_user()
         job_id = self.new_job(client, headers)
         self.settle(client, headers, client.post(f"/api/jobs/{job_id}/gaps", headers=headers, json=EN))
@@ -982,7 +982,7 @@ class StartupTests(unittest.TestCase):
     def refused(self, environ):
         import io
         from contextlib import redirect_stderr
-        from web_v2 import main
+        from feiran.web_v2 import main
         errors = io.StringIO()
         with redirect_stderr(errors), patch("uvicorn.run") as started:
             code = main(["--data", str(self.data)], environ)
@@ -996,13 +996,13 @@ class StartupTests(unittest.TestCase):
         (self.data / "workbench.db").write_bytes(b"")
         code, said = self.refused(self.environ)
         self.assertEqual(code, 2)
-        self.assertIn("v2_migrate.py", said)
+        self.assertIn("python -m feiran.v2_migrate", said)
         self.assertFalse((self.data / "v2.db").exists())
 
     def test_a_folder_claimed_by_v2_is_refused_by_the_single_user_app(self):
-        from web import create_app
-        from web_v2 import claim_v2_format
-        from workspace import DataFormatError
+        from feiran.web import create_app
+        from feiran.web_v2 import claim_v2_format
+        from feiran.workspace import DataFormatError
         claim_v2_format(self.data)
         with self.assertRaises(DataFormatError):
             create_app(facts_db=self.data / "workbench.db", jobs_root=self.data / "jobs", token="t",

@@ -24,7 +24,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tenant_store
+from feiran import tenant_store
 
 name, *args = sys.argv[1:]
 work = Path(os.environ['TEST_WORK'])
@@ -80,8 +80,8 @@ elif name == 'docker':
             source, target, *mode = args[index + 1].split(':')
             mounts[target] = (source, mode)
     position = args.index('python')
-    script, operation, *values = args[position + 1:]
-    assert script == 'v2_backup.py', script
+    module_flag, script, operation, *values = args[position + 1:]
+    assert [module_flag, script] == ['-m', 'feiran.v2_backup'], (module_flag, script)
     if operation == 'create':
         assert state.read_text().strip() == 'inactive', 'copied the source before the service stopped'
         assert mounts['/live'][1] == ['ro'], 'live data must stay read-only'
@@ -102,7 +102,7 @@ elif name == 'docker':
             if value == target or value.startswith(target + '/'):
                 return source + value[len(target):]
         return value
-    sys.exit(subprocess.run([sys.executable, str(repo / script), operation,
+    sys.exit(subprocess.run([sys.executable, '-m', script, operation,
                              *[host_path(value) for value in values]], cwd=repo).returncode)
 elif name == 'mount-data':
     sys.exit(1 if flag('FAKE_UNMOUNTED') else 0)
@@ -139,8 +139,8 @@ cat > "$work/fixture.py" <<'PY'
 import os
 from pathlib import Path
 import shutil
-import tenant_store
-import v2_backup
+from feiran import tenant_store
+from feiran import v2_backup
 work = Path(os.environ['TEST_WORK'])
 for name in ('volume', 'state'):
     shutil.rmtree(work / name, ignore_errors=True)
@@ -172,7 +172,7 @@ assert_original_data() {
     "$PYTHON" - <<'PY'
 import os
 from pathlib import Path
-import tenant_store
+from feiran import tenant_store
 with tenant_store.transaction(Path(os.environ['TEST_WORK']) / 'volume/data/v2.db') as connection:
     rows = connection.execute('SELECT subject FROM users WHERE deleted_at IS NULL ORDER BY subject').fetchall()
     assert [row[0] for row in rows] == ['A', 'current-only'], rows
@@ -184,9 +184,9 @@ assert_clean() {
 
 reset_case
 "$host/backup.sh" > /dev/null
-called 'python v2_backup.py create' || fail "V2 data used the V1 backup tool"
-called 'python v2_backup.py restore' || fail "V2 archive was not restored for verification"
-called 'python v2_backup.py verify' || fail "V2 restored data was not verified"
+called 'python -m feiran.v2_backup create' || fail "V2 data used the V1 backup tool"
+called 'python -m feiran.v2_backup restore' || fail "V2 archive was not restored for verification"
+called 'python -m feiran.v2_backup verify' || fail "V2 restored data was not verified"
 called '--ledger /data/deleted-accounts.jsonl' || fail "backup check ignored the live deletion ledger"
 [ -e "$work/state/last-backup" ] || fail "successful backup was not recorded"
 [ -f "$work/uploaded.tar.gz" ] || fail "verified archive was not uploaded"
@@ -199,8 +199,8 @@ FAKE_DELETE_ON_STOP=1 "$host/restore.sh" latest > /dev/null
 "$PYTHON" - <<'PY'
 import os
 from pathlib import Path
-import tenant_store
-import v2_backup
+from feiran import tenant_store
+from feiran import v2_backup
 work = Path(os.environ['TEST_WORK'])
 data = work / 'volume/data'
 with tenant_store.transaction(data / 'v2.db') as connection:
@@ -212,8 +212,8 @@ assert (data / '.workbench-format').read_text().strip() == '2'
 kept = list((work / 'volume').glob('data.before-*'))
 assert len(kept) == 1 and (kept[0] / 'v2.db').is_file()
 calls = (work / 'calls').read_text()
-assert calls.index('systemctl stop ') < calls.index('python v2_backup.py restore ')
-assert calls.index('python v2_backup.py verify ') < calls.index('systemctl start ')
+assert calls.index('systemctl stop ') < calls.index('python -m feiran.v2_backup restore ')
+assert calls.index('python -m feiran.v2_backup verify ') < calls.index('systemctl start ')
 assert calls.count('systemctl stop ') == 1
 PY
 [ "$(cat "$work/unit-state")" = active ] || fail "restore left the service stopped"
@@ -233,7 +233,7 @@ for failure in missing_ledger malformed_ledger FAKE_RESTORE_FAILS FAKE_VERIFY_FA
     if env "$failure=1" "$host/restore.sh" latest > /dev/null 2>&1; then fail "$failure: restore claimed success"; fi
     assert_original_data
     if [ "$failure" = FAKE_STOP_DEACTIVATING ]; then
-        called 'python v2_backup.py restore' && fail "restore read its ledger while shutdown was in progress"
+        called 'python -m feiran.v2_backup restore' && fail "restore read its ledger while shutdown was in progress"
     fi
     [ "$(cat "$work/unit-state")" = active ] || fail "$failure: original service not restarted"
     assert_clean
@@ -276,8 +276,8 @@ for ledger in present missing; do
         "$PYTHON" - <<'PYTEST'
 import os
 from pathlib import Path
-import tenant_store
-import v2_backup
+from feiran import tenant_store
+from feiran import v2_backup
 data = Path(os.environ['TEST_WORK']) / 'volume/data'
 with tenant_store.transaction(data / 'v2.db') as connection:
     assert connection.execute("SELECT deleted_at FROM users WHERE subject = 'B'").fetchone()[0]
@@ -289,7 +289,7 @@ PYTEST
         if "$host/restore.sh" latest > /dev/null 2>&1; then fail "an empty volume restored without a current ledger"; fi
         [ ! -e "$work/volume/data/v2.db" ] || fail "a refused restore populated the empty volume"
     fi
-    called 'python v2_backup.py restore' || fail "an empty V2 volume selected the V1 restore tool"
+    called 'python -m feiran.v2_backup restore' || fail "an empty V2 volume selected the V1 restore tool"
     called 'systemctl start' && fail "a new volume unexpectedly started the service"
     assert_clean
 done
@@ -297,7 +297,7 @@ reset_case
 rm "$work/volume/data/.workbench-format"
 printf 'WORKBENCH_MODE=v2\n' >> "$WORKBENCH_ENV"
 "$host/backup.sh" > /dev/null
-called 'python v2_backup.py create' || fail "explicit V2 mode did not select its backup tool without a marker"
+called 'python -m feiran.v2_backup create' || fail "explicit V2 mode did not select its backup tool without a marker"
 for mismatch in 'v1 2' 'v2 1' 'unknown 2'; do
     reset_case
     mode=${mismatch% *}

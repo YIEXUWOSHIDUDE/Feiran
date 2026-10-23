@@ -8,10 +8,10 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from deepseek_client import DEFAULT_MODEL as DEEPSEEK_MODEL, DeepSeekError
-from facts import FactStoreError, find_confirmed_facts, list_facts, load_confirmed_fact
-from privacy import mask, stand_ins
-from review import build_report
+from feiran.deepseek_client import DEFAULT_MODEL as DEEPSEEK_MODEL, DeepSeekError
+from feiran.facts import FactStoreError, find_confirmed_facts, list_facts, load_confirmed_fact
+from feiran.privacy import mask, stand_ins
+from feiran.review import build_report
 
 
 MATCHING_METHOD = "versioned-tags-and-type-v1"
@@ -377,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
                 "saved_to": str(args.output),
                 "decision_counts": result["fact_matching"]["decision_counts"],
                 "selected_fact_count": len(result["facts"]),
-                "next_step": "运行 review.py 检查双侧原文和未知项",
+                "next_step": "运行 python -m feiran.review 检查双侧原文和未知项",
             }
         _write_new_json(args.output, result)
     except (OSError, json.JSONDecodeError, FactStoreError, MatchingError, ValueError) as exc:

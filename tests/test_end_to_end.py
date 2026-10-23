@@ -7,11 +7,11 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-import facts
-import job_search
-import matching
-import requirement_flow
-import review
+from feiran import facts
+from feiran import job_search
+from feiran import matching
+from feiran import requirement_flow
+from feiran import review
 
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"

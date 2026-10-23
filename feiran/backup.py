@@ -1,8 +1,8 @@
 """Backups of the workbench's data folder, and checks that a folder is one the workbench can use.
 
-    python backup.py create --data /data --out /backups/workbench.tar.gz   # with the app stopped
-    python backup.py restore --archive /backups/workbench.tar.gz --into /restored/data
-    python backup.py verify --data /restored/data
+    python -m feiran.backup create --data /data --out /backups/workbench.tar.gz   # with the app stopped
+    python -m feiran.backup restore --archive /backups/workbench.tar.gz --into /restored/data
+    python -m feiran.backup verify --data /restored/data
 
 A backup is one .tar.gz: every file of the data folder under data/, and manifest.json with each
 file's size and SHA-256, the application's revision and a few counts. The fact and listings
@@ -32,9 +32,9 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from cv import CVError, is_final_approval, verify_draft
-from facts import FactStoreError, list_facts
-from workspace import DATA_FORMAT, DATA_FORMAT_FILE, JOB_ID, JOURNAL, STEP_FILES, TEMPORARY, write_atomically
+from feiran.cv import CVError, is_final_approval, verify_draft
+from feiran.facts import FactStoreError, list_facts
+from feiran.workspace import DATA_FORMAT, DATA_FORMAT_FILE, JOB_ID, JOURNAL, STEP_FILES, TEMPORARY, write_atomically
 
 
 FORMAT = "workbench-backup-1"

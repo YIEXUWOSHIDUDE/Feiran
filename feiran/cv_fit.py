@@ -17,9 +17,9 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from cv import CVError
-from cv_edit import _in_effect
-from cv_layout import EMPTY_OK, describe_changes, effective_layout, guarded_layout, original_layout, shown_sections
+from feiran.cv import CVError
+from feiran.cv_edit import _in_effect
+from feiran.cv_layout import EMPTY_OK, describe_changes, effective_layout, guarded_layout, original_layout, shown_sections
 
 FIT_VERSION = 1
 MAX_PAGES = 1

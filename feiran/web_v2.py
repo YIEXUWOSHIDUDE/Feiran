@@ -33,27 +33,27 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
-import run_log
-import tenant_store
-from cv import CVError, rejected_lines, render_html, rewritten_lines
-from cv_edit import edits_view, lines_view, shown_places, with_adoptions
-from cv_import import MAX_PDF_BYTES, CVImportError, read_pdf_limited
-from cv_status import CANDIDATE_FIELDS, describe_fallbacks, explained
-from facts import FactStoreError, parse_fact_refs, tag_finder
-from gaps import coverage, suggestion_target
-from identity import Identity, IdentityError, OIDCSettings
-from job_search import SearchError, check_board, fetch_board, parse_board_link, parse_posting_link, prepare_pasted_jd
-from job_url import normalize_url
-from job_review import build_job_review
-from listings import STALE_AFTER, ListingsError, group_postings, load_starter
-from requirement_flow import RequirementError, add_manual_requirements, apply_requirement_decisions
-from task_runner import TaskRunner
-from tenant_store import Conflict, NotFound, Refused, StoreError, UserWorkspace
-from v2_flow import CONSENT, HEAVY, UNITS, auto_decide, cv_language, make_handlers
-from workspace import DataFormatError, recorded_data_format, write_atomically
+from feiran import run_log
+from feiran import tenant_store
+from feiran.cv import CVError, rejected_lines, render_html, rewritten_lines
+from feiran.cv_edit import edits_view, lines_view, shown_places, with_adoptions
+from feiran.cv_import import MAX_PDF_BYTES, CVImportError, read_pdf_limited
+from feiran.cv_status import CANDIDATE_FIELDS, describe_fallbacks, explained
+from feiran.facts import FactStoreError, parse_fact_refs, tag_finder
+from feiran.gaps import coverage, suggestion_target
+from feiran.identity import Identity, IdentityError, OIDCSettings
+from feiran.job_search import SearchError, check_board, fetch_board, parse_board_link, parse_posting_link, prepare_pasted_jd
+from feiran.job_url import normalize_url
+from feiran.job_review import build_job_review
+from feiran.listings import STALE_AFTER, ListingsError, group_postings, load_starter
+from feiran.requirement_flow import RequirementError, add_manual_requirements, apply_requirement_decisions
+from feiran.task_runner import TaskRunner
+from feiran.tenant_store import Conflict, NotFound, Refused, StoreError, UserWorkspace
+from feiran.v2_flow import CONSENT, HEAVY, UNITS, auto_decide, cv_language, make_handlers
+from feiran.workspace import DataFormatError, recorded_data_format, write_atomically
 
 
-WEB_DIR = Path(__file__).parent / "web"
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 SESSION_COOKIE = "__Host-feiran"
 LOGIN_COOKIE = "__Host-feiran-login"
 LOCAL_SESSION_COOKIE = "feiran-session"  # http://localhost testing only: browsers refuse __Host- without https
@@ -1166,7 +1166,7 @@ def _gaps_view(snapshot: dict, record: dict, language: str) -> dict:
 
 def main(argv: list[str] | None = None, environ: Mapping[str, str] = os.environ) -> int:
     """Start V2. It refuses to start without Cognito settings, on a folder that is not the data
-    volume, or on a single-user data folder that has not been migrated (v2_migrate.py)."""
+    volume, or on a single-user data folder that has not been migrated (feiran.v2_migrate)."""
     parser = argparse.ArgumentParser(description="Feiran V2: signed-in users, one server")
     parser.add_argument("--host", default=environ.get("WORKBENCH_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(environ.get("WORKBENCH_PORT", "8765")))
@@ -1197,7 +1197,7 @@ def main(argv: list[str] | None = None, environ: Mapping[str, str] = os.environ)
         return refuse("数据目录中没有 .workbench-data：数据卷可能没有挂载")
     database = data / V2_DATABASE
     if not database.exists() and ((data / "workbench.db").exists() or (data / "jobs").exists()):
-        return refuse("这个数据目录还是单用户格式；先用 v2_migrate.py 迁移，再启动 V2")
+        return refuse("这个数据目录还是单用户格式；先用 python -m feiran.v2_migrate 迁移，再启动 V2")
     try:
         data.mkdir(parents=True, exist_ok=True)
         claim_v2_format(data)

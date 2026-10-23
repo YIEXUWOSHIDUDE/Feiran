@@ -14,18 +14,18 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from cv import CVError, build_draft, export_pdf, print_with_chrome, rendered_pages, tailor_draft
-from cv_fit import fit_outcome
-from cv_preparation import prepare_steps
-from cv_edit import carry_over, without_edits
-from cv_import import CVImportError, structure_cv
-from cv_plan import plan_draft
-from cv_status import STAGE_FAILED, STAGES, adjusted, job_language, reason, reworded, stage_entry, stage_failure
-from deepseek_client import CallRefused
-from gaps import find_gaps, suggest_gap
-from job_search import SearchError, fetch_selected, prepare_review_input
-from job_url import fetch_job_url
-from requirement_flow import RequirementError, apply_requirement_decisions, propose_requirements
+from feiran.cv import CVError, build_draft, export_pdf, print_with_chrome, rendered_pages, tailor_draft
+from feiran.cv_fit import fit_outcome
+from feiran.cv_preparation import prepare_steps
+from feiran.cv_edit import carry_over, without_edits
+from feiran.cv_import import CVImportError, structure_cv
+from feiran.cv_plan import plan_draft
+from feiran.cv_status import STAGE_FAILED, STAGES, adjusted, job_language, reason, reworded, stage_entry, stage_failure
+from feiran.deepseek_client import CallRefused
+from feiran.gaps import find_gaps, suggest_gap
+from feiran.job_search import SearchError, fetch_selected, prepare_review_input
+from feiran.job_url import fetch_job_url
+from feiran.requirement_flow import RequirementError, apply_requirement_decisions, propose_requirements
 
 
 # The legacy quota units each operation reserves when it is submitted (quota_mode legacy; a PDF

@@ -1,7 +1,7 @@
 """Move one single-user workspace (V1) into the multi-user V2 database, for one named owner.
 
-    python v2_migrate.py run --v1-data DIR --v2-db DIR/v2.db --owner-issuer ISSUER --owner-subject SUB [--dry-run]
-    python v2_migrate.py rollback --data DIR --backup-out ARCHIVE
+    python -m feiran.v2_migrate run --v1-data DIR --v2-db DIR/v2.db --owner-issuer ISSUER --owner-subject SUB [--dry-run]
+    python -m feiran.v2_migrate rollback --data DIR --backup-out ARCHIVE
 
 This is an offline tool, never a route of the app: stop the workbench first. The owner is named
 explicitly by the Cognito identity (issuer and subject) that will sign in to V2; the data is
@@ -30,13 +30,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import tenant_store
-from cv import (CVError, LANGUAGES, _count_pages, _profile_hash, content_fingerprint, is_final_approval,
+from feiran import tenant_store
+from feiran.cv import (CVError, LANGUAGES, _count_pages, _profile_hash, content_fingerprint, is_final_approval,
                 profile_fact_ids, profile_languages, verify_draft)
-from facts import FactStoreError, normalize_fact_import
-from review import build_report
-from tenant_store import FactSnapshot, StoreError, UserWorkspace
-from workspace import DATA_FORMAT_FILE, JOB_ID, JOURNAL, UNREADABLE_JOURNAL, recorded_data_format
+from feiran.facts import FactStoreError, normalize_fact_import
+from feiran.review import build_report
+from feiran.tenant_store import FactSnapshot, StoreError, UserWorkspace
+from feiran.workspace import DATA_FORMAT_FILE, JOB_ID, JOURNAL, UNREADABLE_JOURNAL, recorded_data_format
 
 PROFILE = "cv-profile"
 HISTORY_NAME = re.compile(r"(cv-profile(?:\.(?:en|zh))?)-(\d{8}T\d{12})\.json")
@@ -425,7 +425,7 @@ def rollback(data: Path, backup_out: Path) -> dict[str, Any]:
     """Go back to the single-user app on ``data``: first a verified backup of the V2 database
     (so whatever V2 made since is kept), then the V2 database is set aside under a new name and
     the folder's format is set back to 1. Only with the V2 app stopped."""
-    import v2_backup
+    from feiran import v2_backup
     data = Path(data)
     database = data / "v2.db"
     if not database.exists():
@@ -440,7 +440,7 @@ def rollback(data: Path, backup_out: Path) -> dict[str, Any]:
         side_file = data / f"v2.db{side}"
         if side_file.exists():
             side_file.rename(data / f"v2.db.set-aside-{stamp}{side}")
-    from workspace import write_atomically
+    from feiran.workspace import write_atomically
     write_atomically(data / DATA_FORMAT_FILE, b"1\n")
     return {"backup": str(backup_out), "counts": made["counts"], "set_aside": f"v2.db.set-aside-{stamp}"}
 
@@ -464,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
                 with tempfile.TemporaryDirectory(prefix="v2-migrate-dry-") as scratch:
                     target = Path(scratch) / "v2.db"
                     if args.v2_db.exists():
-                        import v2_backup
+                        from feiran import v2_backup
                         v2_backup.copy_database(args.v2_db, target)
                     result = migrate(args.v1_data, target, issuer=args.owner_issuer, subject=args.owner_subject)
                     result["dry_run"] = True

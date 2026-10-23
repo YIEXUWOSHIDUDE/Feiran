@@ -12,14 +12,14 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import tenant_store
-from facts import confirm_facts, import_facts, list_facts
+from feiran import tenant_store
+from feiran.facts import confirm_facts, import_facts, list_facts
 from tests.fit_fixture import ADDED_BULLET, PROFILE, REQUIREMENTS, TEXTS
 from tests.test_cv_fit import RowPrinter
 from tests.test_web import TOKEN, FakeDeepSeek
 from tests import test_sponsor_ui, test_web_v2
-import web as web_module
-from web import create_app
+from feiran import web as web_module
+from feiran.web import create_app
 
 TYPES = {"ms": "education", "be": "education", "x1": "experience", "x2": "experience", "p1": "project",
          "p2": "project", "sk": "skill"}

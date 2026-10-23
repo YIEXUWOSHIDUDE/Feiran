@@ -10,7 +10,7 @@ secret_arn=${2:?usage: enable-public.sh <origin-private-dns> <login-secret-arn>}
 env_file=${WORKBENCH_ENV:-/etc/workbench/env}
 # Never make an older app that ignores the login settings publicly reachable.
 docker run --rm --network none --entrypoint python \
-    "$(sed -n 's/^WORKBENCH_IMAGE=//p' /etc/workbench/release)" -c 'from public_access import OwnerAccess'
+    "$(sed -n 's/^WORKBENCH_IMAGE=//p' /etc/workbench/release)" -c 'from feiran.public_access import OwnerAccess'
 temporary=$(mktemp "${env_file}.XXXXXX")
 trap 'rm -f "$temporary"' EXIT
 sed '/^WORKBENCH_PUBLIC_HOST=/d; /^WORKBENCH_LOGIN_SECRET_ARN=/d; /^WORKBENCH_LOGIN_FILE=/d; /^WORKBENCH_BIND_ADDRESS=/d' \

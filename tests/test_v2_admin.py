@@ -8,9 +8,9 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
-import tenant_store
-import v2_admin
-from tenant_store import UserWorkspace
+from feiran import tenant_store
+from feiran import v2_admin
+from feiran.tenant_store import UserWorkspace
 
 ISSUER = "https://cognito-idp.example.test/pool"
 

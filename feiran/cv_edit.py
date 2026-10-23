@@ -19,10 +19,10 @@ import secrets
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator
 
-from cv import _valid_line
-from cv_layout import shown_sections
-from facts import tag_pattern
-from gaps import (BULLET_TYPES, MAX_ITEM_CHARACTERS, MAX_ITEMS, SKILL_SEPARATORS, _entry_key, _joined,
+from feiran.cv import _valid_line
+from feiran.cv_layout import shown_sections
+from feiran.facts import tag_pattern
+from feiran.gaps import (BULLET_TYPES, MAX_ITEM_CHARACTERS, MAX_ITEMS, SKILL_SEPARATORS, _entry_key, _joined,
                   _profile_entry_key, _skill_items, _suggestion_key, places)
 
 LOCAL_PREFIX = "fact-cv-"  # a valid fact ID, so the same block can later be saved as a fact

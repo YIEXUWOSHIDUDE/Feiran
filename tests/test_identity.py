@@ -12,8 +12,8 @@ from pathlib import Path
 import jwt
 from cryptography.hazmat.primitives import serialization
 
-from identity import Identity, IdentityError, OIDCSettings, pkce_pair, safe_return_to
-from tenant_store import initialize_store
+from feiran.identity import Identity, IdentityError, OIDCSettings, pkce_pair, safe_return_to
+from feiran.tenant_store import initialize_store
 from tests.fake_identity import CLIENT_ID, DOMAIN, ISSUER, ORIGIN, FakeCognito, _key
 
 

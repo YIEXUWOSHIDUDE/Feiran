@@ -53,8 +53,8 @@ if name == 'docker':
             if Path(source) == live:
                 assert mode == ['ro'], 'the live bind must be read-only'
     operation = None
-    if 'v2_backup.py' in args:
-        operation = args[args.index('v2_backup.py') + 1]
+    if 'feiran.v2_backup' in args:
+        operation = args[args.index('feiran.v2_backup') + 1]
         if operation in ('create', 'verify') and args[args.index('--data') + 1] == '/data':
             source, mode = mounts['/data']
             assert source != live and not mode, 'SQLite must use a writable disposable copy'
@@ -146,7 +146,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
-import tenant_store
+from feiran import tenant_store
 
 data = Path('/data')
 db = data / 'v2.db'
@@ -184,7 +184,7 @@ PY
         # Prove this real bind reproduces the old bug. Root on the host does not bypass :ro.
         if "$REAL_DOCKER" run --rm --network none --read-only --tmpfs /tmp \
             -v "$work/volume/data:/data:ro" -v "$work/probe:/backups" "$image" \
-            python v2_backup.py create --data /data --out /backups/old-path.tar.gz > "$work/old-path.log" 2>&1; then
+            python -m feiran.v2_backup create --data /data --out /backups/old-path.tar.gz > "$work/old-path.log" 2>&1; then
             echo 'FAIL: the old read-only WAL path unexpectedly succeeded' >&2; exit 1
         fi
         grep -qE 'sqlite3[.]OperationalError: (attempt to write a readonly database|unable to open database file)' \

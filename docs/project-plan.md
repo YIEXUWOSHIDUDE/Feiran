@@ -134,8 +134,8 @@ AI 可以扩写和补充候选人内容，不要求用户逐条确认事实后�
 | Web 服务 | Python、FastAPI、Uvicorn；本地 V1 与云端 V2 保留不同的存储和身份适配 |
 | 文本生成 | DeepSeek 承担解析、要求提取、改写、布局建议和对照建议等模型任务 |
 | 业务状态 | V2 使用 SQLite 和私有文件；资料、岗位、材料、任务与用户归属关联 |
-| 准备流程 | `cv_preparation.py` 共享改写、布局和局部内容恢复流程；当前未采用 LangGraph 编排 |
-| 编辑与一页整理 | `cv_edit.py` 处理局部操作；`cv_fit.py` 用确定规则选取省略内容，再调用打印检查 |
+| 准备流程 | `feiran/cv_preparation.py` 共享改写、布局和局部内容恢复流程；当前未采用 LangGraph 编排 |
+| 编辑与一页整理 | `feiran/cv_edit.py` 处理局部操作；`feiran/cv_fit.py` 用确定规则选取省略内容，再调用打印检查 |
 | PDF | 使用 Chrome 或 Chromium 将受控 HTML 模板打印为 PDF；上传解析使用 pypdf |
 | 云端 | AWS CloudFront 提供 HTTPS 入口，Cognito 处理登录；应用容器运行在 EC2，使用 EBS 数据卷和 S3 备份 |
 | 发布 | GitHub Actions 执行测试和构建，再通过既有发布流程安装到目标环境 |
@@ -161,7 +161,7 @@ mkdir -p .local
 ```sh
 chmod 600 .local/deepseek_api_key
 export DEEPSEEK_API_KEY_FILE="$PWD/.local/deepseek_api_key"
-.venv/bin/python web.py
+.venv/bin/python -m feiran.web
 ```
 
 打开 `http://127.0.0.1:8765/`。若浏览器无法自动找到，可设置 `CHROME_PATH` 为实际可执行文件路径。中文 PDF 需要支持中文的字体。Windows 命令见仓库 README，其本地端到端运行仍未完成验证。

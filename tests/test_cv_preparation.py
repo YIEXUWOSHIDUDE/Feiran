@@ -2,10 +2,10 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from cv import CVError, build_draft, tailor_draft
-from cv_edit import change_line, shown_text
-from cv_plan import plan_draft
-from cv_preparation import prepare_steps
+from feiran.cv import CVError, build_draft, tailor_draft
+from feiran.cv_edit import change_line, shown_text
+from feiran.cv_plan import plan_draft
+from feiran.cv_preparation import prepare_steps
 from tests.test_cv import PROFILE, FakeChat, make_store
 from tests.test_cv_plan import CUT_API, FakePlanner
 from tests.test_gaps import decided_job

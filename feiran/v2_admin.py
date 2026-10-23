@@ -1,17 +1,17 @@
 """Operator commands for V2's data folder, run beside the app (on the host, in the released image).
 
-    python v2_admin.py --data /data settings
-    python v2_admin.py --data /data set user_daily_units 40
-    python v2_admin.py --data /data quota tokens --user-daily 200000 --site-daily 2000000
-    python v2_admin.py --data /data quota legacy
-    python v2_admin.py --data /data test-unlimited enable USER_ID
-    python v2_admin.py --data /data test-unlimited disable USER_ID
-    python v2_admin.py --data /data accounts [--subject COGNITO_SUB]
-    python v2_admin.py --data /data disable USER_ID
-    python v2_admin.py --data /data enable USER_ID
-    python v2_admin.py --data /data delete USER_ID --confirm USER_ID
-    python v2_admin.py --data /data usage [--day 2026-10-01]
-    python v2_admin.py --data /data sponsorship [--limit 500] [--after NEXT]
+    python -m feiran.v2_admin --data /data settings
+    python -m feiran.v2_admin --data /data set user_daily_units 40
+    python -m feiran.v2_admin --data /data quota tokens --user-daily 200000 --site-daily 2000000
+    python -m feiran.v2_admin --data /data quota legacy
+    python -m feiran.v2_admin --data /data test-unlimited enable USER_ID
+    python -m feiran.v2_admin --data /data test-unlimited disable USER_ID
+    python -m feiran.v2_admin --data /data accounts [--subject COGNITO_SUB]
+    python -m feiran.v2_admin --data /data disable USER_ID
+    python -m feiran.v2_admin --data /data enable USER_ID
+    python -m feiran.v2_admin --data /data delete USER_ID --confirm USER_ID
+    python -m feiran.v2_admin --data /data usage [--day 2026-10-01]
+    python -m feiran.v2_admin --data /data sponsorship [--limit 500] [--after NEXT]
 
 Nothing here signs anyone in or creates an account: an account belongs to one Cognito identity
 (issuer and subject) and is made by its first verified sign-in, only while registration is open
@@ -44,8 +44,8 @@ import os
 import sys
 from pathlib import Path
 
-import tenant_store
-from tenant_store import DATABASE, NotFound, StoreError
+from feiran import tenant_store
+from feiran.tenant_store import DATABASE, NotFound, StoreError
 
 
 def main(argv: list[str] | None = None) -> int:

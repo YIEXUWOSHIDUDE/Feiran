@@ -4,7 +4,7 @@ import unittest
 import urllib.error
 from unittest.mock import MagicMock, Mock, patch
 
-from typesafe_classifier import (
+from feiran.typesafe_classifier import (
     CATEGORIES,
     STRENGTHS,
     TypeSafeError,
@@ -128,8 +128,8 @@ class TypeSafeClassifierTests(unittest.TestCase):
         )
         response = MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps(valid_response()).encode("utf-8")
-        with patch("typesafe_classifier.urllib.request.urlopen", side_effect=[overload, response]) as urlopen:
-            with patch("typesafe_classifier.time.sleep") as sleep:
+        with patch("feiran.typesafe_classifier.urllib.request.urlopen", side_effect=[overload, response]) as urlopen:
+            with patch("feiran.typesafe_classifier.time.sleep") as sleep:
                 parsed = _post_json({"state": "test", "model": "jev-latest", "questions": {}}, "test-key")
         self.assertEqual(parsed["model"], "jev-1.13.0")
         self.assertEqual(urlopen.call_count, 2)

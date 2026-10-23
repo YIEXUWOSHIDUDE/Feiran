@@ -8,9 +8,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from cv import CVError, build_draft, build_draft_from_facts, render_html
-from facts import FactStoreError, import_facts, initialize_database, confirm_facts, load_current_facts
-from tenant_store import (Conflict, NotFound, StoreError, UserWorkspace,
+from feiran.cv import CVError, build_draft, build_draft_from_facts, render_html
+from feiran.facts import FactStoreError, import_facts, initialize_database, confirm_facts, load_current_facts
+from feiran.tenant_store import (Conflict, NotFound, StoreError, UserWorkspace,
                           initialize_store, provision_user, set_user_active)
 from tests.test_cv import FACTS, PROFILE
 

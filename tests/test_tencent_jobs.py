@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from job_search import SearchError, fetch_board, fetch_selected, parse_board_link
-from listings import add_source, refresh_source, list_sources, ListingsError
+from feiran.job_search import SearchError, fetch_board, fetch_selected, parse_board_link
+from feiran.listings import add_source, refresh_source, list_sources, ListingsError
 
 
 def raw(job_id='123'):
@@ -19,7 +19,7 @@ def page(count, posts):
 
 
 class TencentTests(unittest.TestCase):
-    @patch('job_search._fetch_json')
+    @patch('feiran.job_search._fetch_json')
     def test_all_pages_and_update_date_is_not_publication_date(self, read):
         read.side_effect=[page(2,[raw()]),page(2,[raw('456')])]
         jobs=fetch_board('tencent','tencent')
@@ -30,7 +30,7 @@ class TencentTests(unittest.TestCase):
         self.assertIn('pageIndex=2',read.call_args.args[0])
         self.assertEqual(parse_board_link('https://careers.tencent.com/zh-cn/search.html'),('tencent','tencent'))
 
-    @patch('job_search._fetch_json')
+    @patch('feiran.job_search._fetch_json')
     def test_selected_post_requires_complete_detail_and_matching_id(self, read):
         read.return_value={'Code':200,'Data':{**raw(),'Requirement':'熟悉 Python，具备后端项目经验'}}
         selected=fetch_selected('tencent','123','tencent')
@@ -41,7 +41,7 @@ class TencentTests(unittest.TestCase):
             read.return_value={'Code':200,'Data':data}
             with self.assertRaises(SearchError):fetch_selected('tencent','123','tencent')
 
-    @patch('job_search._fetch_json')
+    @patch('feiran.job_search._fetch_json')
     def test_partial_duplicate_changed_or_invalid_response_preserves_cache(self, read):
         with tempfile.TemporaryDirectory() as folder:
             db=Path(folder)/'listings.db'

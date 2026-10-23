@@ -10,20 +10,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import tenant_store
-from cv import build_draft_from_facts, content_fingerprint, tailor_draft
-from cv_plan import plan_draft
-from tenant_store import (Conflict, FactSnapshot, LateResult, NotFound, Refused, StoreError, UserWorkspace,
+from feiran import tenant_store
+from feiran.cv import build_draft_from_facts, content_fingerprint, tailor_draft
+from feiran.cv_plan import plan_draft
+from feiran.tenant_store import (Conflict, FactSnapshot, LateResult, NotFound, Refused, StoreError, UserWorkspace,
                           apply_deletions, claim_tasks, create_session, delete_account, expire_tasks, finish_task,
                           initialize_store, mark_spending, provision_user, read_deletions, record_usage,
                           recover_tasks, resolve_session, revoke_session, save_login_attempt, set_setting,
                           set_user_active, sign_in, store_public_board, take_login_attempt)
 from tests.test_cv import FACTS, PROFILE, FakeChat
 from tests.test_cv_plan import CUT_API, FakePlanner
-from gaps import check_state, find_gaps, places
-from task_runner import TaskContext
+from feiran.gaps import check_state, find_gaps, places
+from feiran.task_runner import TaskContext
 from tests.test_gaps import FakeDeepSeek, decided_job, suggestions
-from v2_flow import make_handlers
+from feiran.v2_flow import make_handlers
 
 ISSUER = "https://cognito-idp.example.amazonaws.com/pool"
 PDF = b"%PDF-1.7\nsynthetic\n%%EOF"
@@ -441,7 +441,7 @@ class MaterialTests(StoreCase):
         self.assertEqual(len(published["materials"]), 2)
 
     def test_a_gap_check_of_a_cv_that_changed_meanwhile_is_not_kept(self):
-        from gaps import find_gaps
+        from feiran.gaps import find_gaps
         job = self.ready(self.a)
         self.prepare(self.a, job)
         for key in ("cv", "facts", "requirements"):
@@ -516,7 +516,7 @@ class LocalCVTests(StoreCase):
         return self.a.cv_inputs(job, "en")["head"]
 
     def test_edit_undo_redo_are_local_and_each_changed_version_needs_approval(self):
-        from cv_edit import shown_text
+        from feiran.cv_edit import shown_text
         job = self.local_job()
         other = self.a.create_job(decided_job()["jd"], request_id="other")["job_id"]
         self.a.save_requirements(other, decided_job(), decided_job(), expected_version=0)
@@ -549,7 +549,7 @@ class LocalCVTests(StoreCase):
         self.assertEqual((self.a.list_facts(), self.a.get_profile("en"), self.head(other)), (facts, profile, other_head))
 
     def test_explicit_save_checks_visible_words_is_atomic_and_retry_does_not_add_versions(self):
-        from cv_edit import shown_text
+        from feiran.cv_edit import shown_text
         job = self.local_job()
         block = "fact-intern-api"
         old = shown_text(self.head(job)["draft"], block)
@@ -574,7 +574,7 @@ class LocalCVTests(StoreCase):
             self.b.save_cv_line(job, "en", block, expected_text=text)
 
     def test_new_local_line_save_adds_one_pending_entry_and_keeps_current_cv(self):
-        from cv_edit import add_line
+        from feiran.cv_edit import add_line
         from tests.test_cv_edit import experience_key
         job = self.local_job()
         self.a._edit_cv(job, "en", "add", ["synthetic-add"], lambda c, h, d, key:
@@ -596,7 +596,7 @@ class GapStoreTests(StoreCase):
         job = self.ready(self.a)
         self.prepare(self.a, job, plan=False)
         inputs = self.a.gaps_inputs(job, "en")
-        from gaps import find_gaps
+        from feiran.gaps import find_gaps
         gaps = find_gaps(inputs["requirements"]["decided"], inputs["head"]["draft"], inputs["facts"],
                          FakeDeepSeek(suggestions), private=inputs["private"])
         task_id, token = run_task(self.database, self.a_id, "check_gaps", key="g", job_id=job)
@@ -628,7 +628,7 @@ class GapStoreTests(StoreCase):
         job = self.ready(self.a)
         self.prepare(self.a, job, plan=False)
         inputs = self.a.gaps_inputs(job, "en")
-        from gaps import find_gaps
+        from feiran.gaps import find_gaps
         gaps = find_gaps(inputs["requirements"]["decided"], inputs["head"]["draft"], inputs["facts"],
                          FakeDeepSeek(suggestions))
         task_id, token = run_task(self.database, self.a_id, "check_gaps", key="g", job_id=job)
@@ -643,7 +643,7 @@ class GapStoreTests(StoreCase):
         head = self.a.job_snapshot(job)["cv"]["en"]["material"]
         self.assertFalse(head["inputs_current"])
         before = self.a.list_facts()
-        from cv_edit import shown_text
+        from feiran.cv_edit import shown_text
         with self.assertRaises(Conflict):
             self.a.save_cv_line(job, "en", "fact-skills-languages",
                                 expected_text=shown_text(head["draft"], "fact-skills-languages"))

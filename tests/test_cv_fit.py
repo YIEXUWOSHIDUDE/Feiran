@@ -8,12 +8,12 @@ import unittest
 from html import unescape
 from pathlib import Path
 
-from cv import CVError, _find_chrome, build_draft_from_facts, rendered_pages
-from cv_edit import add_line, change_line, edits_view, set_edit, shown_text, without_edits
-from cv_fit import FIT_REASON, MAX_RENDERS, FitError, candidates, fit_one_page, fit_outcome
-from cv_layout import shown_sections
-from cv_plan import set_change
-from gaps import _entry_key
+from feiran.cv import CVError, _find_chrome, build_draft_from_facts, rendered_pages
+from feiran.cv_edit import add_line, change_line, edits_view, set_edit, shown_text, without_edits
+from feiran.cv_fit import FIT_REASON, MAX_RENDERS, FitError, candidates, fit_one_page, fit_outcome
+from feiran.cv_layout import shown_sections
+from feiran.cv_plan import set_change
+from feiran.gaps import _entry_key
 from tests.fit_fixture import ADDED_BULLET, FACTS, JOB, PROFILE
 
 try:

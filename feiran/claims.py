@@ -8,7 +8,7 @@ suggestion path for contact/link handling and must remain available.
 import re
 from typing import Iterable
 
-from facts import tag_pattern
+from feiran.facts import tag_pattern
 
 
 MAX_LINE_LENGTH = 300

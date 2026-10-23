@@ -2,11 +2,10 @@
 # above all .local/ (personal data), keys and local notes such as AGENTS.override.md. deploy/
 # and compose.yaml come along so the EC2 host takes its files from the release it installs.
 *
-!*.py
+!feiran/
 !tests/
 !web/
 !examples/
 !deploy/
 !compose.yaml
-!starter_boards.json
 !requirements.txt

@@ -18,10 +18,10 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from cv import PROFILE_VERSION, CVError, _header
-from deepseek_client import DEFAULT_MODEL, DeepSeekError
-from facts import fact_source, tag_pattern
-from privacy import EMAIL, WEB, is_phone, mask, phones
+from feiran.cv import PROFILE_VERSION, CVError, _header
+from feiran.deepseek_client import DEFAULT_MODEL, DeepSeekError
+from feiran.facts import fact_source, tag_pattern
+from feiran.privacy import EMAIL, WEB, is_phone, mask, phones
 
 
 class CVImportError(ValueError):
@@ -165,7 +165,7 @@ def read_pdf(data: bytes) -> dict[str, list[Any]]:
 
 PARSE_SECONDS = 20
 PARSE_MEMORY_BYTES = 768 * 1024 * 1024
-_CHILD = "import cv_import; cv_import._read_pdf_child()"
+_CHILD = "from feiran import cv_import; cv_import._read_pdf_child()"
 
 
 def read_pdf_limited(data: bytes, timeout: float = PARSE_SECONDS) -> dict[str, list[Any]]:
@@ -176,7 +176,7 @@ def read_pdf_limited(data: bytes, timeout: float = PARSE_SECONDS) -> dict[str, l
         raise CVImportError(f"PDF 不能超过 {MAX_PDF_BYTES // 1_000_000} MB")
     try:
         finished = subprocess.run([sys.executable, "-c", _CHILD], input=data, capture_output=True, timeout=timeout,
-                                  cwd=Path(__file__).parent, env={"PATH": os.environ.get("PATH", ""),
+                                  cwd=Path(__file__).resolve().parent.parent, env={"PATH": os.environ.get("PATH", ""),
                                                                    "PYTHONDONTWRITEBYTECODE": "1"})
     except subprocess.TimeoutExpired:
         raise CVImportError("读取这个 PDF 用时过长；请上传普通的文字版 PDF") from None

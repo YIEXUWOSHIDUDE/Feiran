@@ -2,7 +2,7 @@ import random
 import re
 import unittest
 
-from sponsorship import RULE_VERSION, _segments, assess_sponsorship, checked, shown
+from feiran.sponsorship import RULE_VERSION, _segments, assess_sponsorship, checked, shown
 
 
 class SponsorshipTests(unittest.TestCase):

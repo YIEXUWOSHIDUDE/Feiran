@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import workspace as workspace_module
-from workspace import DATA_FORMAT, DATA_FORMAT_FILE, DataFormatError, Workspace, WorkspaceError, claim_data_format
+from feiran import workspace as workspace_module
+from feiran.workspace import DATA_FORMAT, DATA_FORMAT_FILE, DataFormatError, Workspace, WorkspaceError, claim_data_format
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -78,7 +78,7 @@ def die_while(root, action, crash_point):
     a killed process does: no finally, no except, no temporary file removed."""
     code = "\n".join([
         "import os, sys", "from pathlib import Path", f"sys.path.insert(0, {str(REPO)!r})",
-        "import workspace as module", f"workspace = module.Workspace(Path({str(root)!r}))",
+        "from feiran import workspace as module", f"workspace = module.Workspace(Path({str(root)!r}))",
         "real_replace, real_rename, real_open = os.replace, Path.rename, Path.open",
         crash_point, action,
     ])
@@ -278,8 +278,8 @@ class WorkspaceTests(unittest.TestCase):
             events.append(("make", path.name))
             return real_mkdir(path, *args, **kwargs)
 
-        patches = [patch("workspace._sync_folder", sync), patch.object(Path, "rename", rename),
-                   patch("workspace.os.replace", replace), patch.object(Path, "unlink", unlink),
+        patches = [patch("feiran.workspace._sync_folder", sync), patch.object(Path, "rename", rename),
+                   patch("feiran.workspace.os.replace", replace), patch.object(Path, "unlink", unlink),
                    patch.object(Path, "mkdir", mkdir)]
         return events, patches
 
@@ -346,7 +346,7 @@ class WorkspaceTests(unittest.TestCase):
                 raise OSError(28, "No space left on device")
             real(source, destination)
 
-        with patch("workspace.os.replace", disk_full), self.assertRaises(OSError):
+        with patch("feiran.workspace.os.replace", disk_full), self.assertRaises(OSError):
             self.workspace.write(self.job, "cv-draft-en", {"version": 2})
         self.assertEqual(self.read_chain(self.workspace, ("cv-draft-en", "cv-planned-en")),
                          [{"version": 1, "step": "cv-draft-en"}, {"version": 1, "step": "cv-planned-en"}])

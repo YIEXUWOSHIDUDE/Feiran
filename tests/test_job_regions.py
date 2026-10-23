@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from listings import location_regions, ranked_listings, add_source, ListingsError
+from feiran.listings import location_regions, ranked_listings, add_source, ListingsError
 from tests.test_listings import posting, FakeBoards
 
 class RegionTests(unittest.TestCase):

@@ -8,8 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from public_access import OwnerAccess
-from web import create_app
+from feiran.public_access import OwnerAccess
+from feiran.web import create_app
 
 
 class PublicAccessTests(unittest.TestCase):

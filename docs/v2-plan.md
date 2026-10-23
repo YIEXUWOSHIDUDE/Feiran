@@ -145,13 +145,13 @@ V2 提交任务后快速返回任务 ID；页面查询持久化状态。状态�
 
 ### 已实现的行为
 
-- [tenant_store.py](../tenant_store.py) 提供共享 SQLite 存储及 `UserWorkspace`。每次读写都在事务内检查账号状态并带所属用户；同一个事实 ID 在 A/B 的工作区分别解释，不会混合。
+- [tenant_store.py](../feiran/tenant_store.py) 提供共享 SQLite 存储及 `UserWorkspace`。每次读写都在事务内检查账号状态并带所属用户；同一个事实 ID 在 A/B 的工作区分别解释，不会混合。
 - 导入事实只能得到 pending；显式确认精确当前版本才可生成。事实修改采用 `expected_version` 检查，新增 pending 版本并保留旧内容；批量失败整体回滚。重复导入同 ID 的旧内容不会静默覆盖新修正。
 - 中文和英文 profile 分别版本化，引用只能指向本用户事实。可以先保存含 pending 事实的 profile，但生成时会拒绝未确认事实。
 - JD 按用户保存为不可变快照，缺失来源保留未知。草稿使用精确 profile/事实版本，保留 DRAFT 状态；同一请求键返回同一材料，不同输入重用键会冲突，明确重新生成使用新键。
 - 事实或 profile 改变后，旧材料仍保留，但 `inputs_current=false`。停用账户后，已经创建的工作区对象也不能继续读取或生成。
 - SQLite 复合外键检查同一用户的资料关联；独立 application ID 防止新旧数据库混用。V1 的 `facts.py` 也在任何自动迁移之前拒绝 V2 数据库。新库只在显式初始化时创建，打开缺失数据库不会悄悄创建空库。
-- [cv.py](../cv.py) 拆出无存储副作用的 profile 校验和 `build_draft_from_facts`，与旧版 `build_draft` 共用同一份草稿规则；[facts.py](../facts.py) 的导入校验同样复用。网页仍走原来的单用户路径。
+- [cv.py](../feiran/cv.py) 拆出无存储副作用的 profile 校验和 `build_draft_from_facts`，与旧版 `build_draft` 共用同一份草稿规则；[facts.py](../feiran/facts.py) 的导入校验同样复用。网页仍走原来的单用户路径。
 
 ### 可复现验收与执行路径
 
@@ -188,37 +188,37 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t . -p
 
 **① 正式登录与全部私人路由隔离（B1）**
 
-- 新增 [identity.py](../identity.py)：Cognito 授权码 + PKCE（S256）、`state`、`nonce` 与浏览器绑定 Cookie；一次登录尝试只能被发起它的浏览器消费一次，10 分钟过期。令牌端点用 `client_secret_basic`；ID token 由 PyJWT 按 JWKS 校验 RS256 签名、`iss`、`aud`、`exp`、`iat`、`token_use=id` 和 `nonce`；`return_to` 只接受站内路径。新增依赖 `PyJWT==2.15.1`、`cryptography==50.0.2`。
-- 新增独立应用 [web_v2.py](../web_v2.py)（`web.py` 的单用户行为与部署路径不变）：服务端会话只存令牌哈希，绝对 12 小时、空闲 2 小时；`__Host-` Cookie（HttpOnly、Secure、SameSite=Lax）；会话级 CSRF（页面 meta → `X-Workbench-Token`，另核对 Origin）；Host 白名单；`no-store` 等安全头；请求体上限（JSON 256 KB、PDF 5 MB）。退出先撤销本地会话，再跳转 Cognito 退出；过期、停用、删除后下一次请求即 401。
+- 新增 [identity.py](../feiran/identity.py)：Cognito 授权码 + PKCE（S256）、`state`、`nonce` 与浏览器绑定 Cookie；一次登录尝试只能被发起它的浏览器消费一次，10 分钟过期。令牌端点用 `client_secret_basic`；ID token 由 PyJWT 按 JWKS 校验 RS256 签名、`iss`、`aud`、`exp`、`iat`、`token_use=id` 和 `nonce`；`return_to` 只接受站内路径。新增依赖 `PyJWT==2.15.1`、`cryptography==50.0.2`。
+- 新增独立应用 [web_v2.py](../feiran/web_v2.py)（`web.py` 的单用户行为与部署路径不变）：服务端会话只存令牌哈希，绝对 12 小时、空闲 2 小时；`__Host-` Cookie（HttpOnly、Secure、SameSite=Lax）；会话级 CSRF（页面 meta → `X-Workbench-Token`，另核对 Origin）；Host 白名单；`no-store` 等安全头；请求体上限（JSON 256 KB、PDF 5 MB）。退出先撤销本地会话，再跳转 Cognito 退出；过期、停用、删除后下一次请求即 401。
 - 账户只在已验证身份首次登录、注册开启且低于 `max_accounts` 时创建；注册只有在配置了有限的每日额度后才能开启；停用或删除的身份不会因再次登录而重开。应用没有任何测试登录路由；Cognito 替身只在 [tests/fake_identity.py](../tests/fake_identity.py)。`provision_user` 仍只是可信管理入口。
 - 除健康检查与登录/回调/退出页外，全部路由都以会话解析出的 `user_id` 构造 `UserWorkspace`：事实、中英文 profile、上传提案、岗位/要求/备注、关注公司与个人排序、通知、任务、预览、下载。别人的 ID 一律得到与“不存在”相同的 404。公共岗位缓存只保存公开来源的岗位，个人匹配与排序按用户保存。V1 的 `matches/propose`、`matches/decide`、`cv/{language}/draft` 未在 V2 暴露（页面不调用）。
 - 按阶段同意数据去向（`upload_parsing`、`job_processing`，各带版本号）；未同意时提交返回 403 `consent_required`，页面弹出对应说明，同意后重试。所有者以前对自己资料的授权不会成为新用户的同意。
 
 **② 用户范围的材料流程**
 
-- [tenant_store.py](../tenant_store.py) 的 `UserWorkspace` 扩展到完整流程：上传提案（用户核对后在一个事务里导入为 pending 事实并保存该语言的 profile）、JD 快照与要求、材料链（原文草稿 → 改写 → 版面）及各阶段的真实降级说明、批准、导出、缺口检查（接受/写入/拒绝；建议行只有用户确认后才成为事实）与历史。
+- [tenant_store.py](../feiran/tenant_store.py) 的 `UserWorkspace` 扩展到完整流程：上传提案（用户核对后在一个事务里导入为 pending 事实并保存该语言的 profile）、JD 快照与要求、材料链（原文草稿 → 改写 → 版面）及各阶段的真实降级说明、批准、导出、缺口检查（接受/写入/拒绝；建议行只有用户确认后才成为事实）与历史。
 - 批准绑定审核人（会话用户）、具体材料、内容 SHA-256 与输入版本；页面提交 `expected_content_sha256`，旧页或输入已变时 409。模型输出不能确认事实或批准。最终 PDF 以 SQLite BLOB 保存并记录 SHA-256，下载时核对；导出期间材料已变则任务记为 superseded，不成为当前最终版。
-- [v2_flow.py](../v2_flow.py) 是任务端的生成流程，复用 `cv.py`、`cv_plan.py`、`claims.py`、`gaps.py`、`requirement_flow.py` 的规则。为此 [facts.py](../facts.py) 增加 `fact_source`，`cv.py`、`gaps.py`、`cv_import.py` 同时接受单用户数据库路径或 V2 的事实快照；状态说明函数从 `web.py` 移到 [cv_status.py](../cv_status.py) 供两个应用共用；[listings.py](../listings.py) 拆出纯函数 `group_postings`。
+- [v2_flow.py](../feiran/v2_flow.py) 是任务端的生成流程，复用 `cv.py`、`cv_plan.py`、`claims.py`、`gaps.py`、`requirement_flow.py` 的规则。为此 [facts.py](../feiran/facts.py) 增加 `fact_source`，`cv.py`、`gaps.py`、`cv_import.py` 同时接受单用户数据库路径或 V2 的事实快照；状态说明函数从 `web.py` 移到 [cv_status.py](../feiran/cv_status.py) 供两个应用共用；[listings.py](../feiran/listings.py) 拆出纯函数 `group_postings`。
 
 **③ 异步任务与额度**
 
 - 上传解析、岗位导入（粘贴/URL/岗位列表）、准备/改写/版面、缺口检查、PDF 导出都只能经任务提交，立即返回 202 与任务 ID；持久化输入、幂等键 `(user_id, operation, key)`（同键同输入返回原任务，同键不同输入 409）、阶段、尝试次数、执行令牌与截止时间。
-- [task_runner.py](../task_runner.py)：进程内有界执行器，全站同时 2 个、其中 PDF 1 个；每人 1 个执行中 + 1 个排队；全站排队上限。模型调用、网页读取和 PDF 渲染都在数据库写事务之外。发布时同时核对执行令牌与基线版本，取消、超时、被打断或输入已被取代的迟到结果一律拒绝。重启把遗留的 running 标为 interrupted，不自动重跑；同一请求最多尝试 3 次；排队超过 15 分钟失效，单任务 10 分钟超时。
+- [task_runner.py](../feiran/task_runner.py)：进程内有界执行器，全站同时 2 个、其中 PDF 1 个；每人 1 个执行中 + 1 个排队；全站排队上限。模型调用、网页读取和 PDF 渲染都在数据库写事务之外。发布时同时核对执行令牌与基线版本，取消、超时、被打断或输入已被取代的迟到结果一律拒绝。重启把遗留的 running 标为 interrupted，不自动重跑；同一请求最多尝试 3 次；排队超过 15 分钟失效，单任务 10 分钟超时。
 - 额度在提交的同一事务里为用户和全站原子预留当日单位；`tasks_enabled` 是紧急开关；没有有限额度时拒绝新任务。费用状态分 none/known/unknown：调用模型前先记“可能已花费”，拿到用量后记 known；只有确定未花费才退回额度，不声称模型调用恰好一次计费。
 - 上传 PDF 在子进程中解析（20 秒、CPU 时间上限，Linux 另限 768 MB 内存，子进程只拿到 PATH）；上传任务里的简历行在完成 24 小时后清除。公司岗位列表刷新在请求内执行但受限：全站 4 个并发、每人每小时 60 次（进程内计数，重启归零）、30 分钟内复用共享公共缓存。
 
 **④ 合成 V1 迁移、备份恢复与删除**
 
-- [v2_migrate.py](../v2_migrate.py)：显式指定所有者 `(issuer, sub)`，只读打开 V1；迁移全部事实版本、各语言 profile 及历史、岗位、要求、备注、缺口检查、当前材料链、关注公司与公共岗位。批准只有在内容、事实与 profile 都仍满足单用户应用判定时才保留，最终 PDF 随批准一起；否则回到待审核，绝不补造。V1 有未清日志、格式号大于 1、所有者已存在时拒绝，失败时删除半成品；`--dry-run` 只写临时副本；`rollback` 先备份 V2 再让目录回到 V1。
+- [v2_migrate.py](../feiran/v2_migrate.py)：显式指定所有者 `(issuer, sub)`，只读打开 V1；迁移全部事实版本、各语言 profile 及历史、岗位、要求、备注、缺口检查、当前材料链、关注公司与公共岗位。批准只有在内容、事实与 profile 都仍满足单用户应用判定时才保留，最终 PDF 随批准一起；否则回到待审核，绝不补造。V1 有未清日志、格式号大于 1、所有者已存在时拒绝，失败时删除半成品；`--dry-run` 只写临时副本；`rollback` 先备份 V2 再让目录回到 V1。
 - 数据格式号：V2 启动时写 `.workbench-format` = 2，V1 拒绝大于 1 的格式；V2 拒绝未迁移的 V1 目录。
-- [v2_backup.py](../v2_backup.py)：SQLite 在线备份（不含会话）+ 删除账本 + 清单；恢复只写空目录，核对清单与数据库后，合并归档内与现行删除账本重新删除，清空会话，把 running 任务标为 interrupted。删除账户先追加 `deleted-accounts.jsonl`，再删数据并留下墓碑；同一身份不会因登录或恢复旧备份而重开。
+- [v2_backup.py](../feiran/v2_backup.py)：SQLite 在线备份（不含会话）+ 删除账本 + 清单；恢复只写空目录，核对清单与数据库后，合并归档内与现行删除账本重新删除，清空会话，把 running 任务标为 interrupted。删除账户先追加 `deleted-accounts.jsonl`，再删数据并留下墓碑；同一身份不会因登录或恢复旧备份而重开。
 
 **⑤ 试点验收工具、运维与评估准备**
 
 - [tests/acceptance_v2.py](../tests/acceptance_v2.py)：在本机用 Uvicorn 真实起服务，跑 load / burst / restart / pdf / migrate 五组场景（结果见 §9.3）。
-- [v2_admin.py](../v2_admin.py)：站点设置、注册与额度、紧急开关、按 Cognito sub 查账户、停用/启用/删除（删除需重复输入 ID）、当日用量。为此 `tenant_store` 增加 `list_accounts`、`usage_on`，数据库文件名统一为 `tenant_store.DATABASE`。
+- [v2_admin.py](../feiran/v2_admin.py)：站点设置、注册与额度、紧急开关、按 Cognito sub 查账户、停用/启用/删除（删除需重复输入 ID）、当日用量。为此 `tenant_store` 增加 `list_accounts`、`usage_on`，数据库文件名统一为 `tenant_store.DATABASE`。
 - [deploy/aws/cognito.yaml](../deploy/aws/cognito.yaml) 与 [deploy/aws/compose.v2.yaml](../deploy/aws/compose.v2.yaml)（均未部署）；CI 的 cfn-lint 加上 cognito.yaml；操作清单与主机脚本所需改动见 [v2-operations.md](v2-operations.md)。
-- B6：[examples/v2_eval_samples.json](../examples/v2_eval_samples.json)（合成并人工标注：24 条改写，覆盖夸大职责、数字、年限、范围、限定、否定、新技能、中英改写；9 条证据判断，覆盖复合要求、任选其一、年限、相关≠满足、否定）。[eval_v2.py](../eval_v2.py) 的 `offline` 是离线规则回归，已纳入单元测试；`live` 只在 `--confirm-paid` 且 `--max-calls` 为 1–100 时运行，经应用自己的 `find_gaps` 每个样本一次证据调用，建议步骤在本地拦截、不出网，报告模型、提示指纹、样本版本、与关键词基线的对比以及“误判为满足”的样本。**live 未运行。**
+- B6：[examples/v2_eval_samples.json](../examples/v2_eval_samples.json)（合成并人工标注：24 条改写，覆盖夸大职责、数字、年限、范围、限定、否定、新技能、中英改写；9 条证据判断，覆盖复合要求、任选其一、年限、相关≠满足、否定）。[eval_v2.py](../feiran/eval_v2.py) 的 `offline` 是离线规则回归，已纳入单元测试；`live` 只在 `--confirm-paid` 且 `--max-calls` 为 1–100 时运行，经应用自己的 `find_gaps` 每个样本一次证据调用，建议步骤在本地拦截、不出网，报告模型、提示指纹、样本版本、与关键词基线的对比以及“误判为满足”的样本。**live 未运行。**
 - 前端 [web/app.js](../web/app.js)：V2 模式下 401 跳转登录、同意对话框、任务跟踪与自动刷新、退出、删除账户；[web/zh.js](../web/zh.js) 新增 52 条中文。
 
 ### 9.2 设计决定与偏离原方案之处（建议验收时重点审查）

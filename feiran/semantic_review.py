@@ -10,10 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from cv import CVError, PROFILE_VERSION, _profile_hash, content_fingerprint, verify_draft
-from facts import DEFAULT_DATABASE, FactStoreError
-from privacy import mask, private_terms
-from typesafe_classifier import DEFAULT_MODEL, TypeSafeError, _choice_answer, _post_json
+from feiran.cv import CVError, PROFILE_VERSION, _profile_hash, content_fingerprint, verify_draft
+from feiran.facts import DEFAULT_DATABASE, FactStoreError
+from feiran.privacy import mask, private_terms
+from feiran.typesafe_classifier import DEFAULT_MODEL, TypeSafeError, _choice_answer, _post_json
 
 
 PROMPT_VERSION = "cv-writing-observe-v2"

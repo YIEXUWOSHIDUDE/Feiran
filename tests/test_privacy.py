@@ -1,6 +1,6 @@
 import unittest
 
-from privacy import mask, private_terms
+from feiran.privacy import mask, private_terms
 
 
 class PrivacyTests(unittest.TestCase):

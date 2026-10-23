@@ -12,10 +12,10 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
-from cv import CVError, _job_summary, requirement_briefs
-from privacy import mask, private_terms, stand_ins
-from cv_layout import describe_changes, guarded_layout, original_layout
-from deepseek_client import DEFAULT_MODEL, DeepSeekError, chat_json
+from feiran.cv import CVError, _job_summary, requirement_briefs
+from feiran.privacy import mask, private_terms, stand_ins
+from feiran.cv_layout import describe_changes, guarded_layout, original_layout
+from feiran.deepseek_client import DEFAULT_MODEL, DeepSeekError, chat_json
 
 
 PLAN_VERSION = 1

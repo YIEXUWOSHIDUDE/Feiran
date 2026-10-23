@@ -5,11 +5,11 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from deepseek_client import DeepSeekError
-from facts import FactStoreError, add_fact, confirm_fact, initialize_database, list_facts, revise_fact
-from matching import MatchingError, apply_match_decisions, first_candidates, main, propose_matches
-from requirement_flow import apply_requirement_decisions, propose_requirements
-from review import build_report
+from feiran.deepseek_client import DeepSeekError
+from feiran.facts import FactStoreError, add_fact, confirm_fact, initialize_database, list_facts, revise_fact
+from feiran.matching import MatchingError, apply_match_decisions, first_candidates, main, propose_matches
+from feiran.requirement_flow import apply_requirement_decisions, propose_requirements
+from feiran.review import build_report
 
 
 JD_TEXT = """Requirements:

@@ -3,11 +3,11 @@ import json
 import tempfile
 import unittest
 
-from cv import CVError, approve_draft, build_draft, is_final_approval, render_html, rewritten_lines, tailor_draft
-from cv_plan import plan_draft, set_change
-from deepseek_client import DeepSeekError
-from facts import confirm_facts, import_facts
-from requirement_flow import apply_requirement_decisions, propose_requirements
+from feiran.cv import CVError, approve_draft, build_draft, is_final_approval, render_html, rewritten_lines, tailor_draft
+from feiran.cv_plan import plan_draft, set_change
+from feiran.deepseek_client import DeepSeekError
+from feiran.facts import confirm_facts, import_facts
+from feiran.requirement_flow import apply_requirement_decisions, propose_requirements
 from tests.test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
 
 

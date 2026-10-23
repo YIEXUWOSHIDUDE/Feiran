@@ -25,7 +25,7 @@ from typing import Any, Callable, Mapping
 
 import jwt
 
-import tenant_store
+from feiran import tenant_store
 
 
 TOKEN_TIMEOUT_SECONDS = 10

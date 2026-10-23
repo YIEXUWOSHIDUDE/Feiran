@@ -1,8 +1,10 @@
 """Run the whole workflow once inside the container: synthetic data, a scripted stand-in for
 DeepSeek, and real PDFs printed by the container's own Chromium.
 
-    python deploy/smoke.py create --data /data --out /data/smoke   # build it all and check the PDFs
-    python deploy/smoke.py verify --data /data                     # later, in a new container
+    python -m deploy.smoke create --data /data --out /data/smoke   # build it all and check the PDFs
+    python -m deploy.smoke verify --data /data                     # later, in a new container
+
+(from the repository root, /app in the container, so that the feiran package is found).
 
 `create` goes from an uploaded CV to an approved, exported PDF: upload a CV, confirm its facts,
 create a job (its CV is drafted, reworded and adjusted by itself), check what the CV shows for
@@ -24,20 +26,18 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from fastapi.testclient import TestClient
+from pypdf import PdfReader
 
-from fastapi.testclient import TestClient  # noqa: E402
-from pypdf import PdfReader  # noqa: E402
-
-from cv import TAILOR_RULES, build_draft, export_pdf, is_final_approval  # noqa: E402
-from cv_import import STRUCTURE_RULES  # noqa: E402
-from cv_plan import PLAN_RULES  # noqa: E402
-from facts import confirm_facts, import_facts  # noqa: E402
-from gaps import EVIDENCE_RULES, SUGGEST_RULES  # noqa: E402
-from requirement_flow import FIND_RULES  # noqa: E402
-from tests.test_cv_import import minimal_pdf  # noqa: E402
-from web import create_app  # noqa: E402
-from workspace import DATA_FORMAT_FILE  # noqa: E402
+from feiran.cv import TAILOR_RULES, build_draft, export_pdf, is_final_approval
+from feiran.cv_import import STRUCTURE_RULES
+from feiran.cv_plan import PLAN_RULES
+from feiran.facts import confirm_facts, import_facts
+from feiran.gaps import EVIDENCE_RULES, SUGGEST_RULES
+from feiran.requirement_flow import FIND_RULES
+from feiran.web import create_app
+from feiran.workspace import DATA_FORMAT_FILE
+from tests.test_cv_import import minimal_pdf
 
 TOKEN = "smoke-test-token"
 HEADERS = {"X-Workbench-Token": TOKEN}

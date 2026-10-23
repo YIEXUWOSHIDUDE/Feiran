@@ -6,8 +6,8 @@ assesses nothing, confirms no fact and changes no material or approval.
 """
 from typing import Any
 
-from facts import tag_finder, tag_pattern
-from sponsorship import shown
+from feiran.facts import tag_finder, tag_pattern
+from feiran.sponsorship import shown
 
 
 def build_job_review(jd: dict[str, Any], facts: list[dict[str, Any]],
