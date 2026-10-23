@@ -2,7 +2,7 @@
 
 ## 单页整理部署前检查修复（2026-10-23）
 
-PR #34 已合并，但 PR 与 main 的容器检查都在新增真实打印测试报 `No usable sandbox`。本地 Chrome 的 695 项通过不能代表 Linux Docker 配置通过。原因是 CI 和发布流程的全套测试使用普通 `docker run`，没有应用及已有 PDF 验收所用的 Chromium seccomp 配置。两处测试启动改为复用该配置、非提权限制、只读镜像及临时目录；不关闭 Chromium sandbox，不跳过真实打印测试，不修改产品逻辑。以远端容器检查和发布流程的实际结果验收。
+PR #34 已合并，但 PR 与 main 的容器检查都在新增真实打印测试报 `No usable sandbox`。本地 Chrome 的 695 项通过不能代表 Linux Docker 配置通过。原因是 CI 和发布流程的全套测试使用普通 `docker run`，没有应用及已有 PDF 验收所用的 Chromium seccomp 配置。两处测试启动改为复用该配置、非提权限制、只读镜像及临时目录；不关闭 Chromium sandbox，不跳过真实打印测试，不修改产品逻辑。首轮修复后真实打印已通过，两个旧 Chrome 单元测试因临时脚本位于 noexec 挂载而失败；仅测试容器的临时目录显式允许执行，生产 Compose 不变。以远端容器检查和发布流程的实际结果验收。
 
 ## CC 单页整理独立验收（2026-10-22）
 
