@@ -372,7 +372,7 @@ echo "ok   install: the data's format only goes forward; raising it needs a fres
 
 # install.sh across the move into the feiran package: release a is from before it (modules at the
 # top of /app), b has it. Each runs its own layout, also when the install goes back to a.
-rm -rf "$work/home" "$work/state" "$work/units" "$work/volume/data"
+rm -rf "${work:?}/home" "${work:?}/state" "${work:?}/units" "${work:?}/volume/data"
 mkdir -p "$work/home" "$work/state" "$work/units" "$work/volume/data"
 host_env active
 FAKE_LAYOUT_a=root "$host/install.sh" "$image" > /dev/null || fail "a release from before the package was not installed"

@@ -318,7 +318,7 @@ echo 'ok   V2 install: fresh/existing data paths, image capabilities, format rej
 
 # Across the move into the feiran package: release a from before it, b with it. Each runs its own
 # layout, also when the install goes back to a.
-rm -rf "$work/home" "$work/state" "$work/units" "$work/volume/data"
+rm -rf "${work:?}/home" "${work:?}/state" "${work:?}/units" "${work:?}/volume/data"
 mkdir -p "$work/home" "$work/state" "$work/units" "$work/volume/data"
 v2_env
 FAKE_LAYOUT_a=root "$host/install.sh" "$image" > /dev/null || fail 'a V2 release from before the package was not installed'
