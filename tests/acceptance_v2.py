@@ -49,18 +49,18 @@ from pathlib import Path
 import httpx2
 import uvicorn
 
-import tenant_store
-from cv import print_with_chrome
-from deepseek_client import DeepSeekError
-from identity import Identity, OIDCSettings
-from requirement_flow import propose_requirements
-from tenant_store import UserWorkspace, set_setting
+from feiran import tenant_store
+from feiran.cv import print_with_chrome
+from feiran.deepseek_client import DeepSeekError
+from feiran.identity import Identity, OIDCSettings
+from feiran.requirement_flow import propose_requirements
+from feiran.tenant_store import UserWorkspace, set_setting
 from tests.fake_identity import CLIENT_ID, DOMAIN, ISSUER, FakeCognito
 from tests.test_cv import PROFILE, FakePrinter
 from tests.test_cv_import import ANSWER, LINES, minimal_pdf
 from tests.test_web import FakeDeepSeek
-from v2_flow import auto_decide, make_handlers
-from web_v2 import V2Settings, create_v2_app
+from feiran.v2_flow import auto_decide, make_handlers
+from feiran.web_v2 import V2Settings, create_v2_app
 
 REPO = Path(__file__).resolve().parent.parent
 JD_EN = "Senior Backend Engineer\nRequirements:\n- Python services\n- SQL databases\n- Testing with pytest\n"
@@ -349,7 +349,7 @@ def run_burst(workdir, report):
 HOLD = """
 import sys, time
 from pathlib import Path
-from task_runner import TaskRunner
+from feiran.task_runner import TaskRunner
 database = Path(sys.argv[1])
 def hold(ctx):
     ctx.chat([{"role": "user", "content": "x"}], model="m", effort="none")
@@ -381,7 +381,7 @@ def run_restart(workdir, report):
     before = user.get_task(task["task_id"])
     child.send_signal(signal.SIGKILL)
     child.wait(10)
-    from task_runner import TaskRunner
+    from feiran.task_runner import TaskRunner
     runner = TaskRunner(database, make_handlers(printer=FakePrinter()), poll_seconds=0.05, model=FakeDeepSeek())
     runner.start()
     try:
@@ -497,14 +497,14 @@ def fingerprints(folder):
 
 
 def run_migrate(workdir, report):
-    import v2_backup
-    import v2_migrate
+    from feiran import v2_backup
+    from feiran import v2_migrate
     from pypdf import PdfReader
     root = workdir / "migrate"
     data = root / "data"
     data.mkdir(parents=True)
     (data / ".workbench-data").touch()
-    made = subprocess.run([sys.executable, "deploy/smoke.py", "create", "--data", str(data), "--out", str(root / "smoke")],
+    made = subprocess.run([sys.executable, "-m", "deploy.smoke", "create", "--data", str(data), "--out", str(root / "smoke")],
                           cwd=REPO, capture_output=True, text=True)
     assert made.returncode == 0, made.stderr[-2000:]
     before = fingerprints(data)

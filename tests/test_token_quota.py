@@ -4,8 +4,8 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from urllib.error import URLError
-import tenant_store as s
-import deepseek_client as d
+from feiran import tenant_store as s
+from feiran import deepseek_client as d
 
 class Meter:
 
@@ -171,7 +171,7 @@ class LedgerLifecycleTests(unittest.TestCase):
             meter.begin(100, 2000)
 
     def test_upgrade_is_additive_idempotent_and_backup_checks_ledger(self):
-        from v2_backup import verify_database
+        from feiran.v2_backup import verify_database
         with s.transaction(self.db, write=True) as connection:
             for table in s.METER_TABLES:
                 connection.execute('DROP TABLE ' + table)

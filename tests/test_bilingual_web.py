@@ -7,12 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
-from cv import build_draft, approve_draft, content_fingerprint
-from facts import import_facts, confirm_facts, list_facts
-from job_search import prepare_pasted_jd, prepare_review_input
+from feiran.cv import build_draft, approve_draft, content_fingerprint
+from feiran.facts import import_facts, confirm_facts, list_facts
+from feiran.job_search import prepare_pasted_jd, prepare_review_input
 from tests.test_web import FakeDeepSeek, TOKEN
 from tests.test_cv import FakePrinter
-from web import create_app
+from feiran.web import create_app
 
 
 class BilingualWebTests(unittest.TestCase):
@@ -41,7 +41,7 @@ class BilingualWebTests(unittest.TestCase):
 
     def upload(self, language='zh', line='编程语言：Python', name='Alex Example'):
         # Deliberately a Latin name on a Chinese document: explicit language must win.
-        with patch('web.read_pdf', return_value={'lines': [[name], ['专业技能'], [line]], 'links': []}):
+        with patch('feiran.web.read_pdf', return_value={'lines': [[name], ['专业技能'], [line]], 'links': []}):
             response = self.client.post('/api/cv/upload?language='+language, content=b'%PDF-synthetic')
         self.assertEqual(response.status_code, 200, response.text)
         result = self.client.post('/api/cv/uploads/'+response.json()['upload_id']+'/save', json={'name': name})
@@ -102,7 +102,7 @@ class BilingualWebTests(unittest.TestCase):
         self.assertEqual(self.client.post(f'/api/jobs/{self.job}/cv/en/export').status_code, 400)
 
     def test_language_profiles_and_job_choice_survive_backup_restore(self):
-        from backup import create_backup, restore_backup
+        from feiran.backup import create_backup, restore_backup
         self.upload()
         self.client.post(f'/api/jobs/{self.job}/language',json={'language':'zh'})
         # Archives go outside the data tree, as in the deployment backup workflow.

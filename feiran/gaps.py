@@ -12,12 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from claims import LINK
-from cv import CVError, _localized
-from cv_layout import original_layout, shown_sections
-from deepseek_client import DEFAULT_MODEL, DeepSeekError
-from facts import fact_source, tag_pattern
-from privacy import mask, private_terms, stand_ins
+from feiran.claims import LINK
+from feiran.cv import CVError, _localized
+from feiran.cv_layout import original_layout, shown_sections
+from feiran.deepseek_client import DEFAULT_MODEL, DeepSeekError
+from feiran.facts import fact_source, tag_pattern
+from feiran.privacy import mask, private_terms, stand_ins
 
 
 GAPS_VERSION = 3

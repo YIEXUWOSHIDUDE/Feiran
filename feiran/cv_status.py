@@ -4,8 +4,8 @@ explain a stage the same way. No data is read or written here."""
 
 import re
 
-from cv import rewritten_lines
-from deepseek_client import DeepSeekError
+from feiran.cv import rewritten_lines
+from feiran.deepseek_client import DeepSeekError
 
 
 CANDIDATE_FIELDS = ("id", "text", "section", "strength", "status", "decided_by", "extraction_method")

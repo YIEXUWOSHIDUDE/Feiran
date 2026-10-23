@@ -123,7 +123,7 @@ Install [Git for Windows](https://git-scm.com/install/windows), the [Python Inst
 4. Start Feiran in the same PowerShell window:
 
    ```powershell
-   .\.venv\Scripts\python.exe web.py
+   .\.venv\Scripts\python.exe -m feiran.web
    ```
 
    Open <http://127.0.0.1:8765/>; press `Ctrl+C` to stop. On later starts, enter the `Feiran` directory, set `$env:DEEPSEEK_API_KEY_FILE` and `$env:CHROME_PATH` again as above, and run the startup command. You do not need to reinstall dependencies or save the key again.
@@ -157,7 +157,7 @@ The commands below are for macOS / Linux. Install Python 3.14 (the version used 
 3. Start the workspace in the same terminal:
 
    ```sh
-   .venv/bin/python web.py
+   .venv/bin/python -m feiran.web
    ```
 
    Open <http://127.0.0.1:8765/> in your browser and follow the workflow above. Data is stored in `.local/` by default. Press `Ctrl+C` to stop the server. If Chrome / Chromium is not detected, set `CHROME_PATH` to the browser executable's full path. Chinese PDF export requires a font with Chinese character support on your system.
@@ -165,6 +165,8 @@ The commands below are for macOS / Linux. Install Python 3.14 (the version used 
 For your own AWS deployment, see [AWS public deployment](docs/aws-public.md).
 
 ## Development
+
+Application code and the starter company list live in [`feiran/`](feiran/); browser assets in [`web/`](web/); tests in [`tests/`](tests/); deployment tools in [`deploy/`](deploy/); guides in [`docs/`](docs/); and synthetic examples in [`examples/`](examples/).
 
 V2 quota metering and per-requirement AI entry suggestions are documented in [the V2 implementation notes](docs/v2-plan.md). Existing deployments keep their current quota mode until an operator changes it.
 

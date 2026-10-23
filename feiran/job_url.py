@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
-from job_search import SearchError
+from feiran.job_search import SearchError
 
 MAX_PAGE_BYTES = 3_000_000
 TIMEOUT = 12

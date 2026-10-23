@@ -9,11 +9,11 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
-import run_log
-import tenant_store
-from task_runner import TaskRunner
-from tenant_store import UserWorkspace, claim_tasks, initialize_store, provision_user, set_setting
-from v2_flow import TaskFailed
+from feiran import run_log
+from feiran import tenant_store
+from feiran.task_runner import TaskRunner
+from feiran.tenant_store import UserWorkspace, claim_tasks, initialize_store, provision_user, set_setting
+from feiran.v2_flow import TaskFailed
 
 
 class Gate:
@@ -117,7 +117,7 @@ class FailureTests(RunnerCase):
         self.assertEqual(outcome, ["refused"])
 
     def test_a_failed_call_keeps_the_cost_unknown_after_a_later_call_answers(self):
-        from deepseek_client import DeepSeekError
+        from feiran.deepseek_client import DeepSeekError
         answers = [DeepSeekError("lost", reason="unreachable"),
                    {"model": "m", "content": {}, "usage": {"prompt_tokens": 5, "completion_tokens": 1}}]
 

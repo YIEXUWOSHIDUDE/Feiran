@@ -13,7 +13,7 @@
 # cannot read.
 #
 # Before switching, with the workbench stopped so the data cannot change in between, the new
-# release's own read-only check of the data (backup.py verify) may find no problem that the last
+# release's own read-only check of the data (its backup tool's verify) may find no problem that the last
 # good release's check does not; otherwise nothing is switched and the workbench starts again as
 # it was, also if the install fails or is stopped meanwhile. After switching, the release must
 # start and answer within two minutes; otherwise the last good release (the last one that passed,
@@ -70,23 +70,44 @@ good=$(sed -n 1p "$state/good-releases" 2> /dev/null || true)
 previous=$good
 [ "$previous" != "$image" ] || previous=""  # the good release again: nothing to go back to
 
+# Each release runs its own code, laid out its own way: in the feiran package (python -m
+# feiran.backup), or, in releases made before the package, as modules at the top of /app (python
+# backup.py). An install runs two releases (this one and the last good one, or the one it goes
+# back to), so each image is asked which it has. Only the package's own file is looked for: an
+# import that fails is never taken to mean the other layout.
+layout_of() {
+    docker run --rm --network none --entrypoint python "$1" -c \
+        'import os; print("package" if os.path.isfile("feiran/__init__.py") else "root" if os.path.isfile("backup.py") else "")'
+}
+in_release() {  # in_release <image> <its layout> <modules, comma-separated> <code>: the code, after importing those
+    local imports
+    case "$2" in
+        package) imports="from feiran import $3" ;;
+        root) imports="import $3" ;;
+        *) return 1 ;;
+    esac
+    docker run --rm --network none --entrypoint python "$1" -c "$imports; $4"
+}
+layout=$(layout_of "$image") || layout=""
+[ -n "$layout" ] || { echo "refused: $image has neither the feiran package nor the modules of earlier releases" >&2; exit 1; }
+
 # A V2 host must never roll back into the single-owner application in the same image.
 case "${WORKBENCH_MODE:-v1}" in
-    v1) format_query='import workspace; print(workspace.DATA_FORMAT)'; backup_tool=backup.py ;;
+    v1) format_modules=workspace; format_code='print(workspace.DATA_FORMAT)'; backup_module=backup ;;
     v2)
-        format_query='import web_v2, identity; print(web_v2.V2_DATA_FORMAT)'
-        backup_tool=v2_backup.py
+        format_modules='web_v2, identity'; format_code='print(web_v2.V2_DATA_FORMAT)'
+        backup_module=v2_backup
         for setting in WORKBENCH_OIDC_ISSUER WORKBENCH_OIDC_CLIENT_ID WORKBENCH_OIDC_DOMAIN \
                 WORKBENCH_OIDC_USER_POOL_ID WORKBENCH_OIDC_SECRET_FILE WORKBENCH_PUBLIC_ORIGIN WORKBENCH_PUBLIC_HOST; do
             [ -n "${!setting:-}" ] || { echo "refused: V2 is missing $setting" >&2; exit 1; }
         done
-        docker run --rm --network none --entrypoint python "$image" -c 'import web_v2, identity, v2_backup' \
+        in_release "$image" "$layout" 'web_v2, identity, v2_backup' pass \
             || { echo "refused: this release has no V2 support" >&2; exit 1; } ;;
     *) echo "refused: unknown WORKBENCH_MODE" >&2; exit 1 ;;
 esac
 # V1 public mode may never silently roll back to an image without its login gate.
 if [ "${WORKBENCH_MODE:-v1}" = v1 ] && [ -n "${WORKBENCH_PUBLIC_HOST:-}" ]; then
-    docker run --rm --network none --entrypoint python "$image" -c 'from public_access import OwnerAccess' \
+    in_release "$image" "$layout" public_access public_access.OwnerAccess \
         || { echo "refused: this release has no owner login support" >&2; exit 1; }
 fi
 
@@ -103,7 +124,7 @@ if [ ! -d "$release" ]; then
 fi
 "${MOUNT_DATA:-$release/deploy/aws/host/mount-data.sh}" "$DATA_DEVICE" "$DATA_MOUNT" > /dev/null
 
-format=$(docker run --rm --network none --entrypoint python "$image" -c "$format_query")
+format=$(in_release "$image" "$layout" "$format_modules" "$format_code")
 if [ -e "$WORKBENCH_DATA_DIR/.workbench-format" ]; then
     recorded=$(cat "$WORKBENCH_DATA_DIR/.workbench-format")
 elif [ -e "$WORKBENCH_DATA_DIR/v2.db" ]; then
@@ -177,9 +198,14 @@ prepare_v2_check() {
     check_mounts=(-v "$WORKBENCH_DATA_DIR:/live:ro" -v "$check_copy:/data")
 }
 problems_found_by() {  # what release $1 finds wrong, using read-only SQL, one per line, sorted
-    local report
+    local report tool
+    case "$(layout_of "$1")" in  # the last good release may be laid out the old way
+        package) tool=(-m "feiran.$backup_module") ;;
+        root) tool=("$backup_module.py") ;;
+        *) echo "$1 has neither the feiran package nor the modules of earlier releases" >&2; return 1 ;;
+    esac
     report=$(docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
-        "${check_mounts[@]}" "$1" python "$backup_tool" verify --data /data) || [ $? = 1 ]
+        "${check_mounts[@]}" "$1" python "${tool[@]}" verify --data /data) || [ $? = 1 ]
     printf '%s' "$report" | python3 -c 'import json, sys; print("\n".join(sorted(json.load(sys.stdin)["problems"])))'
 }
 refuse_and_go_back() {  # once switched: install the last good release again, when that is safe

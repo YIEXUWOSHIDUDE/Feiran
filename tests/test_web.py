@@ -16,15 +16,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from deepseek_client import DeepSeekError
-from job_search import SearchError
-from facts import confirm_facts, import_facts, list_facts, revise_fact
-from cv_import import STRUCTURE_RULES
-from cv_plan import PLAN_RULES
-from gaps import EVIDENCE_RULES, SUGGEST_RULES
-from matching import MATCH_RULES
-from requirement_flow import FIND_RULES
-import run_log
+from feiran.deepseek_client import DeepSeekError
+from feiran.job_search import SearchError
+from feiran.facts import confirm_facts, import_facts, list_facts, revise_fact
+from feiran.cv_import import STRUCTURE_RULES
+from feiran.cv_plan import PLAN_RULES
+from feiran.gaps import EVIDENCE_RULES, SUGGEST_RULES
+from feiran.matching import MATCH_RULES
+from feiran.requirement_flow import FIND_RULES
+from feiran import run_log
 from tests.test_cv import FACTS as CV_FACTS, PROFILE, FakeChat, FakePrinter
 from tests.test_gaps import resume_ids, sent_lines
 from tests.test_listings import FakeBoards, posting
@@ -35,8 +35,8 @@ HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
 if HAS_FASTAPI:
     from fastapi.testclient import TestClient
 
-    import web as web_module
-    from web import DATA_MARKER, create_app, data_problem, main, server_settings
+    from feiran import web as web_module
+    from feiran.web import DATA_MARKER, create_app, data_problem, main, server_settings
 
 TOKEN = "test-token"
 FACTS = [
@@ -446,7 +446,7 @@ class WebTests(unittest.TestCase):
             raise RuntimeError("Alex Example, Acme Corporation")  # words from a CV, in an error nobody expected
 
         client = TestClient(self.app, base_url="http://127.0.0.1:8765", raise_server_exceptions=False)
-        with patch("web.plan_draft", broken), self.assertLogs("workbench.access", level="ERROR") as logs:
+        with patch("feiran.web.plan_draft", broken), self.assertLogs("workbench.access", level="ERROR") as logs:
             response = client.post(f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
         self.assertEqual(response.status_code, 500)
         [line] = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
@@ -743,7 +743,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len(self.app.state.workspace.jobs()), 1)
 
     def test_generic_url_import_uses_html_and_preserves_retry_identity(self):
-        from job_url import extract_job
+        from feiran.job_url import extract_job
         from tests.test_job_url import HTML, URL
         calls = []
         def read_page(url):
@@ -962,7 +962,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual((follow.status_code, refresh.status_code), (200, 200), refresh.text)
 
     def test_a_busy_database_is_reported_as_busy(self):
-        with patch("web.ranked_listings", side_effect=sqlite3.OperationalError("database is locked")):
+        with patch("feiran.web.ranked_listings", side_effect=sqlite3.OperationalError("database is locked")):
             response = self.client.get("/api/listings", headers=self.headers)
         self.assertEqual(response.status_code, 409)
         self.assertIn("Try again", response.json()["error"])
@@ -1032,7 +1032,7 @@ class WebTests(unittest.TestCase):
         job_id = self.planned_job()
         gate = self.chat.while_planning = Gate()
         change = {"change_id": "cut:fact-intern-api", "undone": True}
-        with patch("web.CHANGE_WAIT_SECONDS", 0.05), \
+        with patch("feiran.web.CHANGE_WAIT_SECONDS", 0.05), \
                 TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(3) as pool:
             try:
                 slow = pool.submit(client.post, f"/api/jobs/{job_id}/cv/en/plan", headers=self.headers)
@@ -1066,7 +1066,7 @@ class WebTests(unittest.TestCase):
         code = "\n".join([
             "import os, sys, json", "from pathlib import Path", f"sys.path.insert(0, {str(REPO)!r})",
             "from fastapi.testclient import TestClient", "from tests.test_web import FakeDeepSeek, TOKEN",
-            "from tests.test_cv import FakePrinter", "from tests.test_cv_import import minimal_pdf", "from web import create_app",
+            "from tests.test_cv import FakePrinter", "from tests.test_cv_import import minimal_pdf", "from feiran.web import create_app",
             "chat = FakeDeepSeek({'fact-intern-api': 'For an internal tool, built REST APIs.'})",
             f"app = create_app(facts_db=Path({str(self.database)!r}), jobs_root=Path({str(Path(self.directory.name) / 'jobs')!r}),"
             f" token=TOKEN, profile_path=Path({str(self.profile_path)!r}), chat=chat, printer=FakePrinter(), starter=[])",
@@ -1164,7 +1164,7 @@ def upload_and_save():
             real_write(path, data)
 
         client = TestClient(self.app, base_url="http://127.0.0.1:8765", raise_server_exceptions=False)
-        with patch("web.write_atomically", disk_full):
+        with patch("feiran.web.write_atomically", disk_full):
             refused = client.post(save, headers=self.headers, json=body)
         self.assertEqual(refused.status_code, 500)
         notices = self.job(job_id)["interrupted_operations"]
@@ -1261,7 +1261,7 @@ def upload_and_save():
             real_write(path, data)
 
         unfinished = self.profile_path.parent / "unfinished"
-        with patch("web.write_atomically", held_write), TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(1) as pool:
+        with patch("feiran.web.write_atomically", held_write), TestClient(self.app, base_url="http://127.0.0.1:8765") as client, ThreadPoolExecutor(1) as pool:
             try:
                 saving = pool.submit(client.post, save, headers=self.headers, json=body)
                 self.assertTrue(gate.arrived.acquire(timeout=5))
@@ -1723,7 +1723,7 @@ class ServerSettingsTests(unittest.TestCase):
         # Logging is set up for the whole process when the server starts; not in a test run.
         said, complained = io.StringIO(), io.StringIO()
         with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch.dict(os.environ, {}, clear=True), \
-                patch("web.logging.basicConfig"), redirect_stdout(said), redirect_stderr(complained):
+                patch("feiran.web.logging.basicConfig"), redirect_stdout(said), redirect_stderr(complained):
             self.assertEqual(main(["--data", directory, "--require-data"]), 2)
             run.assert_not_called()
             self.assertIn(DATA_MARKER, complained.getvalue())  # says why, not only that it stopped
@@ -1734,7 +1734,7 @@ class ServerSettingsTests(unittest.TestCase):
 
     def test_in_a_container_every_line_is_json_from_the_first(self):
         with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, \
-                patch("web.run_log.configure") as configure, patch("web.logging.basicConfig") as plain:
+                patch("feiran.web.run_log.configure") as configure, patch("feiran.web.logging.basicConfig") as plain:
             with self.assertLogs("workbench", level="ERROR") as refused:
                 self.assertEqual(main(["--data", directory, "--require-data", "--json-logs"]), 2)
             self.assertIn(DATA_MARKER, refused.records[0].fields["reason"])  # the refusal, as an event
@@ -1748,8 +1748,8 @@ class ServerSettingsTests(unittest.TestCase):
         def broken(*args, **kwargs):
             raise RuntimeError("Alex Example, Acme Corporation")  # say, a damaged database quoting a fact
 
-        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("web.run_log.configure"), \
-                patch("web.create_app", broken), self.assertLogs("workbench", level="ERROR") as logs:
+        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("feiran.web.run_log.configure"), \
+                patch("feiran.web.create_app", broken), self.assertLogs("workbench", level="ERROR") as logs:
             self.assertEqual(main(["--data", directory, "--json-logs"]), 1)
         run.assert_not_called()
         [line] = [json.loads(run_log.JsonLines().format(record)) for record in logs.records]
@@ -1757,7 +1757,7 @@ class ServerSettingsTests(unittest.TestCase):
         self.assertNotIn("Alex", json.dumps(line))
 
     def test_data_a_newer_release_has_used_is_refused_wherever_the_options_put_it(self):
-        from workspace import DATA_FORMAT, DATA_FORMAT_FILE
+        from feiran.workspace import DATA_FORMAT, DATA_FORMAT_FILE
         with tempfile.TemporaryDirectory() as newer, tempfile.TemporaryDirectory() as other, \
                 patch.object(web_module.Workspace, "recover") as recover:
             (Path(newer) / DATA_FORMAT_FILE).write_text(f"{DATA_FORMAT + 1}\n", encoding="utf-8")
@@ -1769,8 +1769,8 @@ class ServerSettingsTests(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in Path(other).iterdir()), [])  # nothing written either
 
     def test_data_a_newer_release_has_used_is_never_opened(self):
-        from workspace import DATA_FORMAT, DATA_FORMAT_FILE
-        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("web.run_log.configure"), \
+        from feiran.workspace import DATA_FORMAT, DATA_FORMAT_FILE
+        with tempfile.TemporaryDirectory() as directory, patch("uvicorn.run") as run, patch("feiran.web.run_log.configure"), \
                 self.assertLogs("workbench", level="ERROR") as logs:
             (Path(directory) / DATA_FORMAT_FILE).write_text(f"{DATA_FORMAT + 1}\n", encoding="utf-8")
             self.assertEqual(main(["--data", directory, "--json-logs"]), 2)

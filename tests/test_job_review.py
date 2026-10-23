@@ -4,15 +4,15 @@ import unittest
 from datetime import timedelta
 from unittest.mock import Mock, patch
 
-import tenant_store
-from job_review import build_job_review
-from listings import ListingsError, group_postings
-from task_runner import TaskContext
+from feiran import tenant_store
+from feiran.job_review import build_job_review
+from feiran.listings import ListingsError, group_postings
+from feiran.task_runner import TaskContext
 from tests.test_task_runner import RunnerCase
 from tests.test_web_v2 import V2Case, JD_TEXT
 from tests.test_listings import posting
-from sponsorship import assess_sponsorship, shown
-from tenant_store import UserWorkspace
+from feiran.sponsorship import assess_sponsorship, shown
+from feiran.tenant_store import UserWorkspace
 
 
 def answered(row):

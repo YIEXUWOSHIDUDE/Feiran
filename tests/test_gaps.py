@@ -3,13 +3,13 @@ import json
 import tempfile
 import unittest
 
-from cv import build_draft, tailor_draft
-from cv_plan import plan_draft, set_change
-from deepseek_client import DeepSeekError
-from facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
-from gaps import (suggest_gap, EVIDENCE_RULES, SUGGEST_RULES, accept_gap, addition, check_state, coverage, decline_gap,
+from feiran.cv import build_draft, tailor_draft
+from feiran.cv_plan import plan_draft, set_change
+from feiran.deepseek_client import DeepSeekError
+from feiran.facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
+from feiran.gaps import (suggest_gap, EVIDENCE_RULES, SUGGEST_RULES, accept_gap, addition, check_state, coverage, decline_gap,
                   find_gaps, places, suggestion_target, write_line)
-from requirement_flow import apply_requirement_decisions, propose_requirements
+from feiran.requirement_flow import apply_requirement_decisions, propose_requirements
 from tests.test_cv import FACTS, PROFILE, FakeChat, make_store, stand_ins_for, swap_ids
 from tests.test_cv_plan import FakePlanner
 

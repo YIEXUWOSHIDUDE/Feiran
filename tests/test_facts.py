@@ -6,7 +6,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from facts import (
+from feiran.facts import (
     FactStoreError,
     add_fact,
     confirm_fact,

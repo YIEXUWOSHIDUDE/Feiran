@@ -39,8 +39,8 @@ if [ -e "$WORKBENCH_DATA_DIR/.workbench-format" ]; then
     fi
 fi
 case "$format" in
-    1) backup_tool=backup.py ;;
-    2) backup_tool=v2_backup.py ;;
+    1) backup_tool=(-m feiran.backup) ;;
+    2) backup_tool=(-m feiran.v2_backup) ;;
     *) echo "refused: unknown data format $format" >&2; exit 1 ;;
 esac
 spool=$state/backups
@@ -107,7 +107,7 @@ fi
 created=0
 docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
     -e WORKBENCH_REVISION "${create_mounts[@]}" -v "$spool:/backups" \
-    "$WORKBENCH_IMAGE" python "$backup_tool" create --data /data --out "/backups/$name" || created=$?
+    "$WORKBENCH_IMAGE" python "${backup_tool[@]}" create --data /data --out "/backups/$name" || created=$?
 if [ -n "$source_copy" ]; then rm -rf "$source_copy"; source_copy=""; fi
 restart_needed=0
 start_again
@@ -117,7 +117,7 @@ check=$state/backup-check-$stamp
 in_image() {
     docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
         -v "$spool:/backups:ro" -v "$check:/check" -v "$WORKBENCH_DATA_DIR:/data:ro" \
-        "$WORKBENCH_IMAGE" python "$backup_tool" "$@"
+        "$WORKBENCH_IMAGE" python "${backup_tool[@]}" "$@"
 }
 restore_args=(restore --archive "/backups/$name" --into /check/data)
 if [ "$format" = 2 ]; then

@@ -81,24 +81,45 @@ case "$1" in
         spool=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/backups$|\1|p')
         volume=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/volume$|\1|p')
         check=$(printf '%s\n' "$@" | sed -n 's|^\(.*\):/check$|\1|p')
-        # Per release (a or b, the digest's first letter): FAKE_FORMAT_b=2, FAKE_PROBLEMS_b='"x"'.
+        # Per release (a or b, the digest's first letter): FAKE_FORMAT_b=2, FAKE_PROBLEMS_b='"x"';
+        # FAKE_LAYOUT_a=root: a release from before the feiran package (none: neither layout).
         release=$(printf '%s\n' "$@" | sed -n 's/.*@sha256:\(.\).*/\1/p' | head -1)
-        format=FAKE_FORMAT_$release problems=FAKE_PROBLEMS_$release
-        case " $* " in
-            *" --entrypoint python "*) echo "${!format:-1}" ;;
-            *" backup.py verify --data /data "*)
+        format=FAKE_FORMAT_$release problems=FAKE_PROBLEMS_$release layout=FAKE_LAYOUT_$release
+        layout=${!layout:-package}
+        command=" $* "
+        # Each release runs only its own layout, as Python would: -m feiran.<tool> in one with the
+        # package, <tool>.py in one from before it.
+        case "$command" in
+            *" --entrypoint python "*)
+                code=${!#}
+                if [[ "$code" == *feiran/__init__.py* ]]; then  # which layout it has
+                    case "$layout" in package | root) echo "$layout" ;; *) echo ;; esac
+                    exit 0
+                fi
+                if [ "$layout" = package ]; then expected='from feiran import '; else expected='import '; fi
+                [[ "$code" == "$expected"* ]] || { echo "ModuleNotFoundError in a $layout release: $code" >&2; exit 1; }
+                echo "${!format:-1}"; exit 0 ;;
+            *" python -m feiran."*)
+                [ "$layout" = package ] || { echo "No module named feiran in a $layout release" >&2; exit 1; }
+                command=${command/ python -m feiran./ python } ;;
+            *" python "*".py "*)
+                [ "$layout" = root ] || { echo "no such file in a $layout release" >&2; exit 1; }
+                command=${command/.py / } ;;
+        esac
+        case "$command" in
+            *" python backup verify --data /data "*)
                 echo "verify by $release while $(cat "$UNIT_STATE")" >> "$CALLS"
                 printf '{"counts": {}, "problems": [%s], "notes": []}\n' "${!problems:-}"
                 [ -z "${!problems:-}" ] || exit 1 ;;
-            *" backup.py create "*)
+            *" python backup create "*)
                 [ "${FAKE_CREATE_FAILS:-0}" = 0 ] || exit 1
                 touch "$spool/$(basename "${!#}")"
                 [ "${FAKE_DATA_PROBLEMS:-0}" = 0 ] || exit 1 ;;
-            *" backup.py restore "*)
+            *" python backup restore "*)
                 into=${!#}
                 case "$into" in /check/*) into=$check/${into#/check/} ;; *) into=$volume/${into#/volume/} ;; esac
                 mkdir -p "$into" && echo restored > "$into/facts" ;;
-            *" backup.py verify "*) [ "${FAKE_VERIFY_FAILS:-0}" = 0 ] || exit 1 ;;
+            *" python backup verify "*) [ "${FAKE_VERIFY_FAILS:-0}" = 0 ] || exit 1 ;;
         esac ;;
     image)
         if [ "$2" = ls ] && [ -n "${FAKE_IMAGES:-}" ]; then
@@ -148,8 +169,8 @@ echo "ok   fetch-secret: the named secret, or none; never printed; an empty one 
 # backup.sh
 host_env active
 "$host/backup.sh" > /dev/null
-[ "$(order 'mount-data\|systemctl stop workbench.service\|backup.py create\|systemctl start workbench.service\|backup.py restore\|backup.py verify\|aws s3 cp')" \
-    = "mount-data|systemctl stop workbench.service|backup.py create|systemctl start workbench.service|backup.py restore|backup.py verify|aws s3 cp|" ] \
+[ "$(order 'mount-data\|systemctl stop workbench.service\|feiran.backup create\|systemctl start workbench.service\|feiran.backup restore\|feiran.backup verify\|aws s3 cp')" \
+    = "mount-data|systemctl stop workbench.service|feiran.backup create|systemctl start workbench.service|feiran.backup restore|feiran.backup verify|aws s3 cp|" ] \
     || fail "not: mount checked, stopped, packed, started again, restored and verified, uploaded"
 called "s3://test-bucket/backups/workbench-" || fail "not uploaded under backups/"
 [ -e "$work/state/last-backup" ] || fail "a backup that worked was not recorded"
@@ -177,7 +198,7 @@ for broken in FAKE_CREATE_FAILS FAKE_DATA_PROBLEMS FAKE_VERIFY_FAILS FAKE_S3_FAI
 done
 host_env active
 FAKE_FREE_KB=1 "$host/backup.sh" > /dev/null 2>&1 || true
-called "backup.py restore" && fail "restored a backup to check it on a disk without room for it"
+called "feiran.backup restore" && fail "restored a backup to check it on a disk without room for it"
 called "aws s3 cp" || fail "a backup that could not be checked was not uploaded (it is still the best copy)"
 host_env active
 FAKE_CREATE_FAILS=1 "$host/backup.sh" > /dev/null 2>&1 || true
@@ -192,8 +213,8 @@ echo "ok   backup: only on the volume; stopped even while starting, started agai
 echo current > "$work/volume/data/facts"
 host_env active
 "$host/restore.sh" latest > /dev/null
-[ "$(order 'mount-data\|aws s3api list-objects-v2\|aws s3 cp\|backup.py restore\|backup.py verify\|systemctl stop workbench.service\|systemctl start workbench.service')" \
-    = "mount-data|aws s3api list-objects-v2|aws s3 cp|backup.py restore|backup.py verify|systemctl stop workbench.service|systemctl start workbench.service|" ] \
+[ "$(order 'mount-data\|aws s3api list-objects-v2\|aws s3 cp\|feiran.backup restore\|feiran.backup verify\|systemctl stop workbench.service\|systemctl start workbench.service')" \
+    = "mount-data|aws s3api list-objects-v2|aws s3 cp|feiran.backup restore|feiran.backup verify|systemctl stop workbench.service|systemctl start workbench.service|" ] \
     || fail "not: mount checked, downloaded, restored, checked, then swapped with the workbench stopped"
 called "s3://test-bucket/backups/workbench-20261001T033000Z.tar.gz" || fail "the latest backup was not the one restored"
 [ "$(cat "$work/volume/data/facts")" = restored ] || fail "the restored data is not in place"
@@ -348,4 +369,31 @@ if "$host/install.sh" "$image" > /dev/null 2>&1; then fail "a release older than
 [ "$(running)" = "$image_c" ] || fail "refusing an older release changed the running one"
 called "systemctl stop" && fail "the workbench was stopped for a release that was refused"
 echo "ok   install: the data's format only goes forward; raising it needs a fresh backup and is never undone automatically"
+
+# install.sh across the move into the feiran package: release a is from before it (modules at the
+# top of /app), b has it. Each runs its own layout, also when the install goes back to a.
+rm -rf "$work/home" "$work/state" "$work/units" "$work/volume/data"
+mkdir -p "$work/home" "$work/state" "$work/units" "$work/volume/data"
+host_env active
+FAKE_LAYOUT_a=root "$host/install.sh" "$image" > /dev/null || fail "a release from before the package was not installed"
+called "$image -c import workspace; print(workspace.DATA_FORMAT)" || fail "an old release's format was not read its own way"
+called "$image python backup.py verify --data /data" || fail "an old release did not check the data its own way"
+: > "$calls"
+if FAKE_LAYOUT_a=root FAKE_UNHEALTHY=b HEALTH_WAIT_ATTEMPTS=2 HEALTH_WAIT_SECONDS=0 \
+        "$host/install.sh" "$image_b" > "$work/out" 2>&1; then
+    fail "a release that did not answer was installed"
+fi
+called "$image python backup.py verify --data /data" || fail "the last good (old) release did not check the data its own way"
+called "$image_b python -m feiran.backup verify --data /data" || fail "the new release did not check the data with its package"
+called "$image -c import workspace; print(workspace.DATA_FORMAT)" || fail "going back did not run the old release its own way"
+grep -q "could not be installed either" "$work/out" && fail "going back to the release from before the package failed"
+[ "$(running)" = "$image" ] || fail "the release from before the package was not put back"
+[ "$(unit_state)" = active ] || fail "the old release put back is not running"
+FAKE_LAYOUT_a=root "$host/install.sh" "$image_b" > /dev/null || fail "upgrading from a release before the package failed"
+[ "$(running)" = "$image_b" ] || fail "the release with the package was not switched to"
+: > "$calls"
+if FAKE_LAYOUT_c=none "$host/install.sh" "$image_c" > /dev/null 2>&1; then fail "a release with neither layout was installed"; fi
+called "systemctl stop" && fail "the workbench was stopped for a release with neither layout"
+[ "$(running)" = "$image_b" ] || fail "a release with neither layout changed the running one"
+echo "ok   install: old and new layouts each run their own way, upgrading and going back; neither layout refused"
 echo "host scripts: all checks passed"

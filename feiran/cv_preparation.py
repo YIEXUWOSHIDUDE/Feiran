@@ -8,9 +8,9 @@ from dataclasses import dataclass
 import time
 from typing import Callable, Iterator
 
-from cv import CVError
-from cv_edit import carry_over
-from cv_status import adjusted, reworded, stage_failure
+from feiran.cv import CVError
+from feiran.cv_edit import carry_over
+from feiran.cv_status import adjusted, reworded, stage_failure
 
 
 @dataclass

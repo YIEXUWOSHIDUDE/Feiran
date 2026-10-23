@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.routing import Match
 from pydantic import BaseModel
 
-from cv import (
+from feiran.cv import (
     CVError,
     _profile_hash,
     verify_draft,
@@ -48,9 +48,9 @@ from cv import (
     rewritten_lines,
     tailor_draft,
 )
-from cv_fit import fit_outcome
-from cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, structure_cv
-from cv_status import (
+from feiran.cv_fit import fit_outcome
+from feiran.cv_import import MAX_PDF_BYTES, CVImportError, build_profile, read_pdf, structure_cv
+from feiran.cv_status import (
     CANDIDATE_FIELDS,
     REASONS,
     STAGES,
@@ -63,8 +63,8 @@ from cv_status import (
     stage_entry as _stage,
     stage_failure as _stage_failure,
 )
-from cv_preparation import prepare_steps
-from cv_edit import (
+from feiran.cv_preparation import prepare_steps
+from feiran.cv_edit import (
     StaleEdit,
     adopt_for,
     already_saved,
@@ -80,12 +80,12 @@ from cv_edit import (
     with_adoptions,
     without_edits,
 )
-from cv_plan import plan_draft, set_change
-from deepseek_client import DeepSeekError, chat_json
-from facts import (DEFAULT_DATABASE, FactStoreError, confirm_facts, fact_source, import_facts, list_facts,
+from feiran.cv_plan import plan_draft, set_change
+from feiran.deepseek_client import DeepSeekError, chat_json
+from feiran.facts import (DEFAULT_DATABASE, FactStoreError, confirm_facts, fact_source, import_facts, list_facts,
                    parse_fact_refs, revise_fact)
-from gaps import _gap, coverage, decline_gap, find_gaps, suggest_gap, unusable
-from job_search import (
+from feiran.gaps import _gap, coverage, decline_gap, find_gaps, suggest_gap, unusable
+from feiran.job_search import (
     SearchError,
     fetch_board,
     fetch_selected,
@@ -94,9 +94,9 @@ from job_search import (
     prepare_pasted_jd,
     prepare_review_input,
 )
-from job_review import build_job_review
-from job_url import fetch_job_url, normalize_url
-from listings import (
+from feiran.job_review import build_job_review
+from feiran.job_url import fetch_job_url, normalize_url
+from feiran.listings import (
     ListingsError,
     add_source,
     get_listing,
@@ -107,19 +107,19 @@ from listings import (
     refresh_source,
     remove_source,
 )
-from matching import MatchingError, apply_match_decisions, first_candidates, propose_matches
-from privacy import private_terms
-from public_access import OwnerAccess
-from requirement_flow import (
+from feiran.matching import MatchingError, apply_match_decisions, first_candidates, propose_matches
+from feiran.privacy import private_terms
+from feiran.public_access import OwnerAccess
+from feiran.requirement_flow import (
     RequirementError,
     add_manual_requirements,
     apply_requirement_decisions,
     propose_requirements,
 )
-from review import build_report
-import run_log
-from sponsorship import assess_sponsorship
-from workspace import (
+from feiran.review import build_report
+from feiran import run_log
+from feiran.sponsorship import assess_sponsorship
+from feiran.workspace import (
     DEFAULT_ROOT,
     JOB_ID,
     DataFormatError,
@@ -133,7 +133,7 @@ from workspace import (
 )
 
 
-WEB_DIR = Path(__file__).parent / "web"
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 DEFAULT_PROFILE = Path(".local/cv-profile.json")
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 # Written once into the data volume when it is set up. With --require-data the app starts only

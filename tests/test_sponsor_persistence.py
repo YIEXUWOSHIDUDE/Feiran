@@ -19,21 +19,21 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-import listings
-import sponsorship
-import tenant_store
-import v2_admin
-import v2_backup
-import web
-from identity import Identity, OIDCSettings
-from tenant_store import UserWorkspace
+from feiran import listings
+from feiran import sponsorship
+from feiran import tenant_store
+from feiran import v2_admin
+from feiran import v2_backup
+from feiran import web
+from feiran.identity import Identity, OIDCSettings
+from feiran.tenant_store import UserWorkspace
 from tests.fake_identity import CLIENT_ID, DOMAIN, ISSUER, ORIGIN
 from tests.test_cv import FakePrinter
 from tests.test_listings import FakeBoards, posting
 from tests.test_web import PROFILE, TOKEN, FakeDeepSeek
 from tests.test_web_v2 import HOST, JD_TEXT, V2Case
-from v2_flow import make_handlers
-from web_v2 import V2Settings, create_v2_app
+from feiran.v2_flow import make_handlers
+from feiran.web_v2 import V2Settings, create_v2_app
 
 REAL = sponsorship.assess_sponsorship
 SUPPORTED = "Requirements:\n- Python and SQL\nWe provide visa sponsorship."

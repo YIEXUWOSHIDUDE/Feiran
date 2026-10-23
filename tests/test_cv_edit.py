@@ -2,13 +2,13 @@ import copy
 import tempfile
 import unittest
 
-from cv import CVError, approve_draft, build_draft, content_fingerprint, tailor_draft, verify_draft
-from cv_edit import (LOCAL_PREFIX, EditError, StaleEdit, add_line, adopt, adopted_sources, adoptions, carry_over,
+from feiran.cv import CVError, approve_draft, build_draft, content_fingerprint, tailor_draft, verify_draft
+from feiran.cv_edit import (LOCAL_PREFIX, EditError, StaleEdit, add_line, adopt, adopted_sources, adoptions, carry_over,
                      change_line, edits_view, lines_view, mark_saved, profile_with_line, save_target, set_edit,
                      shown_text, without_edits)
-from cv_layout import shown_sections
-from cv_plan import plan_draft, set_change
-from gaps import _entry_key
+from feiran.cv_layout import shown_sections
+from feiran.cv_plan import plan_draft, set_change
+from feiran.gaps import _entry_key
 from tests.test_cv import PROFILE, FakeChat, make_store
 from tests.test_cv_plan import CUT_API, FakePlanner
 from tests.test_gaps import decided_job

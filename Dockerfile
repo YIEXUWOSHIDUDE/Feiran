@@ -34,4 +34,4 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python", "-c", "import sys, urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=4).status != 200)"]
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python", "web.py"]
+CMD ["python", "-m", "feiran.web"]

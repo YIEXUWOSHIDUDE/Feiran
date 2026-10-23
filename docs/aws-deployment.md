@@ -256,12 +256,12 @@ and the security group lets nothing in.
 ## 6. A first run with synthetic data
 
 Before any real data goes to AWS, check persistence and recovery with the synthetic run
-(`deploy/smoke.py`: a synthetic CV, facts, a job, an approved CV, English and Chinese PDFs printed by
-Chromium in the container). It refuses a folder with anything real in it.
+(`python -m deploy.smoke`: a synthetic CV, facts, a job, an approved CV, English and Chinese PDFs
+printed by Chromium in the container). It refuses a folder with anything real in it.
 
 ```sh
 SMOKE="cd /opt/workbench/current && set -a && . /etc/workbench/env && . /etc/workbench/release && set +a && \
-  docker compose -f compose.yaml -f deploy/aws/compose.aws.yaml run --rm --no-deps workbench python deploy/smoke.py"
+  docker compose -f compose.yaml -f deploy/aws/compose.aws.yaml run --rm --no-deps workbench python -m deploy.smoke"
 run_on_host "systemctl stop workbench && { $SMOKE create --data /data --out /data/smoke; ran=\$?; systemctl start workbench; exit \$ran; }"
 ```
 
@@ -282,7 +282,7 @@ Only after every check in step 6 passes. On your Mac, with the workbench stopped
 
 ```sh
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-.venv/bin/python backup.py create --data .local --out "$HOME/workbench-$STAMP.tar.gz" --revision "$(git rev-parse HEAD)"
+.venv/bin/python -m feiran.backup create --data .local --out "$HOME/workbench-$STAMP.tar.gz" --revision "$(git rev-parse HEAD)"
 BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK" \
   --query "Stacks[0].Outputs[?OutputKey=='BackupBucketName'].OutputValue" --output text)
 aws s3 cp "$HOME/workbench-$STAMP.tar.gz" "s3://$BUCKET/backups/workbench-$STAMP.tar.gz"
@@ -306,8 +306,10 @@ then:
 1. checks that the data volume itself is mounted, then refuses a release whose data format is older
    than the data's, before anything is stopped (see the data format below);
 2. stops the workbench (and refuses if it does not stop), so the data cannot change in between, and
-   runs two read-only checks of the data (`backup.py verify`): the new release's and the last good
-   release's. If the new one finds a problem the last good one does not, nothing is switched, the
+   runs two read-only checks of the data (the backup tool's `verify`): the new release's and the
+   last good release's, each started the way that release lays out its code (`python -m
+   feiran.backup` from the `feiran` package, `python backup.py` in releases from before it).
+   If the new one finds a problem the last good one does not, nothing is switched, the
    workbench starts again as it was, and the run fails. It also starts again if the install fails
    or is stopped before switching;
 3. switches to the new release and waits up to two minutes for it to start and answer. If it does

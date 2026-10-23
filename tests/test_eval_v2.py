@@ -5,8 +5,8 @@ import io
 import json
 import unittest
 
-import eval_v2
-from gaps import EVIDENCE_RULES
+from feiran import eval_v2
+from feiran.gaps import EVIDENCE_RULES
 
 
 class OfflineGateTests(unittest.TestCase):

@@ -22,11 +22,11 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-import run_log
-import tenant_store
-from deepseek_client import MAX_TOKENS, CallRefused, chat_json, estimate_prompt_tokens
-from tenant_store import LateResult, NotFound, Refused, StoreError, UserWorkspace
-from v2_flow import TaskFailed
+from feiran import run_log
+from feiran import tenant_store
+from feiran.deepseek_client import MAX_TOKENS, CallRefused, chat_json, estimate_prompt_tokens
+from feiran.tenant_store import LateResult, NotFound, Refused, StoreError, UserWorkspace
+from feiran.v2_flow import TaskFailed
 
 
 log = logging.getLogger("workbench.tasks")

@@ -16,11 +16,11 @@ from html import escape
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from cv_layout import shown_sections
-from deepseek_client import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, DeepSeekError, chat_json
-from facts import DEFAULT_DATABASE, FactStoreError, fact_source
-from privacy import mask, private_terms, stand_ins
-from review import build_report
+from feiran.cv_layout import shown_sections
+from feiran.deepseek_client import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, DeepSeekError, chat_json
+from feiran.facts import DEFAULT_DATABASE, FactStoreError, fact_source
+from feiran.privacy import mask, private_terms, stand_ins
+from feiran.review import build_report
 
 
 PROFILE_VERSION = 1
@@ -890,7 +890,7 @@ def main(argv: list[str] | None = None) -> int:
                 "paper": draft["paper"],
                 "fact_count": len(draft["facts"]),
                 "language_fallbacks": draft["language_fallbacks"],
-                "next_step": "运行 cv.py pdf 生成带草稿水印的 PDF 并逐行检查",
+                "next_step": "运行 python -m feiran.cv pdf 生成带草稿水印的 PDF 并逐行检查",
             }
         elif args.action == "tailor":
             job = _read_json(args.job) if args.job else None
@@ -907,7 +907,7 @@ def main(argv: list[str] | None = None) -> int:
                 "rejected": tailored["tailoring"]["rejected"],
                 "rejected_lines": rejected_lines(tailored),
                 "rewritten_lines": rewritten_lines(tailored),
-                "next_step": "运行 cv.py pdf 生成 PDF，并逐行核对改写后的内容",
+                "next_step": "运行 python -m feiran.cv pdf 生成 PDF，并逐行核对改写后的内容",
             }
         elif args.action == "approve":
             approved = approve_draft(_read_json(args.draft), args.facts_db)
@@ -921,7 +921,7 @@ def main(argv: list[str] | None = None) -> int:
                     len(entry["lines"]) for section in approved["sections"] for entry in section["entries"]
                 ),
                 "rewritten_lines": rewritten_lines(approved),
-                "next_step": "运行 cv.py pdf 生成无水印的最终 PDF；内容或事实变化后需重新批准",
+                "next_step": "运行 python -m feiran.cv pdf 生成无水印的最终 PDF；内容或事实变化后需重新批准",
             }
         else:
             summary = export_pdf(

@@ -1,7 +1,7 @@
 """B6 evaluation on synthetic, hand-labelled samples (examples/v2_eval_samples.json).
 
-    python eval_v2.py offline       # candidate content format checks; no model
-    python eval_v2.py live --max-calls 9 --confirm-paid --out report.json   # paid; needs authorization
+    python -m feiran.eval_v2 offline       # candidate content format checks; no model
+    python -m feiran.eval_v2 live --max-calls 9 --confirm-paid --out report.json   # paid; needs authorization
 
 ``offline`` checks that candidate content is usable as a CV line. Source text and old
 truthfulness labels do not limit skills, numbers, responsibility or other content suggestions.
@@ -21,9 +21,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from cv import _valid_line
+from feiran.cv import _valid_line
 
-SAMPLES = Path(__file__).parent / "examples" / "v2_eval_samples.json"
+SAMPLES = Path(__file__).resolve().parent.parent / "examples" / "v2_eval_samples.json"
 MAX_LIVE_CALLS = 100
 GENERIC_WORDS = {"with", "experience", "years", "year", "proficiency", "knowledge", "familiarity", "strong",
                  "hands", "ability", "skills", "writing"}
@@ -66,8 +66,8 @@ class EvidenceOnly:
         self.models: set[str] = set()
 
     def __call__(self, messages: list[dict[str, str]], model: str, effort: str) -> dict[str, Any]:
-        from deepseek_client import DeepSeekError
-        from gaps import EVIDENCE_RULES
+        from feiran.deepseek_client import DeepSeekError
+        from feiran.gaps import EVIDENCE_RULES
         if messages[0]["content"] != EVIDENCE_RULES:
             raise DeepSeekError("not part of this evaluation", reason="request_failed")
         if self.calls >= self.limit:
@@ -84,7 +84,7 @@ class EvidenceOnly:
 
 def evidence_case(case: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], Any]:
     """One requirement and a one-entry CV for an evidence sample, shaped as the app builds them."""
-    from tenant_store import FactSnapshot
+    from feiran.tenant_store import FactSnapshot
     facts = [{"id": f"fact-eval-{number}", "version": 1, "text": line, "fact_type": "experience", "tags": [],
               "status": "confirmed"} for number, line in enumerate(case["lines"], 1)]
     cv = {"language": "zh" if re.search(r"[一-鿿]", case["requirement"]) else "en",
@@ -109,8 +109,8 @@ def baseline(case: dict[str, Any]) -> str:
 
 def live(samples: dict[str, Any], limit: int, chat: Callable[..., dict[str, Any]]) -> dict[str, Any]:
     """The evidence samples judged by the model; costs money with the real client."""
-    from deepseek_client import DEFAULT_MODEL
-    from gaps import EVIDENCE_RULES, find_gaps
+    from feiran.deepseek_client import DEFAULT_MODEL
+    from feiran.gaps import EVIDENCE_RULES, find_gaps
     limited = EvidenceOnly(chat, limit)
     rows = []
     for case in samples["evidence"]:
@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refused: a live run sends the synthetic samples to DeepSeek and is billed; it needs an authorized "
               f"budget, --confirm-paid and --max-calls from 1 to {MAX_LIVE_CALLS}", file=sys.stderr)
         return 2
-    from deepseek_client import chat_json
+    from feiran.deepseek_client import chat_json
     report = live(samples, args.max_calls, chat_json)
     args.out.write_text(json.dumps(report, indent=1, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "rows"}, indent=1, ensure_ascii=False))

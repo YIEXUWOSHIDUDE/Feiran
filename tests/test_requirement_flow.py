@@ -6,8 +6,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from deepseek_client import DeepSeekError
-from requirement_flow import (
+from feiran.deepseek_client import DeepSeekError
+from feiran.requirement_flow import (
     RequirementError,
     add_manual_requirements,
     apply_requirement_decisions,
@@ -17,8 +17,8 @@ from requirement_flow import (
     main,
     propose_requirements,
 )
-from review import build_report
-from typesafe_classifier import TypeSafeError
+from feiran.review import build_report
+from feiran.typesafe_classifier import TypeSafeError
 
 
 JD_TEXT = """About the role
@@ -475,7 +475,7 @@ Benefits: Health insurance and a laptop
             input_path = Path(directory) / "review-input.json"
             output_path = Path(directory) / "candidates.json"
             input_path.write_text(json.dumps(review_input()), encoding="utf-8")
-            with patch("requirement_flow.classify_requirement_candidates", side_effect=classify):
+            with patch("feiran.requirement_flow.classify_requirement_candidates", side_effect=classify):
                 with redirect_stdout(io.StringIO()):
                     exit_code = main([
                         "propose", str(input_path), "--typesafe", "--output", str(output_path)
@@ -491,7 +491,7 @@ Benefits: Health insurance and a laptop
             output_path = Path(directory) / "candidates.json"
             input_path.write_text(json.dumps(review_input()), encoding="utf-8")
             with patch(
-                "requirement_flow.classify_requirement_candidates",
+                "feiran.requirement_flow.classify_requirement_candidates",
                 side_effect=TypeSafeError("service unavailable"),
             ):
                 with redirect_stderr(io.StringIO()):

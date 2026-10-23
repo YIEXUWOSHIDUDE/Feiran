@@ -7,7 +7,7 @@
 # first: if it stops between the renames, the next start of the workbench puts the old data back
 # (mount-data.sh). The data it replaces is kept beside it as data.before-<time>, never deleted;
 # the workbench is started again if it was running or starting. A backup made on a laptop
-# (backup.py create --data .local) restores the same way. Backups, restores and installs run one
+# (python -m feiran.backup create --data .local) restores the same way. Backups, restores and installs run one
 # at a time.
 #
 #   restore.sh latest
@@ -41,8 +41,8 @@ if [ -e "$WORKBENCH_DATA_DIR/.workbench-format" ]; then
     fi
 fi
 case "$format" in
-    1) backup_tool=backup.py ;;
-    2) backup_tool=v2_backup.py ;;
+    1) backup_tool=(-m feiran.backup) ;;
+    2) backup_tool=(-m feiran.v2_backup) ;;
     *) echo "refused: unknown data format $format" >&2; exit 1 ;;
 esac
 if [ "$key" = latest ]; then
@@ -86,10 +86,10 @@ in_image() {
     if [ "$format" = 2 ]; then
         docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
             -v "$DATA_MOUNT/$work:/restore" -v "$WORKBENCH_DATA_DIR:/data:ro" \
-            "$WORKBENCH_IMAGE" python "$backup_tool" "$@"
+            "$WORKBENCH_IMAGE" python "${backup_tool[@]}" "$@"
     else
         docker run --rm --network none --read-only --tmpfs /tmp --security-opt no-new-privileges:true \
-            -v "$DATA_MOUNT:/volume" "$WORKBENCH_IMAGE" python "$backup_tool" "$@"
+            -v "$DATA_MOUNT:/volume" "$WORKBENCH_IMAGE" python "${backup_tool[@]}" "$@"
     fi
 }
 image_work=/volume/$work

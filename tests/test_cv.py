@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from cv import (
+from feiran.cv import (
     CVError,
     print_with_chrome,
     approve_draft,
@@ -21,7 +21,7 @@ from cv import (
     tailor_draft,
     verify_draft,
 )
-from facts import confirm_facts, import_facts, revise_fact
+from feiran.facts import confirm_facts, import_facts, revise_fact
 
 
 FACTS = [
@@ -475,7 +475,7 @@ class CVCommandLineTests(unittest.TestCase):
             database = make_store(directory)
             profile_path = root / "profile.json"
             profile_path.write_text(json.dumps(PROFILE, ensure_ascii=False), encoding="utf-8")
-            with patch("cv.print_with_chrome", FakePrinter()):
+            with patch("feiran.cv.print_with_chrome", FakePrinter()):
                 drafted = self.run_cli([
                     "draft", "--profile", profile_path, "--facts-db", database,
                     "--language", "zh", "--output", root / "draft.json",
@@ -496,7 +496,7 @@ class CVCommandLineTests(unittest.TestCase):
             (root / "draft.json").write_text(
                 json.dumps(build_draft(PROFILE, database, "en"), ensure_ascii=False), encoding="utf-8"
             )
-            with patch("cv.chat_json", chat):
+            with patch("feiran.cv.chat_json", chat):
                 summary = self.run_cli([
                     "tailor", root / "draft.json", "--facts-db", database,
                     "--output", root / "tailored.json",
@@ -513,7 +513,7 @@ class CVCommandLineTests(unittest.TestCase):
             database = make_store(directory)
             tailored = tailor_draft(build_draft(PROFILE, database, "en"), database, chat=chat)
             (root / "tailored.json").write_text(json.dumps(tailored, ensure_ascii=False), encoding="utf-8")
-            with patch("cv.print_with_chrome", FakePrinter()):
+            with patch("feiran.cv.print_with_chrome", FakePrinter()):
                 approved = self.run_cli([
                     "approve", root / "tailored.json", "--facts-db", database,
                     "--output", root / "approved.json",
@@ -537,7 +537,7 @@ class CVCommandLineTests(unittest.TestCase):
             items = json.loads((examples / "synthetic_cv_facts.json").read_text(encoding="utf-8"))["facts"]
             import_facts(database, items)
             confirm_facts(database, [(item["id"], 1) for item in items])
-            with patch("cv.print_with_chrome", FakePrinter()):
+            with patch("feiran.cv.print_with_chrome", FakePrinter()):
                 for language in ("en", "zh"):
                     self.run_cli([
                         "draft", "--profile", examples / "synthetic_cv_profile.json",

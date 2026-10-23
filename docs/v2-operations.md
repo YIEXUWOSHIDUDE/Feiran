@@ -11,7 +11,7 @@
 | G3 | 隔离演练环境 | 第二套 `workbench.yaml` + `public.yaml` 栈（EC2、EBS、S3、CloudFront）按时计费 | 新建隔离栈，或在约定窗口占用现有主机（会中断当前所有者服务） |
 | G4 | 在主机上安装 V2 发行版 | 改变运行中服务 | 发布授权；需先提交、推送并由 CI 构建镜像（G7） |
 | G5 | 迁移所有者真实资料 | 真实个人资料 | 所有者的 Cognito `sub`、停机窗口、迁移前 V1 备份保留期 |
-| G6 | 真实 DeepSeek 演练与 B6 有限评估 | 付费模型调用 | 预算与调用上限（`eval_v2.py live --max-calls`） |
+| G6 | 真实 DeepSeek 演练与 B6 有限评估 | 付费模型调用 | 预算与调用上限（`python -m feiran.eval_v2 live --max-calls`） |
 | G7 | 提交、推送、PR、CI、合并 | 远端仓库 | 用户 / Codex 决定 |
 
 ## 2. V2 主机流程
@@ -33,13 +33,13 @@
 
    脚本检查卷已挂载、服务已停止、数据为空或已是 V2，写入 V2 模式和 OIDC 设置，删除 V1 登录设置，设置 `WORKBENCH_BIND_ADDRESS=0.0.0.0`。`WORKBENCH_PUBLIC_HOST` 是源站私有 DNS；浏览器 CSRF 的 Origin 是 CloudFront HTTPS 地址。主机的入站仍由独立 CloudFront 栈限制。
 5. `fetch-secret.sh` 用主机角色向 Cognito 读取该应用客户端密钥，保存到 `/run/workbench/oidc_client_secret`（0400，容器 uid 10001）。不打印密钥、不把密钥作为参数，V2 不读取所有者 Basic 登录密钥；取不到密钥则配置失败。
-6. 使用现有 `workbench-release` 按镜像 digest 安装。安装器在 V2 模式读取 `web_v2.V2_DATA_FORMAT`，检查 V2 模块和配置。只有真正空的初始数据卷可跳过数据库完整性检查；已使用的 V2 卷必须通过 `v2_backup.py verify`：停服后将数据库、存在的 WAL/回滚日志与删除账本复制到 root 磁盘的私有可写目录，校验副本，原始数据保持只读。升级检查需预留源文件逻辑大小的两倍加 1 GiB；缺文件、链接、空间不足或仍在停服中都会拒绝。V1 数据必须先显式迁移。
+6. 使用现有 `workbench-release` 按镜像 digest 安装。安装器在 V2 模式读取 `feiran.web_v2.V2_DATA_FORMAT`（本次之前的发行版是根目录的 `web_v2`；安装器按每个镜像自己的代码布局调用），检查 V2 模块和配置。只有真正空的初始数据卷可跳过数据库完整性检查；已使用的 V2 卷必须通过 V2 备份工具的 `verify`（`python -m feiran.v2_backup verify`）：停服后将数据库、存在的 WAL/回滚日志与删除账本复制到 root 磁盘的私有可写目录，校验副本，原始数据保持只读。升级检查需预留源文件逻辑大小的两倍加 1 GiB；缺文件、链接、空间不足或仍在停服中都会拒绝。V1 数据必须先显式迁移。
 7. 安装成功需要同时满足：`GET /healthz` = 200；未登录 `GET /` = 303，跳往 `/login?return_to=/`；`GET /api/me` = 401。鉴权检查不通过则停止 V2，只有能安全读取当前数据的上一个发行版才可恢复；不会回到 V1 登录。
 8. 再按 §4 配置**最多两个**合成试运行账号，完成 §5 的真实登录及隔离检查后才扩大人数。初始不配置 DeepSeek secret，不迁移真实资料。
 
 ### 备份与恢复
 
-- `.workbench-format=2` 时，主机 `backup.sh` / `restore.sh` 使用 `v2_backup.py`。新空卷以显式 V2 模式选择 V2 恢复；已有格式与显式模式不一致时拒绝。
+- `.workbench-format=2` 时，主机 `backup.sh` / `restore.sh` 使用 V2 备份工具（`python -m feiran.v2_backup`）。新空卷以显式 V2 模式选择 V2 恢复；已有格式与显式模式不一致时拒绝。
 - 备份沿用短暂停服流程。V2 数据库及存在的 WAL/回滚日志、删除账本先复制到 root 磁盘的 0700 私有目录，文件为 0600；SQLite 在此可写副本重建辅助文件，原始数据始终只读。复制前需预留源文件逻辑大小的四倍加 1 GiB；不能只复制主库或用 `immutable=1` 忽略 WAL 中的提交。副本成功或失败均清理，归档后恢复原服务状态；只有临时恢复和校验均通过才更新“备份成功”时间。
 - V2 恢复在读取现行删除账本**之前**停止服务，覆盖停服过程中完成的删除，并一直保持停止直到目录交换结束；失败时保留原数据并恢复原服务状态。主机维护锁不能替代这个停服步骤，因为应用内删除账号不持有主机锁。
 - 恢复始终要求 `/data/deleted-accounts.jsonl`，不会自动使用 `--without-live-ledger`。新隔离恢复环境必须先从可信现行来源取得账本副本；缺失或损坏时停止恢复。
@@ -69,7 +69,7 @@ aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name feiran-v2
 在主机上对运行中的容器执行管理命令（输出只有内部 ID、Cognito `sub`、状态和数字，没有简历内容）：
 
 ```sh
-v2() { docker compose -f compose.yaml -f deploy/aws/compose.aws.yaml -f deploy/aws/compose.v2.yaml exec -T workbench python v2_admin.py --data /data "$@"; }
+v2() { docker compose -f compose.yaml -f deploy/aws/compose.aws.yaml -f deploy/aws/compose.v2.yaml exec -T workbench python -m feiran.v2_admin --data /data "$@"; }
 v2 settings
 v2 set user_daily_units 20      # 数字待预算决定，见下
 v2 set site_daily_units 600
@@ -109,10 +109,10 @@ v2 sponsorship --limit 500 --after <上一轮输出的 next>   # 从上一轮停
 
 1. 在 Cognito 邀请所有者并取得其 `sub`：`aws cognito-idp admin-get-user --user-pool-id … --username <所有者邮箱> --query "UserAttributes[?Name=='sub'].Value" --output text`。
 2. 停止 V1，执行现有 `backup.sh`，确认备份已校验，保留到 V2 验收结束。
-3. 预演（只写临时副本）：`python v2_migrate.py run --v1-data /data --v2-db /data/v2.db --owner-issuer <Issuer> --owner-subject <sub> --dry-run`，审阅报告里的计数、未迁移项（未保存的上传、未完成操作的提示、谈话要点匹配、各岗位历史目录）和“哪些批准未能保留”。
-4. 正式迁移：同一命令去掉 `--dry-run`，再 `python v2_backup.py verify --data /data`。V1 文件只读打开、保持原样。所有者已存在、日志未清（`-wal`/`-journal`）或格式不对时会拒绝并删除半成品。
+3. 预演（只写临时副本）：`python -m feiran.v2_migrate run --v1-data /data --v2-db /data/v2.db --owner-issuer <Issuer> --owner-subject <sub> --dry-run`，审阅报告里的计数、未迁移项（未保存的上传、未完成操作的提示、谈话要点匹配、各岗位历史目录）和“哪些批准未能保留”。
+4. 正式迁移：同一命令去掉 `--dry-run`，再 `python -m feiran.v2_backup verify --data /data`。V1 文件只读打开、保持原样。所有者已存在、日志未清（`-wal`/`-journal`）或格式不对时会拒绝并删除半成品。
 5. 启动 V2，所有者登录核对：事实与双语 profile 版本、岗位、材料链；只有仍完全成立的批准与其最终 PDF 被带过来，其余回到待审核。迁移从不补造批准或确认。
-6. 回退：`python v2_migrate.py rollback --data /data --backup-out /backups/v2-before-rollback.tar.gz`（先备份 V2 并移开，数据目录回到 V1 格式），再安装上一 V1 发行版。V2 期间新产生的资料保存在该备份里，不会被静默丢弃。
+6. 回退：`python -m feiran.v2_migrate rollback --data /data --backup-out /backups/v2-before-rollback.tar.gz`（先备份 V2 并移开，数据目录回到 V1 格式），再安装上一 V1 发行版。V2 期间新产生的资料保存在该备份里，不会被静默丢弃。
 
 ## 7. 日常运维
 

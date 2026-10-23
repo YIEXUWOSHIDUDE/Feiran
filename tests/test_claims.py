@@ -2,7 +2,7 @@
 
 import unittest
 
-from claims import check_rewrite
+from feiran.claims import check_rewrite
 
 
 API_FACT = (

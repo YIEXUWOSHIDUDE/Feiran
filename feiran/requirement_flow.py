@@ -9,9 +9,9 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from deepseek_client import DEFAULT_MODEL as DEEPSEEK_MODEL, DeepSeekError
-from review import build_report
-from typesafe_classifier import DEFAULT_MODEL, TypeSafeError, classify_requirement_candidates
+from feiran.deepseek_client import DEFAULT_MODEL as DEEPSEEK_MODEL, DeepSeekError
+from feiran.review import build_report
+from feiran.typesafe_classifier import DEFAULT_MODEL, TypeSafeError, classify_requirement_candidates
 
 
 EXTRACTION_METHOD = "section-lines-v3"
@@ -651,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
                 "saved_to": str(args.output),
                 "added": [{"id": item["id"], "text": item["text"]} for item in added],
                 "candidate_count": len(result["requirement_candidates"]),
-                "next_step": "运行 requirement_flow.py decide 确认或排除这些候选",
+                "next_step": "运行 python -m feiran.requirement_flow decide 确认或排除这些候选",
             }
         else:
             confirmations = _parse_confirmations(args.confirm)
@@ -660,7 +660,7 @@ def main(argv: list[str] | None = None) -> int:
                 "saved_to": str(args.output),
                 "decision_counts": result["requirement_extraction"]["decision_counts"],
                 "selected_requirement_count": len(result["selected_requirements"]),
-                "next_step": "运行 matching.py 为已确认要求检索候选事实",
+                "next_step": "运行 python -m feiran.matching 为已确认要求检索候选事实",
             }
         _write_new_json(args.output, result)
     except (OSError, json.JSONDecodeError, RequirementError, TypeSafeError, ValueError) as exc:

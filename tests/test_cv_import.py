@@ -4,13 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cv import build_draft
-from cv_import import STRUCTURE_RULES, build_profile, split_private, structure_cv
-from facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
+from feiran.cv import build_draft
+from feiran.cv_import import STRUCTURE_RULES, build_profile, split_private, structure_cv
+from feiran.facts import add_fact, confirm_fact, confirm_facts, import_facts, list_facts, revise_fact
 
 HAS_PYPDF = importlib.util.find_spec("pypdf") is not None
 if HAS_PYPDF:
-    from cv_import import read_pdf
+    from feiran.cv_import import read_pdf
 
 
 def minimal_pdf(lines, links=()):

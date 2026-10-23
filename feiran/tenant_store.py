@@ -37,16 +37,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
-import sponsorship
-from cv import (CVError, _profile_hash, approve_draft, build_draft_from_facts, content_fingerprint,
+from feiran import sponsorship
+from feiran.cv import (CVError, _profile_hash, approve_draft, build_draft_from_facts, content_fingerprint,
                 is_final_approval, profile_fact_ids, profile_languages, verify_draft)
-from cv_edit import EditError, StaleEdit, adopt_for, already_saved, change_line, mark_saved, save_plan, save_target, set_edit
-from cv_import import build_profile
-from cv_plan import set_change
-from facts import FactStoreError, normalize_fact_import
-from gaps import _gap, addition, decline_gap, unusable
-from privacy import private_terms
-from review import build_report
+from feiran.cv_edit import EditError, StaleEdit, adopt_for, already_saved, change_line, mark_saved, save_plan, save_target, set_edit
+from feiran.cv_import import build_profile
+from feiran.cv_plan import set_change
+from feiran.facts import FactStoreError, normalize_fact_import
+from feiran.gaps import _gap, addition, decline_gap, unusable
+from feiran.privacy import private_terms
+from feiran.review import build_report
 
 
 APPLICATION_ID = 0x46455632  # FEV2, distinct from the single-user fact database

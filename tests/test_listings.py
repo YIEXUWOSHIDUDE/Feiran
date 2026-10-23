@@ -6,9 +6,9 @@ from unittest.mock import patch
 import sqlite3
 from pathlib import Path
 
-from facts import confirm_facts, import_facts
-from job_search import SearchError
-from listings import (
+from feiran.facts import confirm_facts, import_facts
+from feiran.job_search import SearchError
+from feiran.listings import (
     ListingsError,
     add_source,
     initialize,
@@ -129,9 +129,9 @@ class ListingsTests(unittest.TestCase):
         return [(item["title"], item["matched"]) for item in ranked["listings"]]
 
     def test_seniority_reads_reuse_text_but_recheck_changed_description(self):
-        import listings
+        from feiran import listings
         text = "Required: 7 years of software engineering experience. Unique cache test."
-        with patch("listings._YEAR_WORD", wraps=listings._YEAR_WORD) as words:
+        with patch("feiran.listings._YEAR_WORD", wraps=listings._YEAR_WORD) as words:
             self.assertTrue(listings.requires_senior_experience(text))
             first = words.finditer.call_count
             listings.requires_senior_experience(text)
@@ -151,10 +151,10 @@ class ListingsTests(unittest.TestCase):
         self.assertEqual(len(list_sources(self.listings_db)), 1)
 
     def test_sponsor_cache_survives_reads_refresh_and_rule_changes(self):
-        from sponsorship import assess_sponsorship, RULE_VERSION
+        from feiran.sponsorship import assess_sponsorship, RULE_VERSION
         boards = FakeBoards([posting("1", "Engineer", "We provide visa sponsorship.")])
         add_source(self.listings_db, "greenhouse", "example", fetch=boards)
-        with patch("listings.assess_sponsorship", wraps=assess_sponsorship) as assess:
+        with patch("feiran.listings.assess_sponsorship", wraps=assess_sponsorship) as assess:
             first = ranked_listings(self.listings_db, self.facts_db)
             calls = assess.call_count
             ranked_listings(self.listings_db, self.facts_db, title="engineer")
@@ -167,13 +167,13 @@ class ListingsTests(unittest.TestCase):
             changed = ranked_listings(self.listings_db, self.facts_db)
             self.assertEqual(changed["listings"][0]["sponsorship"]["status"], "not_supported")
             self.assertEqual(assess.call_count, calls + 1)
-            with patch("listings.SPONSOR_RULE_VERSION", RULE_VERSION + 1):
+            with patch("feiran.listings.SPONSOR_RULE_VERSION", RULE_VERSION + 1):
                 ranked_listings(self.listings_db, self.facts_db)
             self.assertEqual(assess.call_count, calls + 2)
         self.assertEqual(first["listings"][0]["sponsorship"]["status"], "supported")
 
     def test_answer_cached_by_older_rules_is_worked_out_again(self):
-        from sponsorship import RULE_VERSION
+        from feiran.sponsorship import RULE_VERSION
         text = ("We do sponsor visas! However, sponsorship is not available for every role "
                 "and depends on eligibility.")
         add_source(self.listings_db, "greenhouse", "example", fetch=FakeBoards([posting("1", "Engineer", text)]))

@@ -7,8 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from facts import add_fact, confirm_fact
-from job_search import (
+from feiran.facts import add_fact, confirm_fact
+from feiran.job_search import (
     SearchError,
     fetch_board,
     fetch_selected,
@@ -22,8 +22,8 @@ from job_search import (
     rank_jobs,
     write_new_json,
 )
-from requirement_flow import propose_requirements
-from review import build_report
+from feiran.requirement_flow import propose_requirements
+from feiran.review import build_report
 
 
 CAPTURED = "2026-09-18T12:00:00+00:00"
@@ -92,7 +92,7 @@ def ashby_posting(posting_id=ASHBY_ID):
 
 
 class JobSearchTests(unittest.TestCase):
-    @patch("job_search._fetch_json")
+    @patch("feiran.job_search._fetch_json")
     def test_lever_postings_keep_their_requirement_lists(self, fetch_json):
         fetch_json.return_value = [lever_posting()]
         job = fetch_board("example", provider="lever")[0]
@@ -104,7 +104,7 @@ class JobSearchTests(unittest.TestCase):
         self.assertEqual(job["posted_at"], "2026-08-29T10:40:00+00:00")
         self.assertEqual(job["text"], "Build data tools.\nWhat We Require\nPython & SQL\nLinux\nVisa sponsorship available.")
 
-    @patch("job_search._fetch_json")
+    @patch("feiran.job_search._fetch_json")
     def test_ashby_board_skips_unlisted_jobs_and_keeps_every_location(self, fetch_json):
         fetch_json.return_value = {"jobs": [
             ashby_posting(),
@@ -117,7 +117,7 @@ class JobSearchTests(unittest.TestCase):
         self.assertEqual(jobs[0]["posted_at"], "2026-03-12T16:38:15+00:00")
         self.assertEqual(jobs[0]["text"], "About the Team\nWe train models.\nPython\nPyTorch")
 
-    @patch("job_search._fetch_json")
+    @patch("feiran.job_search._fetch_json")
     def test_selected_lever_and_ashby_jobs_are_read_again(self, fetch_json):
         fetch_json.return_value = lever_posting()
         lever = fetch_selected("example", LEVER_ID, provider="lever")
@@ -220,7 +220,7 @@ class JobSearchTests(unittest.TestCase):
             write_new_json(path, {"selected_requirements": []})
             self.assertTrue(path.is_file())
 
-    @patch("job_search.fetch_selected")
+    @patch("feiran.job_search.fetch_selected")
     def test_select_cli_writes_review_input(self, fetch_selected_mock):
         fetch_selected_mock.return_value = {
             "jd": {"text": "Python experience", "source": "https://example.test/jobs/1", "captured_at": CAPTURED},
@@ -241,7 +241,7 @@ class JobSearchTests(unittest.TestCase):
         self.assertIn("匹配阶段", summary["fact_confirmation_status"])
         self.assertEqual(summary["selected_requirement_count"], 0)
 
-    @patch("job_search.fetch_board")
+    @patch("feiran.job_search.fetch_board")
     def test_search_uses_confirmed_database_tags_without_copying_fact_store(self, fetch_board_mock):
         fetch_board_mock.return_value = normalize_board(
             {"jobs": [posting(1, "Backend Intern", "<p>Python experience</p>", "Remote")]},
@@ -279,7 +279,7 @@ class JobSearchTests(unittest.TestCase):
             with self.assertRaisesRegex(SearchError, "必须出现在事实原文"):
                 load_profile(path)
 
-    @patch("job_search._fetch_json")
+    @patch("feiran.job_search._fetch_json")
     def test_selected_job_is_refetched_and_snapshot_keeps_source(self, fetch_json):
         fetch_json.return_value = posting(1, "Software Engineer Intern", "<p>Python</p>", "Remote")
         result = fetch_selected("example", "1")
@@ -289,13 +289,13 @@ class JobSearchTests(unittest.TestCase):
         self.assertEqual(result["jd"]["text"], "Python")
         self.assertIn("本次公开接口返回", result["source_status"])
 
-    @patch("job_search._fetch_json")
+    @patch("feiran.job_search._fetch_json")
     def test_selected_job_id_mismatch_fails(self, fetch_json):
         fetch_json.return_value = posting(2, "Other Intern", "<p>Python</p>")
         with self.assertRaisesRegex(SearchError, "不同的岗位 ID"):
             fetch_selected("example", "1")
 
-    @patch("job_search._fetch_json", side_effect=SearchError("岗位接口返回 HTTP 503"))
+    @patch("feiran.job_search._fetch_json", side_effect=SearchError("岗位接口返回 HTTP 503"))
     def test_source_failure_does_not_return_cached_jobs(self, fetch_json):
         with self.assertRaisesRegex(SearchError, "HTTP 503"):
             fetch_board("example")
@@ -360,8 +360,8 @@ class JobSearchTests(unittest.TestCase):
                     self.assertFalse(output_path.exists())
                     self.assertIn(message, stderr.getvalue())
 
-    @patch("job_search.time.sleep")
-    @patch("job_search.urlopen")
+    @patch("feiran.job_search.time.sleep")
+    @patch("feiran.job_search.urlopen")
     def test_read_timeout_is_retried_once(self, urlopen_mock, sleep_mock):
         board = {"jobs": [posting(1, "Intern", "<p>Python</p>")]}
         urlopen_mock.side_effect = [TimeoutError("The read operation timed out"), FakeResponse(board)]
@@ -370,15 +370,15 @@ class JobSearchTests(unittest.TestCase):
         self.assertEqual(urlopen_mock.call_count, 2)
         sleep_mock.assert_called_once()
 
-    @patch("job_search.time.sleep")
-    @patch("job_search.urlopen", side_effect=TimeoutError("The read operation timed out"))
+    @patch("feiran.job_search.time.sleep")
+    @patch("feiran.job_search.urlopen", side_effect=TimeoutError("The read operation timed out"))
     def test_repeated_timeout_reports_a_clear_error(self, urlopen_mock, _sleep_mock):
         with self.assertRaisesRegex(SearchError, "超时"):
             fetch_board("example")
         self.assertEqual(urlopen_mock.call_count, 2)
 
-    @patch("job_search.time.sleep")
-    @patch("job_search.urlopen")
+    @patch("feiran.job_search.time.sleep")
+    @patch("feiran.job_search.urlopen")
     def test_missing_board_is_not_retried(self, urlopen_mock, sleep_mock):
         urlopen_mock.side_effect = HTTPError("https://example.test", 404, "Not Found", None, None)
         with self.assertRaisesRegex(SearchError, "HTTP 404.*招聘板标识"):

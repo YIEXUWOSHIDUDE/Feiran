@@ -1,8 +1,8 @@
 """Backups of V2's data folder: the database and the deletion ledger.
 
-    python v2_backup.py create --data /data --out /backups/feiran-v2.tar.gz
-    python v2_backup.py restore --archive /backups/feiran-v2.tar.gz --into /restored/data --ledger /data/deleted-accounts.jsonl
-    python v2_backup.py verify --data /restored/data
+    python -m feiran.v2_backup create --data /data --out /backups/feiran-v2.tar.gz
+    python -m feiran.v2_backup restore --archive /backups/feiran-v2.tar.gz --into /restored/data --ledger /data/deleted-accounts.jsonl
+    python -m feiran.v2_backup verify --data /restored/data
 
 Everything V2 keeps is in one SQLite database (uploads waiting for review, versions, approvals and
 final PDFs included), so SQLite's online backup copies one consistent moment even while the app
@@ -34,9 +34,9 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import tenant_store
-from cv import CVError, content_fingerprint, is_final_approval
-from workspace import write_atomically
+from feiran import tenant_store
+from feiran.cv import CVError, content_fingerprint, is_final_approval
+from feiran.workspace import write_atomically
 
 FORMAT = "feiran-v2-backup-1"
 DATABASE = tenant_store.DATABASE

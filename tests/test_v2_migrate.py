@@ -14,19 +14,19 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-import tenant_store
-import v2_backup
-import v2_migrate
-from facts import confirm_facts, import_facts, revise_fact
-from identity import Identity, OIDCSettings
-from tenant_store import UserWorkspace, claim_tasks, create_session, delete_account, read_deletions, set_setting
+from feiran import tenant_store
+from feiran import v2_backup
+from feiran import v2_migrate
+from feiran.facts import confirm_facts, import_facts, revise_fact
+from feiran.identity import Identity, OIDCSettings
+from feiran.tenant_store import UserWorkspace, claim_tasks, create_session, delete_account, read_deletions, set_setting
 from tests.fake_identity import CLIENT_ID, DOMAIN, ISSUER, ORIGIN, FakeCognito
 from tests.test_cv import FACTS, PROFILE, FakePrinter
 from tests.test_web import FakeDeepSeek
-from v2_flow import make_handlers
-from web import create_app
-from web_v2 import V2Settings, create_v2_app
-from workspace import recorded_data_format
+from feiran.v2_flow import make_handlers
+from feiran.web import create_app
+from feiran.web_v2 import V2Settings, create_v2_app
+from feiran.workspace import recorded_data_format
 
 JD = (Path(__file__).resolve().parent.parent / "examples" / "synthetic_jd_zh.txt").read_text(encoding="utf-8")
 

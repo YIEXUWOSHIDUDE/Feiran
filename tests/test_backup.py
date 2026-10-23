@@ -7,12 +7,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from backup import BackupError, create_backup, main, restore_backup, verify_data
-from cv import approve_draft, build_draft
-from facts import confirm_facts, list_facts, revise_fact
-from listings import initialize
+from feiran.backup import BackupError, create_backup, main, restore_backup, verify_data
+from feiran.cv import approve_draft, build_draft
+from feiran.facts import confirm_facts, list_facts, revise_fact
+from feiran.listings import initialize
 from tests.test_cv import PROFILE, make_store
-from workspace import DATA_FORMAT, DATA_FORMAT_FILE, Workspace
+from feiran.workspace import DATA_FORMAT, DATA_FORMAT_FILE, Workspace
 
 
 INPUT = {"jd": {"text": "Requirements:\n- Python", "title": "Backend Intern", "company": "Example Co",

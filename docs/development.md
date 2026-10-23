@@ -171,7 +171,7 @@ CC 交回时说明实际修改、验证结果及未完成项；Codex 检查真�
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python web.py
+.venv/bin/python -m feiran.web
 ```
 
 网页启动后访问 `http://127.0.0.1:8765/`，使用 dogfood 检查实际页面。报告记录此地址与本次运行版本；涉及真实 AI 时沿用已经确认的数据去向和费用范围。

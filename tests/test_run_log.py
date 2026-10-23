@@ -4,7 +4,7 @@ import logging
 import unittest
 from contextlib import redirect_stderr
 
-import run_log
+from feiran import run_log
 
 
 class RunLogTests(unittest.TestCase):
