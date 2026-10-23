@@ -87,7 +87,12 @@ jobs:
         timeout-minutes: 5
         run: sudo env WORKBENCH_IMAGE="$WORKBENCH_IMAGE" deploy/aws/test-v2-docker-backup.sh
       - name: The tests pass inside the image too
-        run: docker run --rm "$WORKBENCH_IMAGE" python -m unittest discover -s tests -t . -p "test_*.py"
+        # Real PDF tests need the app Chromium namespace rules; the unit-test fake
+        # Chrome scripts also need an executable temporary directory (test container only).
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:exec --shm-size 256m \
+            --security-opt no-new-privileges:true --security-opt "seccomp=$PWD/deploy/seccomp-chromium.json" \
+            -e HOME=/tmp "$WORKBENCH_IMAGE" python -m unittest discover -s tests -t . -p "test_*.py"
       - name: V2 acceptance with 100 synthetic accounts and real Linux Chromium PDFs
         timeout-minutes: 10
         run: |
