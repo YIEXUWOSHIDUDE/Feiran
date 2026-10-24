@@ -9,8 +9,10 @@ final PDFs included), so SQLite's online backup copies one consistent moment eve
 runs; no pause of the task runner is needed for consistency. A task running at that moment is in
 the copy as running and becomes "interrupted" when the copy is restored: it is never rerun or
 published by itself. Sign-in sessions are left out of the copy, and so are guest workspaces:
-they end within hours and their data goes with them, so no copy keeps one and no restore can
-bring one back (a restore removes any it finds too).
+they are disposable and synthetic, so no copy keeps one and no restore can bring one back (a
+restore removes any it finds too). What their model calls charged stays in the copy's day
+totals, without their IDs (the site's and all guests'), as it does when one ends; use after the
+copy was made is not in it.
 
 A restore writes only into a missing or empty folder, after every file matches the manifest and
 the database checks out. It then deletes again every account the deletion ledger lists (the one
@@ -78,8 +80,9 @@ def _tables(path: Path) -> set[str]:
 
 def _without_guests(path: Path) -> int:
     """Remove every guest workspace from a copy (tenant_store.expire_guests): they are disposable,
-    so a backup never keeps one and a restored copy never holds one, ended or not. A database from
-    before guest workspaces has none. Returns how many were removed."""
+    so a backup never keeps one and a restored copy never holds one. Their model use stays in the
+    copy's day totals (tenant_store._purge_guest). A database from before guest workspaces has
+    none. Returns how many were removed."""
     if "guest_workspaces" not in _tables(path):
         return 0
     return tenant_store.expire_guests(path, everything=True)

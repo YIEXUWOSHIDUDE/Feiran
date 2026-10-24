@@ -31,7 +31,7 @@ The V2 workspace is deployed on AWS with HTTPS and Cognito sign-in. The four-rou
 
 ### Guest workspaces (off by default)
 
-An operator can switch on temporary guest workspaces (`python -m feiran.v2_admin set guest_enabled 1`). The public welcome page then offers, besides signing in, one click for a private workspace with a synthetic sample CV and an example job: edit, undo and redo, fit to one page, approve and download the PDF. A guest workspace makes no AI requests, cannot upload or add jobs, ends after a fixed time (default 2 hours) and is then deleted. See [guest workspaces](docs/guest-workspaces.md) for the limits and configuration.
+An operator can switch on guest workspaces (`python -m feiran.v2_admin set guest_enabled 1`). The public welcome page then offers, besides signing in, one click for a private workspace with a synthetic sample CV and an example job. The guest can find the requirements, prepare, reword and adjust the CV with DeepSeek, check it against the job, edit, undo and redo, fit to one page, approve and download the PDF. AI use is metered per call against a one-time allowance per workspace (default 100,000 tokens, never refilled) and a shared daily allowance for all guests (default 1,000,000 tokens per UTC day). When it runs out, editing, fitting and downloading still work. A guest workspace has no time limit: the same browser finds it again until the guest ends it or clears the site's cookies. It is not kept in backups. Uploads, new jobs and saving to a profile need an account. See [guest workspaces](docs/guest-workspaces.md) for the limits, configuration, migration and rollback.
 
 ## Using Feiran
 

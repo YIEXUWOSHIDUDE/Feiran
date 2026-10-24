@@ -154,6 +154,8 @@ def _redo_stage(ctx: Any, stage: str) -> None:
         return
     if not head["inputs_current"]:
         raise TaskFailed("简历资料已更新，请重新准备并审核这份简历", "stale")
+    if head["requirements_version"] is None:  # a CV never prepared for the job (a sample from before guests had AI)
+        raise TaskFailed("This CV was not prepared for the job's requirements yet; choose Start over first.", "not_prepared")
     chain = inputs["chain"]
     root = chain[-1]
     decided = inputs["requirements"]["decided"]

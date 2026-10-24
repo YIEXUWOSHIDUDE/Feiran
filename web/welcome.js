@@ -9,8 +9,7 @@
   const meta = (name) => (document.querySelector(`meta[name="${name}"]`) || {}).content || "";
   const start = meta("guest-start");
   const resumable = meta("guest-state") === "guest";
-  const ends = meta("guest-ends");
-  const lifetime = Number(meta("guest-lifetime")) || 120;
+  const tokens = Number(meta("guest-tokens")) || 0;
   const message = document.getElementById("message");
   const button = document.getElementById("guest-start");
   const status = document.getElementById("guest-status");
@@ -24,13 +23,13 @@
   I18n.mount();
   // Signing in comes back to the part of the app the visitor asked for.
   document.getElementById("sign-in").setAttribute("href", `/login?return_to=${encodeURIComponent("/" + location.hash)}`);
-  I18n.setText(document.getElementById("guest-lifetime"),
-    t`It ends ${lifetime} minutes after it starts, however much you use it, and everything in it is then deleted.`);
+  I18n.setText(document.getElementById("guest-allowance"),
+    t`It comes with ${tokens.toLocaleString("en-US")} AI tokens, once: they do not refill. When they are used up, editing, fitting, approving and downloading still work.`);
   const label = resumable ? t("Continue your guest workspace") : t("Try a guest workspace");
   I18n.setText(button, label);
-  if (resumable && ends) {
+  if (resumable) {
     status.hidden = false;
-    I18n.setText(status, t`This browser has a guest workspace open until ${I18n.date(ends, true)}.`);
+    I18n.setText(status, t("This browser has a guest workspace open."));
   }
   if (new URLSearchParams(location.search).has("ended")) {
     show(t("Your guest workspace has ended, and everything in it was deleted. Start a new one or sign in."), "ok");

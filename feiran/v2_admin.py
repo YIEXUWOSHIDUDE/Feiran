@@ -40,15 +40,19 @@ failing cannot hold up the others. Once "next" is null, a round without --after 
 failed ones again. What is stored is never assessed again, and pages never assess anything.
 
 Guest workspaces are off until guest_enabled is 1 (and off again at once with 0: no new one
-starts; open ones keep working until they end, or end them with "guests end-all"). Their limits
-are settings too, each bounded whatever it is set to: guest_max_active (open at once, 1-100,
-default 10), guest_starts_per_hour (the whole site, 1-200, default 20), guest_lifetime_minutes
-(fixed from the start, never extended, 10-240, default 120) and guest_max_tasks (fit and PDF
-runs per workspace, 1-100, default 20). "guests" lists them with each open workspace (internal
-ID, times, tasks and CV versions used; no content); "guests expire" removes ended ones now (the
-app does so by itself every few seconds and at each start); "guests end USER_ID" and "guests
-end-all" remove open ones now. A guest workspace is removed whole, with no tombstone and no line
-in the deletion ledger: "delete" refuses one, and "accounts" does not list them.
+starts; open ones keep working, or end them with "guests end-all"). They have no time limit.
+Their limits are settings too, each bounded whatever it is set to: guest_max_active (guest
+workspaces stored at once, 1-1000, default 100; none is removed to make room),
+guest_starts_per_hour (the whole site, 1-200, default 20), guest_max_tasks (fit and PDF runs per
+workspace, 1-100, default 20), guest_lifetime_tokens (each workspace's AI allowance, given once
+and never refilled, 1000-1000000, default 100000) and guest_daily_tokens (all guests together
+per UTC day, 10000-100000000, default 1000000). "guests" lists them with all guests' AI use
+today and each workspace (internal ID, start, AI tokens, runs and versions used; no content);
+"guests expire" removes those that cannot be used (a start that failed halfway, a disabled
+account); "guests end USER_ID" and "guests end-all" remove workspaces now. A guest workspace is
+removed whole, with no tombstone and no line in the deletion ledger, its model use kept in the
+day totals: "delete" refuses one, "accounts" does not list them, and "test-unlimited" refuses
+one.
 """
 
 import argparse

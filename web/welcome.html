@@ -6,8 +6,7 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'">
 <meta name="guest-start" content="__GUEST_START__">
 <meta name="guest-state" content="__GUEST_STATE__">
-<meta name="guest-ends" content="__GUEST_ENDS__">
-<meta name="guest-lifetime" content="__GUEST_LIFETIME__">
+<meta name="guest-tokens" content="__GUEST_TOKENS__">
 <title data-i18n="Feiran">Feiran</title>
 <meta name="description" content="What oft was thought, but ne’er so well express’d.">
 <link rel="stylesheet" href="/static/style.css">
@@ -41,10 +40,11 @@
       </section>
       <section class="welcome-choice guest-choice">
         <h3 data-i18n="Try a guest workspace">Try a guest workspace</h3>
-        <p data-i18n="A temporary workspace of your own, with a synthetic sample CV and an example job. Edit its lines, undo and redo, fit it to one page, approve it and download the PDF.">A temporary workspace of your own, with a synthetic sample CV and an example job. Edit its lines, undo and redo, fit it to one page, approve it and download the PDF.</p>
+        <p data-i18n="A workspace of your own, with a synthetic sample CV and an example job. Find its requirements, reword and adjust the CV with DeepSeek, check it against the job, edit lines, undo and redo, fit it to one page, approve it and download the PDF.">A workspace of your own, with a synthetic sample CV and an example job. Find its requirements, reword and adjust the CV with DeepSeek, check it against the job, edit lines, undo and redo, fit it to one page, approve it and download the PDF.</p>
         <ul class="guest-terms">
-          <li data-i18n="No AI requests are made in a guest workspace. The sample's requirements and CV were prepared without AI; sign in for AI rewording, suggestions, uploads and new jobs.">No AI requests are made in a guest workspace. The sample's requirements and CV were prepared without AI; sign in for AI rewording, suggestions, uploads and new jobs.</li>
-          <li id="guest-lifetime"></li>
+          <li data-i18n="The sample itself was prepared without AI. AI work here sends the sample job and CV to DeepSeek once you agree to it, within an allowance (below); uploads, new jobs and saving to a profile need an account.">The sample itself was prepared without AI. AI work here sends the sample job and CV to DeepSeek once you agree to it, within an allowance (below); uploads, new jobs and saving to a profile need an account.</li>
+          <li id="guest-allowance"></li>
+          <li data-i18n="There is no time limit: this browser finds your workspace again until you end it or clear this site's cookies. It is not kept in backups.">There is no time limit: this browser finds your workspace again until you end it or clear this site's cookies. It is not kept in backups.</li>
           <li data-i18n="The sample person and job are made up. Please do not type real personal information into it.">The sample person and job are made up. Please do not type real personal information into it.</li>
         </ul>
         <p id="guest-status" class="muted" hidden></p>
