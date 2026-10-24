@@ -278,12 +278,12 @@ const refused=run('fitNote({status:"cannot_fit",pages_before:2,pages:2,tried:7,c
 assert(refused.includes("even with 7 less related line(s) left out (at most half of what it shows), this CV prints on 2 pages"));
 assert(refused.includes("1 added or edited in this CV; 3 the one line a job or the skills keep"));
 assert(refused.includes("Nothing was changed"));
-assert(run('fitNote({status:"fits",pages:1})').textContent.includes("Prints on one page"));
+assert(run('fitNote({status:"fits",pages:1})').textContent.includes("already fits on one page"));
 assert.equal(run('fitNote(undefined)'),null);
 run('document.documentElement={}; document.getElementById=(id)=>id==="app"?__app:id==="interface-language"?{}:null; NodeFilter={SHOW_ELEMENT:1,SHOW_TEXT:4}; document.createTreeWalker=()=>({nextNode:()=>null}); I18n.setLanguage("zh")');
 assert(run('fitNote({status:"fitted",pages_before:2,pages:1,left_out:3})').textContent.includes("已压缩为一页"));
 assert(run('String(I18n.serverText("Left out to fit one page: less related to this job\'s requirements than what stays."))').startsWith("为压缩为一页而省略"));
 const stale=run('cvBlock({job_id:"j",cv:{en:{head:"tailored",content_sha256:"c",stale:true,fit:{status:"fits"},lines:[],edits:[]}}},"en",async()=>{})');
 assert(!find(stale,n=>n.tagName==="button"&&n.textContent==="压缩为一页"));
-assert(!stale.textContent.includes("打印为一页"));
+assert(!stale.textContent.includes("当前简历已是一页"));
 ''', mode=mode)

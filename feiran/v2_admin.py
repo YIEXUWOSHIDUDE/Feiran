@@ -12,6 +12,8 @@
     python -m feiran.v2_admin --data /data delete USER_ID --confirm USER_ID
     python -m feiran.v2_admin --data /data usage [--day 2026-10-01]
     python -m feiran.v2_admin --data /data sponsorship [--limit 500] [--after NEXT]
+    python -m feiran.v2_admin --data /data set guest_enabled 1
+    python -m feiran.v2_admin --data /data guests [list | expire | end USER_ID | end-all]
 
 Nothing here signs anyone in or creates an account: an account belongs to one Cognito identity
 (issuer and subject) and is made by its first verified sign-in, only while registration is open
@@ -36,6 +38,17 @@ rules changed), and prints counts and "next". While "next" is not null, run it a
 --after set to that value: each round goes on where the last stopped, so a text that keeps
 failing cannot hold up the others. Once "next" is null, a round without --after tries the
 failed ones again. What is stored is never assessed again, and pages never assess anything.
+
+Guest workspaces are off until guest_enabled is 1 (and off again at once with 0: no new one
+starts; open ones keep working until they end, or end them with "guests end-all"). Their limits
+are settings too, each bounded whatever it is set to: guest_max_active (open at once, 1-100,
+default 10), guest_starts_per_hour (the whole site, 1-200, default 20), guest_lifetime_minutes
+(fixed from the start, never extended, 10-240, default 120) and guest_max_tasks (fit and PDF
+runs per workspace, 1-100, default 20). "guests" lists them with each open workspace (internal
+ID, times, tasks and CV versions used; no content); "guests expire" removes ended ones now (the
+app does so by itself every few seconds and at each start); "guests end USER_ID" and "guests
+end-all" remove open ones now. A guest workspace is removed whole, with no tombstone and no line
+in the deletion ledger: "delete" refuses one, and "accounts" does not list them.
 """
 
 import argparse
@@ -75,11 +88,28 @@ def main(argv: list[str] | None = None) -> int:
     backfill = commands.add_parser("sponsorship", help="assess saved texts with no sponsor answer under the current rules")
     backfill.add_argument("--limit", type=int, default=500, help="at most this many texts (0 only counts)")
     backfill.add_argument("--after", help='go on after this position: the "next" a previous round printed')
+    guests = commands.add_parser("guests", help="guest workspaces: list them, remove ended ones, or end open ones")
+    guests.add_argument("action", nargs="?", default="list", choices=("list", "expire", "end", "end-all"))
+    guests.add_argument("user_id", nargs="?", help="the guest workspace to end (with end)")
     args = parser.parse_args(argv)
     database = args.data / DATABASE
     try:
-        if args.command == "settings":
-            result: object = tenant_store.get_settings(database)
+        if args.command == "guests":
+            tenant_store.upgrade_store(database)  # the tables, if the app has not started on this store yet
+            if (args.action == "end") != (args.user_id is not None):
+                print("refused: give a guest workspace's user ID with end, and only with end", file=sys.stderr)
+                return 2
+            result: object
+            if args.action == "end":
+                if not tenant_store.end_guest(database, args.user_id):
+                    raise NotFound("No such guest workspace")
+                result = {"ended": args.user_id}
+            elif args.action in ("expire", "end-all"):
+                result = {"removed": tenant_store.expire_guests(database, everything=args.action == "end-all")}
+            else:
+                result = tenant_store.list_guests(database)
+        elif args.command == "settings":
+            result = tenant_store.get_settings(database)
         elif args.command == "set":
             tenant_store.set_setting(database, args.key, args.value)
             result = tenant_store.get_settings(database)

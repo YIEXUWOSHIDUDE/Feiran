@@ -8,7 +8,9 @@ Everything V2 keeps is in one SQLite database (uploads waiting for review, versi
 final PDFs included), so SQLite's online backup copies one consistent moment even while the app
 runs; no pause of the task runner is needed for consistency. A task running at that moment is in
 the copy as running and becomes "interrupted" when the copy is restored: it is never rerun or
-published by itself. Sign-in sessions are left out of the copy.
+published by itself. Sign-in sessions are left out of the copy, and so are guest workspaces:
+they end within hours and their data goes with them, so no copy keeps one and no restore can
+bring one back (a restore removes any it finds too).
 
 A restore writes only into a missing or empty folder, after every file matches the manifest and
 the database checks out. It then deletes again every account the deletion ledger lists (the one
@@ -66,14 +68,34 @@ def copy_database(source: Path, target: Path) -> None:
         reader.close()
 
 
+def _tables(path: Path) -> set[str]:
+    connection = sqlite3.connect(path)
+    try:
+        return {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    finally:
+        connection.close()
+
+
+def _without_guests(path: Path) -> int:
+    """Remove every guest workspace from a copy (tenant_store.expire_guests): they are disposable,
+    so a backup never keeps one and a restored copy never holds one, ended or not. A database from
+    before guest workspaces has none. Returns how many were removed."""
+    if "guest_workspaces" not in _tables(path):
+        return 0
+    return tenant_store.expire_guests(path, everything=True)
+
+
 def _without_sessions(path: Path) -> None:
     """Sessions and sign-ins in progress are not data worth keeping and are ended by a restore anyway."""
+    guests = "guest_sessions" in _tables(path)
     connection = sqlite3.connect(path)
     try:
         connection.execute("PRAGMA secure_delete = ON")
         with connection:
             connection.execute("DELETE FROM sessions")
             connection.execute("DELETE FROM login_attempts")
+            if guests:
+                connection.execute("DELETE FROM guest_sessions")
         connection.execute("VACUUM")
     finally:
         connection.close()
@@ -158,6 +180,7 @@ def create_backup(data: Path, archive: Path, revision: str | None = None) -> dic
     with tempfile.TemporaryDirectory(prefix=".feiran-v2-backup-", dir=archive.parent) as staging_name:
         staging = Path(staging_name)
         copy_database(data / DATABASE, staging / DATABASE)
+        _without_guests(staging / DATABASE)
         _without_sessions(staging / DATABASE)
         names = [DATABASE]
         if (data / LEDGER).is_file():
@@ -264,7 +287,8 @@ def restore_backup(archive: Path, into: Path, *, live_ledger: Path | None) -> di
         with tenant_store.transaction(staging / DATABASE, write=True) as connection:
             connection.execute("DELETE FROM sessions")
             connection.execute("DELETE FROM login_attempts")
-        interrupted = tenant_store.recover_tasks(staging / DATABASE)
+        interrupted = tenant_store.recover_tasks(staging / DATABASE)  # also adds the tables a newer release keeps
+        guests_removed = _without_guests(staging / DATABASE)
         connection = sqlite3.connect(staging / DATABASE)
         try:
             connection.execute("PRAGMA journal_mode = WAL")  # as a new V2 database runs
@@ -282,7 +306,7 @@ def restore_backup(archive: Path, into: Path, *, live_ledger: Path | None) -> di
         raise
     return {"restored_from": manifest.get("created_at"), "revision": manifest.get("revision"),
             "deleted_again": deleted_again, "deletions_known": len(records), "interrupted_tasks": interrupted,
-            "counts": after["counts"], "problems": after["problems"]}
+            "guest_workspaces_removed": guests_removed, "counts": after["counts"], "problems": after["problems"]}
 
 
 def verify_data(data: Path) -> dict[str, Any]:

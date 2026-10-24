@@ -266,7 +266,11 @@ for _ in $(seq "${HEALTH_WAIT_ATTEMPTS:-60}"); do
         if [ "${WORKBENCH_MODE:-v1}" = v2 ]; then
             page=$(curl -s --max-time 5 -o /dev/null -w '%{http_code} %{redirect_url}' http://127.0.0.1:8765/ || true)
             api=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/api/me || true)
-            if [ "$page" = '303 http://127.0.0.1:8765/login?return_to=/' ] && [ "$api" = 401 ]; then healthy=1; break; fi
+            # Signed out, / goes to sign-in, or to the welcome page while guest workspaces are on.
+            case "$page" in
+                '303 http://127.0.0.1:8765/login?return_to=/' | '303 http://127.0.0.1:8765/welcome')
+                    if [ "$api" = 401 ]; then healthy=1; break; fi ;;
+            esac
         else
             healthy=1; break
         fi
