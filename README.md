@@ -29,6 +29,10 @@ Prefer running it on your computer? Complete [local setup instructions](#local-d
 
 The V2 workspace is deployed on AWS with HTTPS and Cognito sign-in. The four-round workflow improvements and one-page fitting are included in [release `4c595a7`](https://github.com/YIEXUWOSHIDUDE/Feiran/actions/runs/40027427699), deployed on October 23, 2026. Live English acceptance covered fitting an actual PDF from two pages to one, undo/redo, persistence after refresh, and browser downloads. Font sizes were unchanged, with no clipping or overlap in the inspected PDF. Chinese one-page fitting has not yet been checked in the live browser. See [development evidence and limits](docs/development.md) for details; older deployment records describe earlier releases.
 
+### Guest workspaces (off by default)
+
+An operator can switch on temporary guest workspaces (`python -m feiran.v2_admin set guest_enabled 1`). The public welcome page then offers, besides signing in, one click for a private workspace with a synthetic sample CV and an example job: edit, undo and redo, fit to one page, approve and download the PDF. A guest workspace makes no AI requests, cannot upload or add jobs, ends after a fixed time (default 2 hours) and is then deleted. See [guest workspaces](docs/guest-workspaces.md) for the limits and configuration.
+
 ## Using Feiran
 
 The steps below describe the deployed V2 flow. The optional local V1 mode differs where noted.

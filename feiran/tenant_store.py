@@ -23,6 +23,13 @@ reservation while it runs and is charged what the provider reported (prompt plus
 tokens) once it answers, or keeps its reservation when its use cannot be proven. The quota mode
 is "legacy" (fixed units per task, reserved at submit) until the operator configures "tokens"
 (daily token limits checked when each call starts); legacy units are never read as tokens.
+
+Guest workspaces (start_guest) are short-lived accounts the server makes itself, switched off
+until the operator sets guest_enabled. Their identity (GUEST_ISSUER) is one no sign-in can name,
+their sessions are kept apart (guest_sessions, which a release before them never reads), and the
+store itself bounds them: no model call or job read, only fitting and printing their CV, a fixed
+end time, caps on how many there are and on what each can make. An ended guest is removed whole,
+without a tombstone (expire_guests).
 """
 
 import hashlib
@@ -73,7 +80,8 @@ ACTIVE_TASKS = ("queued", "running")
 RETRYABLE_TASKS = ("failed", "interrupted", "cancelled", "superseded")
 MAX_TASK_ATTEMPTS = 3
 SETTING_KEYS = ("registration_open", "max_accounts", "tasks_enabled", "user_daily_units", "site_daily_units",
-                "queue_limit", "quota_mode", "user_daily_tokens", "site_daily_tokens")
+                "queue_limit", "quota_mode", "user_daily_tokens", "site_daily_tokens", "guest_enabled",
+                "guest_max_active", "guest_starts_per_hour", "guest_lifetime_minutes", "guest_max_tasks")
 DEFAULT_SETTINGS = {"registration_open": "0", "max_accounts": "100", "tasks_enabled": "1", "queue_limit": "20"}
 # No quota_mode setting means legacy: a store made before tokens existed keeps its unit limits as
 # units. Tokens mode needs both token limits, set together with it (configure_quota).
@@ -91,6 +99,21 @@ MAX_REPORTED_TOKENS = 10 ** 9  # a single call reporting more than this is malfo
 RESETS = "It resets at 00:00 UTC."
 DATABASE = "v2.db"  # in the data folder, beside the deletion ledger
 DELETION_LEDGER = "deleted-accounts.jsonl"
+# Guest workspaces. The issuer is not an https URL, and OIDCSettings accepts only https issuers,
+# so no sign-in can ever name it; sign_in and provision_user refuse it besides.
+GUEST_ISSUER = "urn:feiran:guest"
+# Each limit as (default, smallest, largest): a guest site is always bounded, however it is set.
+GUEST_LIMITS = {"guest_max_active": (10, 1, 100), "guest_starts_per_hour": (20, 1, 200),
+                "guest_lifetime_minutes": (120, 10, 240), "guest_max_tasks": (20, 1, 100)}
+GUEST_OPERATIONS = ("fit_cv", "export_pdf")  # print-only work: no model call, no page read
+GUEST_MAX_VERSIONS = 150  # CV versions one guest workspace may make (each edit, undo or fit is one)
+GUEST_QUEUED = 2  # guest tasks waiting at once on the whole site, and never more than half its queue
+GUEST_RUNNING = 1  # guest tasks running at once on the whole site
+GUEST_SESSIONS = 4  # sessions of one guest workspace (a double click makes two); the oldest go first
+GUEST_SEED_WAIT = timedelta(minutes=5)  # a workspace not ready by then failed while it was made
+GUEST_START_WINDOW = timedelta(hours=1)
+GUEST_ONLY = ("Sign in to use this. A guest workspace can edit, fit, approve and download its sample CV; "
+              "AI features, uploads and new jobs need an account.")
 
 
 class StoreError(Exception):
@@ -472,9 +495,40 @@ METER_SCHEMA = (
     charged_tokens INTEGER NOT NULL CHECK(charged_tokens >= 0)
 )""",
 )
-ADDED_TABLES = SPONSOR_TABLES + METER_TABLES
-ADDED_INDEXES = ("model_calls_by_day", "model_calls_by_task")
-ADDED_SCHEMA = SPONSOR_SCHEMA + METER_SCHEMA
+# Guest workspaces, added the same way. A release from before them reads none of these, so it
+# can never resolve a guest's session.
+GUEST_TABLES = ("guest_workspaces", "guest_sessions", "guest_starts")
+GUEST_SCHEMA = (
+    # Which accounts are guests, when each ends (fixed when it starts, never extended) and the hash
+    # of the one-click start it was made by, so the same click sent twice finds it again. ready is
+    # 0 while the sample is being put in: no session is given before it is 1.
+    """CREATE TABLE IF NOT EXISTS guest_workspaces (
+    user_id TEXT PRIMARY KEY REFERENCES users(user_id),
+    start_sha256 TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    ready INTEGER NOT NULL DEFAULT 0 CHECK(ready IN (0, 1))
+)""",
+    "CREATE INDEX IF NOT EXISTS guest_workspaces_by_expiry ON guest_workspaces(expires_at)",
+    # A guest's sessions, apart from signed-in users' sessions: only the token's hash is kept, and
+    # each ends with its workspace.
+    """CREATE TABLE IF NOT EXISTS guest_sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    csrf_token TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+)""",
+    "CREATE INDEX IF NOT EXISTS guest_sessions_by_user ON guest_sessions(user_id)",
+    # When guest workspaces were started, for the hourly limit: no one's identity, and kept only
+    # for the hour the limit looks back over, so ending a workspace early never frees a start.
+    """CREATE TABLE IF NOT EXISTS guest_starts (
+    started_at TEXT NOT NULL
+)""",
+)
+ADDED_TABLES = SPONSOR_TABLES + METER_TABLES + GUEST_TABLES
+ADDED_INDEXES = ("model_calls_by_day", "model_calls_by_task", "guest_workspaces_by_expiry", "guest_sessions_by_user")
+ADDED_SCHEMA = SPONSOR_SCHEMA + METER_SCHEMA + GUEST_SCHEMA
 # What one call counts against a limit: a settled call what was reported; any other at least its
 # reservation, and more if a part that was reported says so.
 _CHARGE = ("CASE WHEN status = 'settled' THEN prompt_tokens + completion_tokens "
@@ -483,7 +537,7 @@ _CHARGE = ("CASE WHEN status = 'settled' THEN prompt_tokens + completion_tokens 
 USER_TABLES = ("artifacts", "approvals", "material_facts", "materials", "job_gaps", "job_notes",
                "job_requirements", "jobs", "profile_facts", "profile_versions", "profiles", "fact_versions",
                "facts", "uploads", "posting_matches", "user_sponsor_assessments", "followed_boards", "model_calls",
-               "quota_exemptions", "tasks", "request_keys", "sessions")
+               "quota_exemptions", "tasks", "request_keys", "sessions", "guest_sessions", "guest_workspaces")
 
 
 def _clock() -> datetime:
@@ -671,6 +725,22 @@ def get_settings(path: Path) -> dict[str, str]:
         return _settings(connection)
 
 
+def _guest_limits(settings: dict[str, str]) -> dict[str, Any]:
+    """Whether guest workspaces are on, and their limits: each within GUEST_LIMITS whatever the
+    stored value says, so no setting can leave them unbounded."""
+    limits: dict[str, Any] = {"enabled": settings.get("guest_enabled") == "1"}
+    for key, (default, smallest, largest) in GUEST_LIMITS.items():
+        limits[key.removeprefix("guest_")] = min(max(_positive(settings.get(key)) or default, smallest), largest)
+    return limits
+
+
+def guest_settings(path: Path) -> dict[str, Any]:
+    """Whether guest workspaces are on (guest_enabled, off unless set) and their limits:
+    max_active, starts_per_hour, lifetime_minutes and max_tasks."""
+    with transaction(path) as connection:
+        return _guest_limits(_settings(connection))
+
+
 def _quota_mode(settings: dict[str, str]) -> str:
     return "tokens" if settings.get("quota_mode") == "tokens" else "legacy"
 
@@ -712,9 +782,13 @@ def set_setting(path: Path, key: str, value: str) -> None:
     needs its two token limits first."""
     if key not in SETTING_KEYS:
         raise StoreError(f"Unknown setting: {key}")
-    if key in ("registration_open", "tasks_enabled"):
+    if key in ("registration_open", "tasks_enabled", "guest_enabled"):
         if value not in ("0", "1"):
             raise StoreError(f"{key} must be 0 or 1")
+    elif key in GUEST_LIMITS:
+        _default, smallest, largest = GUEST_LIMITS[key]
+        if not (isinstance(value, str) and value.isascii() and value.isdigit() and smallest <= int(value) <= largest):
+            raise StoreError(f"{key} must be a whole number from {smallest} to {largest}")
     elif key == "quota_mode":
         if value not in QUOTA_MODES:
             raise StoreError("quota_mode must be legacy or tokens")
@@ -768,12 +842,14 @@ def _exempt(connection: sqlite3.Connection, user_id: str) -> bool:
 
 
 def list_accounts(path: Path) -> list[dict[str, Any]]:
-    """Every account, for the operator: internal ID, identity, state and dates; no content."""
+    """Every signed-in user's account, for the operator: internal ID, identity, state and dates;
+    no content. Guest workspaces are listed apart (list_guests)."""
     with transaction(path) as connection:
         return [{"user_id": row["user_id"], "issuer": row["issuer"], "subject": row["subject"],
                  "state": "deleted" if row["deleted_at"] else "active" if row["active"] else "disabled",
                  "created_at": row["created_at"], "deleted_at": row["deleted_at"]}
-                for row in connection.execute("SELECT * FROM users ORDER BY created_at, user_id")]
+                for row in connection.execute("SELECT * FROM users WHERE issuer != ? ORDER BY created_at, user_id",
+                                              (GUEST_ISSUER,))]
 
 
 def _resets_at(day: str) -> str:
@@ -871,8 +947,11 @@ def provision_user(path: Path, *, issuer: str, subject: str) -> str:
     Idempotent for the exact provider identity. Never uses email to own stored materials,
     and never reactivates a disabled or deleted user as a side effect of another login.
     Unlike ``sign_in`` it ignores the registration switch: the admin tool and tests use it.
+    The guest issuer is refused: a guest is made only by start_guest.
     """
     issuer, subject = _text(issuer, 'issuer', 2048), _text(subject, 'subject')
+    if issuer == GUEST_ISSUER:
+        raise StoreError("A guest identity cannot be provisioned")
     with transaction(path, write=True) as connection:
         user = connection.execute('SELECT user_id FROM users WHERE issuer = ? AND subject = ?',
                                   (issuer, subject)).fetchone()
@@ -897,8 +976,11 @@ def sign_in(path: Path, *, issuer: str, subject: str, starter: Iterable[dict[str
     """The account of an identity the identity adapter has verified, created on first sign-in
     only while registration is open and below the account limit. A disabled or deleted account
     is refused and never reopened by signing in. ``starter`` lists the public job boards a new
-    account follows at first, like a new single-user workspace."""
+    account follows at first, like a new single-user workspace. The guest issuer is never signed
+    in, and guest workspaces do not count against max_accounts."""
     issuer, subject = _text(issuer, 'issuer', 2048), _text(subject, 'subject')
+    if issuer == GUEST_ISSUER:
+        raise Refused("A guest identity cannot sign in", "account_disabled")
     with transaction(path, write=True) as connection:
         user = connection.execute('SELECT user_id, active, deleted_at FROM users WHERE issuer = ? AND subject = ?',
                                   (issuer, subject)).fetchone()
@@ -912,7 +994,8 @@ def sign_in(path: Path, *, issuer: str, subject: str, starter: Iterable[dict[str
         if settings.get("registration_open") != "1":
             raise Refused("Registration is closed", "registration_closed")
         limit = _positive(settings.get("max_accounts"))
-        count = connection.execute('SELECT COUNT(*) FROM users WHERE deleted_at IS NULL').fetchone()[0]
+        count = connection.execute('SELECT COUNT(*) FROM users WHERE deleted_at IS NULL AND issuer != ?',
+                                   (GUEST_ISSUER,)).fetchone()[0]
         if limit is None or count >= limit:
             raise Refused("The pilot is full", "registration_full")
         return _create_user(connection, issuer, subject, starter)
@@ -937,7 +1020,9 @@ def set_user_active(path: Path, user_id: str, *, active: bool) -> None:
         if changed.rowcount != 1:
             raise NotFound("Account unavailable")
         if not active:
+            _add_tables(connection)  # a store this release has not started on yet has no guest tables
             connection.execute('DELETE FROM sessions WHERE user_id = ?', (user_id,))
+            connection.execute('DELETE FROM guest_sessions WHERE user_id = ?', (user_id,))
             _cancel_tasks(connection, user_id, "The account was disabled")
 
 
@@ -946,11 +1031,14 @@ def delete_account(path: Path, user_id: str, ledger: Path | None = None) -> dict
     same sign-in can never reopen it, and the deletion time. With ``ledger`` (a file outside the
     database, kept beside it) the tombstone is also appended there first, so restoring an older
     backup can delete the account again (v2_backup.py). Backups made earlier still hold the data
-    until they expire; that is stated to users, not hidden."""
+    until they expire; that is stated to users, not hidden. A guest workspace is refused: it ends
+    with end_guest, which keeps no tombstone (no one can sign in as a guest again)."""
     with transaction(path, write=True) as connection:
         user = connection.execute('SELECT * FROM users WHERE user_id = ? AND deleted_at IS NULL', (user_id,)).fetchone()
         if user is None:
             raise NotFound("Account unavailable")
+        if user['issuer'] == GUEST_ISSUER:
+            raise StoreError("This is a guest workspace; end it with end_guest (python -m feiran.v2_admin guests end)")
         record = {"user_id": user_id, "issuer": user["issuer"], "subject": user["subject"], "deleted_at": _now()}
         if ledger is not None:
             append_deletion(ledger, record)
@@ -1069,18 +1157,20 @@ class Session:
     user_id: str
     csrf_token: str
     expires_at: str
+    guest: bool = False  # a guest workspace's session (guest_sessions), never a signed-in user's
 
 
 def create_session(path: Path, user_id: str, *, lifetime: timedelta, idle: timedelta) -> tuple[str, Session]:
     """A new server-side session for an active account. Only the token's hash is stored; the
-    token itself goes into the browser's cookie once. Expired sessions are cleared here too."""
+    token itself goes into the browser's cookie once. Expired sessions are cleared here too.
+    A guest workspace gets its sessions from create_guest_session only."""
     if lifetime <= timedelta(0) or idle <= timedelta(0):
         raise StoreError("Session lifetimes must be positive")
     token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     now = _clock()
     with transaction(path, write=True) as connection:
-        user = connection.execute('SELECT active FROM users WHERE user_id = ?', (user_id,)).fetchone()
-        if not user or not user['active']:
+        user = connection.execute('SELECT active, issuer FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        if not user or not user['active'] or user['issuer'] == GUEST_ISSUER:
             raise NotFound("Account unavailable")
         connection.execute('DELETE FROM sessions WHERE expires_at <= ? OR idle_expires_at <= ?',
                            (_stamp(now), _stamp(now)))
@@ -1093,13 +1183,25 @@ def create_session(path: Path, user_id: str, *, lifetime: timedelta, idle: timed
 
 def resolve_session(path: Path, token: str | None) -> Session | None:
     """The session a cookie names, if it is unexpired, not revoked and its account is active.
-    Activity extends the idle limit (at most once a minute), never the absolute one."""
+    Activity extends the idle limit (at most once a minute), never the absolute one. A guest
+    workspace's session (``guest``) holds only while the workspace is ready and before its fixed
+    end; nothing extends it."""
     if not isinstance(token, str) or not 20 <= len(token) <= 128:
         return None
     key, now = _hash(token), _clock()
     with transaction(path) as connection:
         row = connection.execute('''SELECT s.*, u.active FROM sessions s JOIN users u ON u.user_id = s.user_id
             WHERE s.token_hash = ?''', (key,)).fetchone()
+        guest = None if row is not None else connection.execute(
+            '''SELECT s.user_id, s.csrf_token, MIN(s.expires_at, g.expires_at) AS expires_at
+               FROM guest_sessions s JOIN guest_workspaces g ON g.user_id = s.user_id
+               JOIN users u ON u.user_id = s.user_id
+               WHERE s.token_hash = ? AND g.ready = 1 AND u.active = 1 AND u.issuer = ?''',
+            (key, GUEST_ISSUER)).fetchone()
+    if guest is not None:
+        if guest['expires_at'] <= _stamp(now):
+            return None  # ended: expire_guests removes the workspace and its sessions
+        return Session(guest['user_id'], guest['csrf_token'], guest['expires_at'], guest=True)
     if row is None or not row['active']:
         return None
     if row['expires_at'] <= _stamp(now) or row['idle_expires_at'] <= _stamp(now):
@@ -1117,6 +1219,7 @@ def revoke_session(path: Path, token: str | None) -> None:
     if isinstance(token, str) and token:
         with transaction(path, write=True) as connection:
             connection.execute('DELETE FROM sessions WHERE token_hash = ?', (_hash(token),))
+            connection.execute('DELETE FROM guest_sessions WHERE token_hash = ?', (_hash(token),))
 
 
 def save_login_attempt(path: Path, *, state: str, binding: str, nonce: str, code_verifier: str,
@@ -1146,6 +1249,149 @@ def take_login_attempt(path: Path, *, state: str, binding: str) -> dict[str, str
     if row['expires_at'] <= _now():
         return None
     return {"nonce": row['nonce'], "code_verifier": row['code_verifier'], "return_to": row['return_to']}
+
+
+# ---------------------------------------------------------------------------------------------
+# Guest workspaces: accounts the server makes for one visitor's one-click start (the web layer
+# checks the click came from this site's own page). See the module docstring.
+
+def start_guest(path: Path, *, start: str) -> tuple[str, bool]:
+    """The guest workspace of one one-click start, and whether it was made now. ``start`` is the
+    browser's start token: the same start sent again (a double click, a resend) finds the
+    workspace it made, so it never makes two. A new one is made only while guest workspaces are
+    on, fewer than guest_max_active are open and fewer than guest_starts_per_hour were started in
+    the last hour; a refusal says which (guest_disabled, guest_full, guest_rate_limited) and
+    writes nothing. The new account ends guest_lifetime_minutes from now and is not ready yet:
+    the caller puts the sample in through its UserWorkspace, then calls guest_ready."""
+    digest, now = _hash(_text(start, 'start token', 128)), _clock()
+    with transaction(path, write=True) as connection:
+        limits = _guest_limits(_settings(connection))
+        if not limits["enabled"]:
+            raise Refused("Guest workspaces are not available right now; sign in instead", "guest_disabled")
+        found = connection.execute('SELECT user_id, expires_at, ready FROM guest_workspaces WHERE start_sha256 = ?',
+                                   (digest,)).fetchone()
+        if found is not None:
+            if found['expires_at'] <= _stamp(now):
+                raise Refused("This guest workspace has ended; reload the page to start a new one", "guest_ended")
+            if not found['ready']:
+                raise Refused("Your guest workspace is still being prepared; try again in a moment", "guest_preparing")
+            return found['user_id'], False
+        active = connection.execute('SELECT COUNT(*) FROM guest_workspaces WHERE expires_at > ?', (_stamp(now),)).fetchone()[0]
+        if active >= limits["max_active"]:
+            raise Refused("All guest workspaces are in use right now; try again later, or sign in", "guest_full")
+        connection.execute('DELETE FROM guest_starts WHERE started_at <= ?', (_stamp(now - GUEST_START_WINDOW),))
+        if connection.execute('SELECT COUNT(*) FROM guest_starts').fetchone()[0] >= limits["starts_per_hour"]:
+            raise Refused("Many guest workspaces were started in the last hour; try again later, or sign in",
+                          "guest_rate_limited")
+        user_id = _create_user(connection, GUEST_ISSUER, "guest-" + secrets.token_hex(16))
+        connection.execute('INSERT INTO guest_workspaces VALUES (?, ?, ?, ?, 0)',
+                           (user_id, digest, _stamp(now), _stamp(now + timedelta(minutes=limits["lifetime_minutes"]))))
+        connection.execute('INSERT INTO guest_starts VALUES (?)', (_stamp(now),))
+        return user_id, True
+
+
+def guest_ready(path: Path, user_id: str) -> None:
+    """The sample is in: the guest workspace may be given sessions from now on."""
+    with transaction(path, write=True) as connection:
+        if connection.execute('UPDATE guest_workspaces SET ready = 1 WHERE user_id = ?', (user_id,)).rowcount != 1:
+            raise NotFound("Guest workspace unavailable")
+
+
+def create_guest_session(path: Path, user_id: str) -> tuple[str, Session]:
+    """A new session for a ready guest workspace that has not ended; it ends with the workspace.
+    Only the token's hash is stored. At most GUEST_SESSIONS stay open: the oldest go first."""
+    token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    now = _stamp(_clock())
+    with transaction(path, write=True) as connection:
+        guest = connection.execute('''SELECT g.expires_at FROM guest_workspaces g JOIN users u ON u.user_id = g.user_id
+            WHERE g.user_id = ? AND g.ready = 1 AND g.expires_at > ? AND u.active = 1 AND u.issuer = ?''',
+                                   (user_id, now, GUEST_ISSUER)).fetchone()
+        if guest is None:
+            raise NotFound("Guest workspace unavailable")
+        connection.execute('''DELETE FROM guest_sessions WHERE user_id = ? AND token_hash NOT IN (
+            SELECT token_hash FROM guest_sessions WHERE user_id = ? ORDER BY created_at DESC, token_hash LIMIT ?)''',
+                           (user_id, user_id, GUEST_SESSIONS - 1))
+        connection.execute('INSERT INTO guest_sessions VALUES (?, ?, ?, ?, ?)',
+                           (_hash(token), user_id, csrf, now, guest['expires_at']))
+    return token, Session(user_id, csrf, guest['expires_at'], guest=True)
+
+
+def _is_guest(connection: sqlite3.Connection, user_id: str) -> bool:
+    return connection.execute('''SELECT 1 FROM guest_workspaces g JOIN users u ON u.user_id = g.user_id
+        WHERE g.user_id = ? AND u.issuer = ?''', (user_id, GUEST_ISSUER)).fetchone() is not None
+
+
+def _purge_guest(connection: sqlite3.Connection, user_id: str) -> bool:
+    """Remove one guest workspace whole, inside the caller's transaction: every row of the
+    account, its sessions and the account itself, with no tombstone and no ledger line (no one
+    can sign in as a guest, so there is nothing to keep closed). Its queued and running work is
+    cancelled first: a result that arrives later finds no execution to publish under. Anything
+    but a guest account (GUEST_ISSUER with a guest_workspaces row) is left alone: False."""
+    if not _is_guest(connection, user_id):
+        return False
+    _cancel_tasks(connection, user_id, "The guest workspace ended")
+    _fold_calls(connection, user_id)  # a guest makes no model call; were there one, its day keeps it
+    for table in USER_TABLES:
+        connection.execute(f'DELETE FROM {table} WHERE user_id = ?', (user_id,))
+    connection.execute('DELETE FROM quota_usage WHERE scope = ?', (user_id,))
+    connection.execute('DELETE FROM users WHERE user_id = ? AND issuer = ?', (user_id, GUEST_ISSUER))
+    return True
+
+
+def end_guest(path: Path, user_id: str) -> bool:
+    """End one guest workspace now (its own choice, signing in from it, or the operator's) and
+    remove it whole; False when ``user_id`` is no guest workspace. A signed-in user's account is
+    never touched here."""
+    with transaction(path, write=True) as connection:
+        return _purge_guest(connection, _text(user_id, 'user_id'))
+
+
+def expire_guests(path: Path, *, everything: bool = False) -> int:
+    """Remove every guest workspace that has ended: its fixed end has passed, its account was
+    disabled or deleted, or it was never made ready within GUEST_SEED_WAIT (its start failed
+    halfway). With ``everything``, every guest workspace (before guests are switched off for good,
+    or a release without them is installed). The app runs this at each start and from the task
+    runner's loop, so a restart or a restored copy is cleaned up as well. Finding none takes no
+    write lock; each workspace goes in its own short transaction. Returns how many went."""
+    now = _clock()
+    with transaction(path) as connection:
+        due = [row['user_id'] for row in connection.execute(
+            '''SELECT g.user_id FROM guest_workspaces g JOIN users u ON u.user_id = g.user_id
+               WHERE ? OR g.expires_at <= ? OR u.active = 0 OR u.deleted_at IS NOT NULL
+                  OR (g.ready = 0 AND g.created_at <= ?) ORDER BY g.expires_at, g.user_id''',
+            (int(everything), _stamp(now), _stamp(now - GUEST_SEED_WAIT))).fetchall()]
+    removed = 0
+    for user_id in due:
+        with transaction(path, write=True) as connection:
+            removed += _purge_guest(connection, user_id)
+    return removed
+
+
+def _guest_state(connection: sqlite3.Connection, user_id: str) -> dict[str, Any] | None:
+    row = connection.execute('SELECT * FROM guest_workspaces WHERE user_id = ?', (user_id,)).fetchone()
+    if row is None or not _is_guest(connection, user_id):
+        return None
+    limits = _guest_limits(_settings(connection))
+    lifetime = datetime.fromisoformat(row['expires_at']) - datetime.fromisoformat(row['created_at'])
+    return {"created_at": row['created_at'], "expires_at": row['expires_at'],
+            "lifetime_minutes": int(lifetime.total_seconds() // 60), "ready": bool(row['ready']),
+            "tasks_used": connection.execute('SELECT COUNT(*) FROM tasks WHERE user_id = ?', (user_id,)).fetchone()[0],
+            "task_limit": limits["max_tasks"],
+            "versions_used": connection.execute('SELECT COUNT(*) FROM materials WHERE user_id = ?', (user_id,)).fetchone()[0],
+            "version_limit": GUEST_MAX_VERSIONS}
+
+
+def list_guests(path: Path) -> dict[str, Any]:
+    """For the operator: the guest settings in force and each guest workspace (internal ID, when
+    it started and ends, whether it is ready, how many tasks and CV versions it made); no content."""
+    with transaction(path) as connection:
+        limits = _guest_limits(_settings(connection))
+        guests = [{"user_id": row['user_id'], **_guest_state(connection, row['user_id'])}
+                  for row in connection.execute('SELECT user_id FROM guest_workspaces ORDER BY created_at, user_id').fetchall()
+                  if _is_guest(connection, row['user_id'])]
+        recent = connection.execute('SELECT COUNT(*) FROM guest_starts WHERE started_at > ?',
+                                    (_stamp(_clock() - GUEST_START_WINDOW),)).fetchone()[0]
+    return {"settings": limits, "started_last_hour": recent, "workspaces": guests}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1263,7 +1509,9 @@ class UserWorkspace:
 
     Construct with a server-resolved user_id, never a client-selected identity. The object
     holds no connection or cached account status and may be used after a process restart.
-    Every call checks the user's active state inside the same transaction as its reads/writes.
+    Every call checks the user's active state inside the same transaction as its reads/writes;
+    a guest workspace past its end is unavailable the same way, whatever still holds its ID (a
+    task finishing late, say), even before expire_guests removes it.
     Approval and fact confirmation only happen through methods named for the user's decision.
     """
     database: Path
@@ -1273,8 +1521,9 @@ class UserWorkspace:
     def _transaction(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
         _text(self.user_id, 'user_id')
         with transaction(self.database, write=write) as connection:
-            user = connection.execute('SELECT active FROM users WHERE user_id = ?', (self.user_id,)).fetchone()
-            if not user or not user['active']:
+            user = connection.execute('''SELECT u.active, g.expires_at FROM users u
+                LEFT JOIN guest_workspaces g ON g.user_id = u.user_id WHERE u.user_id = ?''', (self.user_id,)).fetchone()
+            if not user or not user['active'] or (user['expires_at'] is not None and user['expires_at'] <= _now()):
                 raise NotFound("Account unavailable")
             yield connection
 
@@ -1798,6 +2047,10 @@ class UserWorkspace:
                          parent_id: str | None, profile_version: int, requirements_version: int | None,
                          request_id: str, request_payload: str, document: dict,
                          facts: list[tuple[str, int]]) -> str:
+        if _is_guest(connection, self.user_id) and connection.execute(
+                'SELECT COUNT(*) FROM materials WHERE user_id = ?', (self.user_id,)).fetchone()[0] >= GUEST_MAX_VERSIONS:
+            raise Refused("This guest workspace has made as many CV versions as it may; start a new guest workspace, "
+                          "or sign in to keep editing", "guest_version_limit", {"limit": GUEST_MAX_VERSIONS})
         version = connection.execute('''SELECT COALESCE(MAX(version), 0) + 1 FROM materials
             WHERE user_id = ? AND job_id = ? AND language = ?''', (self.user_id, job_id, language)).fetchone()[0]
         material_id = secrets.token_hex(16)
@@ -2667,6 +2920,11 @@ class UserWorkspace:
         _text(key, 'idempotency key', 200)
         if heavy not in ('model', 'pdf') or type(units) is not int or units < 0:
             raise StoreError("Invalid task")
+        guest = _is_guest(connection, self.user_id)
+        if guest:  # whatever the page or a route asks: print-only work, never a model call or a page read
+            if operation not in GUEST_OPERATIONS or heavy != 'pdf':
+                raise Refused(GUEST_ONLY, "guest_not_allowed")
+            units = 0  # nothing of the daily model allowance; the guest limits below bound it instead
         payload = _json({"intent": request, "context": context or {}})
         if job_id is not None:
             self._job(connection, job_id)
@@ -2689,6 +2947,19 @@ class UserWorkspace:
         if queued >= 1:
             raise Refused("You already have work waiting; try again when it has started", "queue_full")
         limit = _positive(settings.get("queue_limit")) or 1
+        if guest:
+            # Each guest workspace makes a bounded number of tasks over its life, and guests together
+            # hold at most GUEST_QUEUED places (and less than half) of the site's queue, so they can
+            # never fill it for signed-in users.
+            most = _guest_limits(settings)["max_tasks"]
+            if existing is None and connection.execute('SELECT COUNT(*) FROM tasks WHERE user_id = ?',
+                                                       (self.user_id,)).fetchone()[0] >= most:
+                raise Refused("This guest workspace has used all its fit and PDF runs; start a new guest workspace, "
+                              "or sign in", "guest_task_limit", {"limit": most})
+            waiting = connection.execute('''SELECT COUNT(*) FROM tasks t JOIN guest_workspaces g ON g.user_id = t.user_id
+                WHERE t.status = 'queued' ''').fetchone()[0]
+            if waiting >= min(GUEST_QUEUED, limit // 2):
+                raise Refused("Guest workspaces are busy right now; try again in a minute", "queue_full")
         if connection.execute("SELECT COUNT(*) FROM tasks WHERE status = 'queued'").fetchone()[0] >= limit:
             raise Refused("The site is busy; try again in a minute", "queue_full")
         day = _reserve(connection, self.user_id, units, settings, model=heavy == 'model' and units > 0)
@@ -2752,6 +3023,12 @@ class UserWorkspace:
         ``used`` and ``limit`` are in the active mode's measure: legacy units or tokens."""
         with self._transaction() as connection:
             return _account_usage(connection, self.user_id, _today())
+
+    def guest(self) -> dict[str, Any] | None:
+        """None for a signed-in user's account; for a guest workspace, what its page shows: when
+        it started and ends (fixed), and how much of its task and CV version limits it has used."""
+        with self._transaction() as connection:
+            return _guest_state(connection, self.user_id)
 
 
 def _suggested(gaps: dict, requirement_id: str) -> Any:
@@ -2843,6 +3120,9 @@ def _running_task(connection: sqlite3.Connection, user_id: str, task_id: str, to
         raise LateResult("This task no longer holds its execution; its result is not published")
     if row['deadline_at'] is not None and row['deadline_at'] <= _now():
         raise LateResult("This task ran past its time limit; its result is not published")
+    guest = connection.execute('SELECT expires_at FROM guest_workspaces WHERE user_id = ?', (user_id,)).fetchone()
+    if guest is not None and guest['expires_at'] <= _now():  # ended, even before expire_guests removes it
+        raise LateResult("This guest workspace has ended; its result is not published")
     return row
 
 
@@ -3132,25 +3412,41 @@ def public_board_age(path: Path, provider: str, board: str) -> tuple[str | None,
 QUEUE_WAIT = timedelta(minutes=15)
 
 
-def claim_tasks(path: Path, *, total: int, pdf: int, deadline: timedelta, busy: Iterable[str] = ()) -> list[dict[str, Any]]:
+def claim_tasks(path: Path, *, total: int, pdf: int, deadline: timedelta, busy: Iterable[str] = (),
+                guests_running: int = 0) -> list[dict[str, Any]]:
     """Start up to ``total`` queued tasks (at most ``pdf`` of them PDF printing), oldest first,
     one per user at a time and never for a disabled account. A user is busy while a task of
     theirs is running here, and while the runner says (``busy``) that one of theirs is still
     executing although it has ended here: cancelled or timed out, its handler not yet returned.
-    Each claimed task gets a new execution token: only the holder of that token can publish its
-    result."""
+    Signed-in users' tasks start before any guest workspace's, and at most GUEST_RUNNING guest
+    tasks run at once (``guests_running``: the guests' handlers the runner still runs), so a
+    guest never takes a signed-in user's turn. A guest's task that is not print-only work is
+    ended, never started (submit_task never queues one; this is the second line), and an ended
+    guest's tasks wait for expire_guests. Each claimed task gets a new execution token: only the
+    holder of that token can publish its result."""
     claimed: list[dict[str, Any]] = []
     if total <= 0:
         return claimed
     now = _clock()
     with transaction(path, write=True) as connection:
         busy = set(busy) | {row['user_id'] for row in connection.execute("SELECT user_id FROM tasks WHERE status = 'running'")}
+        guest_slots = GUEST_RUNNING - max(guests_running, connection.execute(
+            "SELECT COUNT(*) FROM tasks t JOIN guest_workspaces g ON g.user_id = t.user_id WHERE t.status = 'running'"
+        ).fetchone()[0])
         queued = connection.execute(
-            "SELECT t.* FROM tasks t JOIN users u ON u.user_id = t.user_id "
-            "WHERE t.status = 'queued' AND u.active = 1 ORDER BY t.created_at, t.task_id").fetchall()
+            "SELECT t.*, (g.user_id IS NOT NULL AND u.issuer = ?) AS guest, g.expires_at AS guest_ends "
+            "FROM tasks t JOIN users u ON u.user_id = t.user_id LEFT JOIN guest_workspaces g ON g.user_id = t.user_id "
+            "WHERE t.status = 'queued' AND u.active = 1 ORDER BY guest, t.created_at, t.task_id", (GUEST_ISSUER,)).fetchall()
         for row in queued:
             if len(claimed) >= total:
                 break
+            if row['guest']:
+                if row['operation'] not in GUEST_OPERATIONS or row['heavy'] != 'pdf' or row['units']:
+                    _end_task(connection, row['user_id'], row['task_id'], 'failed', error_code='guest_not_allowed',
+                              message=GUEST_ONLY)
+                    continue
+                if guest_slots <= 0 or row['guest_ends'] <= _stamp(now):
+                    continue
             if row['user_id'] in busy or (row['heavy'] == 'pdf' and pdf <= 0):
                 continue
             token = secrets.token_urlsafe(24)
@@ -3159,9 +3455,10 @@ def claim_tasks(path: Path, *, total: int, pdf: int, deadline: timedelta, busy: 
                                (token, _stamp(now), _stamp(now + deadline), row['user_id'], row['task_id']))
             busy.add(row['user_id'])
             pdf -= row['heavy'] == 'pdf'
+            guest_slots -= bool(row['guest'])
             claimed.append({'user_id': row['user_id'], 'task_id': row['task_id'], 'operation': row['operation'],
                             'heavy': row['heavy'], 'token': token, 'job_id': row['job_id'],
-                            'request': _request_of(row['request_payload'])})
+                            'request': _request_of(row['request_payload']), 'guest': bool(row['guest'])})
     return claimed
 
 
@@ -3184,6 +3481,8 @@ def begin_call(path: Path, user_id: str, task_id: str, token: str, *, prompt_tok
         account = connection.execute('SELECT active FROM users WHERE user_id = ?', (user_id,)).fetchone()
         if account is None or not account['active']:
             raise NotFound("Account unavailable")
+        if _is_guest(connection, user_id):  # the last line of defence: no task of a guest's may reach a model
+            raise Refused("A guest workspace makes no model calls; nothing was sent", "guest_not_allowed")
         if row['heavy'] != 'model' or row['units'] == 0:
             raise StoreError("This task does not allow paid calls")
         settings = _settings(connection)
@@ -3304,7 +3603,7 @@ def mark_spending(path: Path, user_id: str, task_id: str, token: str, stage: str
     LateResult, so no call is made for it."""
     with transaction(path, write=True) as connection:
         row = _running_task(connection, user_id, task_id, token)
-        if row['units'] == 0:
+        if row['units'] == 0 or _is_guest(connection, user_id):
             raise StoreError("This task does not allow paid calls")
         state = _usage_state(row['usage'])
         state["calls"] += 1

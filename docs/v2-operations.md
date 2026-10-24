@@ -34,7 +34,7 @@
    脚本检查卷已挂载、服务已停止、数据为空或已是 V2，写入 V2 模式和 OIDC 设置，删除 V1 登录设置，设置 `WORKBENCH_BIND_ADDRESS=0.0.0.0`。`WORKBENCH_PUBLIC_HOST` 是源站私有 DNS；浏览器 CSRF 的 Origin 是 CloudFront HTTPS 地址。主机的入站仍由独立 CloudFront 栈限制。
 5. `fetch-secret.sh` 用主机角色向 Cognito 读取该应用客户端密钥，保存到 `/run/workbench/oidc_client_secret`（0400，容器 uid 10001）。不打印密钥、不把密钥作为参数，V2 不读取所有者 Basic 登录密钥；取不到密钥则配置失败。
 6. 使用现有 `workbench-release` 按镜像 digest 安装。安装器在 V2 模式读取 `feiran.web_v2.V2_DATA_FORMAT`（本次之前的发行版是根目录的 `web_v2`；安装器按每个镜像自己的代码布局调用），检查 V2 模块和配置。只有真正空的初始数据卷可跳过数据库完整性检查；已使用的 V2 卷必须通过 V2 备份工具的 `verify`（`python -m feiran.v2_backup verify`）：停服后将数据库、存在的 WAL/回滚日志与删除账本复制到 root 磁盘的私有可写目录，校验副本，原始数据保持只读。升级检查需预留源文件逻辑大小的两倍加 1 GiB；缺文件、链接、空间不足或仍在停服中都会拒绝。V1 数据必须先显式迁移。
-7. 安装成功需要同时满足：`GET /healthz` = 200；未登录 `GET /` = 303，跳往 `/login?return_to=/`；`GET /api/me` = 401。鉴权检查不通过则停止 V2，只有能安全读取当前数据的上一个发行版才可恢复；不会回到 V1 登录。
+7. 安装成功需要同时满足：`GET /healthz` = 200；未登录 `GET /` = 303，跳往 `/login?return_to=/`（开启访客工作区时跳往 `/welcome`，两者之外一律不通过）；`GET /api/me` = 401。鉴权检查不通过则停止 V2，只有能安全读取当前数据的上一个发行版才可恢复；不会回到 V1 登录。
 8. 再按 §4 配置**最多两个**合成试运行账号，完成 §5 的真实登录及隔离检查后才扩大人数。初始不配置 DeepSeek secret，不迁移真实资料。
 
 ### 备份与恢复
@@ -84,6 +84,8 @@ v2 delete <user_id> --confirm <user_id>   # 先写删除账本，再删数据并
 v2 sponsorship --limit 500      # 用本地规则补齐当前规则下缺失的 Sponsor 检查结果，每轮最多 500 份；--limit 0 只统计（§7）
 v2 sponsorship --limit 500 --after <上一轮输出的 next>   # 从上一轮停下的位置继续
 ```
+
+访客工作区默认关闭：`v2 set guest_enabled 1` 开启、`0` 停止新建，`v2 guests` 查看、`v2 guests end-all` 立即全部删除；各项上限（同时开放数、每小时新建数、固定时长、每个工作区的压缩/PDF 次数）都有不可突破的范围。完整说明、限制和本地试用命令见 [guest-workspaces.md](guest-workspaces.md)。回退到不支持访客的发行版前先执行 `v2 guests end-all`。
 
 每类操作的额度单位（`v2_flow.UNITS`）：上传简历 1、导入岗位/从 URL/开始岗位列表 3、准备简历 2、改写 1、版面 1、缺口检查 2、导出 PDF 1。提交时为用户和全站原子预留；确定未产生费用（例如在调用模型前失败）才退回，费用未知的不退回、也不自动无限重试。用演练里每个任务记录的 token 用量估算“每单位成本”，再由预算推出两个每日上限。AWS 预算告警不是硬上限，这两个设置和 `tasks_enabled` 才是。
 

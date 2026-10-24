@@ -287,6 +287,13 @@ if FAKE_NO_V2=1 "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail 'image
 called 'systemctl stop' && fail 'unsupported image stopped existing service'
 [ "$(running)" = "$image" ] || fail 'unsupported image changed release'
 : > "$calls"
+# With guest workspaces on, a signed-out / goes to the welcome page instead: that is healthy too.
+FAKE_ROOT_RESULT='303 http://127.0.0.1:8765/welcome' HEALTH_WAIT_ATTEMPTS=1 HEALTH_WAIT_SECONDS=0 \
+    "$host/install.sh" "$image" > /dev/null || fail 'refused the guest welcome redirect'
+called 'http://127.0.0.1:8765/api/me' || fail 'guest welcome install did not check API auth'
+[ "$(unit_state)" = active ] || fail 'guest welcome install not running'
+[ "$(running)" = "$image" ] || fail 'guest welcome install changed release'
+: > "$calls"
 if FAKE_API_CODE=200 HEALTH_WAIT_ATTEMPTS=1 HEALTH_WAIT_SECONDS=0 "$host/install.sh" "$image" > /dev/null 2>&1; then
     fail 'health alone accepted an unauthenticated API'
 fi
@@ -296,6 +303,20 @@ if FAKE_ROOT_RESULT='303 https://evil.example/login' HEALTH_WAIT_ATTEMPTS=1 HEAL
     fail 'accepted an unexpected login redirect'
 fi
 [ "$(unit_state)" = inactive ] || fail 'bad redirect left service serving'
+for redirect in '303 https://evil.example/welcome' '303 http://127.0.0.1:8765/welcome?next=//evil.example' \
+        '302 http://127.0.0.1:8765/welcome' '200 '; do
+    : > "$calls"
+    if FAKE_ROOT_RESULT=$redirect HEALTH_WAIT_ATTEMPTS=1 HEALTH_WAIT_SECONDS=0 "$host/install.sh" "$image" > /dev/null 2>&1; then
+        fail "accepted an unexpected root answer: $redirect"
+    fi
+    [ "$(unit_state)" = inactive ] || fail "unexpected root answer left service serving: $redirect"
+done
+: > "$calls"
+if FAKE_ROOT_RESULT='303 http://127.0.0.1:8765/welcome' FAKE_API_CODE=200 HEALTH_WAIT_ATTEMPTS=1 HEALTH_WAIT_SECONDS=0 \
+        "$host/install.sh" "$image" > /dev/null 2>&1; then
+    fail 'the guest welcome redirect accepted an unauthenticated API'
+fi
+[ "$(unit_state)" = inactive ] || fail 'guest welcome with open API left service serving'
 : > "$calls"
 # A signal after startup must not leave an unverified V2 release serving.
 if FAKE_INTERRUPT_INSTALL=1 "$host/install.sh" "$image_b" > /dev/null 2>&1; then fail 'interrupted install passed'; fi

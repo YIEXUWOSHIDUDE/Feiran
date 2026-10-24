@@ -521,3 +521,20 @@ input[type="file"]::file-selector-button { padding: 8px 12px; margin-right: 12px
 .account-usage p { margin: 8px 0 0; font-size: .9rem; }
 .ai-entry { margin: 12px 0; padding: 12px; border-left: 3px solid #526eaa; background: #f5f8fc; }
 .ai-entry input { width: 100%; min-width: 0; }
+
+/* Guest workspaces: the public welcome page and the notice a guest sees on every page. */
+.welcome-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-top: 18px; }
+.welcome-choice { border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; background: #fbfcfe; }
+.welcome-choice h3 { margin-top: 0; }
+.guest-choice { border-color: #c9d8ef; background: var(--accent-soft); }
+.guest-terms { margin: 10px 0; padding-left: 18px; color: var(--ink-soft); }
+.guest-terms li { margin: 6px 0; }
+.guest-banner { max-width: 1240px; margin: 12px auto; padding: 12px 20px; background: var(--warn-soft); border: 1px solid #f0d9a6; border-radius: 10px; color: #4d3800; }
+.guest-banner p { margin: 4px 0; font-size: .92rem; }
+.guest-banner .muted { color: #6b5414; }
+.guest-sample-note { padding: 10px 14px; border-left: 3px solid var(--warn); background: var(--warn-soft); color: #4d3800; }
+.guest-download { font-size: .92rem; }
+@media (max-width: 760px) {
+  .welcome-choices { grid-template-columns: minmax(0, 1fr); }
+  .guest-banner { margin-inline: 12px; }
+}

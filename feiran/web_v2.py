@@ -6,6 +6,13 @@ user's IDs find nothing. Writes need the session's CSRF token. Model calls, page
 printing are tasks (task_runner.py): a request queues them and returns at once, and the page
 follows the task. The single-user app (web.py) is unchanged and is never a fallback for a
 failed sign-in: this app refuses to start without Cognito settings.
+
+When the operator switches guest workspaces on (python -m feiran.v2_admin set guest_enabled 1), the public
+page /welcome also offers a guest workspace: one click there (POST /guest/start, checked by its
+own start token and this site's Origin) makes a short-lived account with the synthetic sample
+(feiran/guest_sample.py) and a session of its own. A guest's session reaches only GUEST_ROUTES, the
+store refuses a guest any work but fitting and printing (tenant_store), and the workspace is
+removed when it ends. Signing in is never replaced by a guest, nor a guest turned into an account.
 """
 
 import argparse
@@ -33,6 +40,7 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.routing import Match
 
+from feiran import guest_sample
 from feiran import run_log
 from feiran import tenant_store
 from feiran.cv import CVError, rejected_lines, render_html, rewritten_lines
@@ -56,11 +64,28 @@ from feiran.workspace import DataFormatError, recorded_data_format, write_atomic
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 SESSION_COOKIE = "__Host-feiran"
 LOGIN_COOKIE = "__Host-feiran-login"
+GUEST_START_COOKIE = "__Host-feiran-guest-start"
 LOCAL_SESSION_COOKIE = "feiran-session"  # http://localhost testing only: browsers refuse __Host- without https
 LOCAL_LOGIN_COOKIE = "feiran-login"
+LOCAL_GUEST_START_COOKIE = "feiran-guest-start"
 V2_DATA_FORMAT = 2
 V2_DATABASE = tenant_store.DATABASE
-PUBLIC_PATHS = ("/healthz", "/login", "/auth/callback", "/signed-out")
+PUBLIC_PATHS = ("/healthz", "/login", "/auth/callback", "/signed-out", "/welcome", "/guest/start")
+# Everything a guest workspace's session may reach, by method and route: its sample to read, the
+# CV's own edits, undo and redo, fitting, approving, printing and downloading, and ending the
+# workspace. Any other route (model work, uploads, job reads, profile changes, consent, account
+# deletion, and every route added later) is refused before it runs.
+GUEST_ROUTES = frozenset({
+    ("GET", "/"), ("GET", "/api/me"), ("GET", "/api/facts"), ("GET", "/api/cv/languages"), ("GET", "/api/jobs"),
+    ("GET", "/api/jobs/{job_id}"), ("GET", "/api/tasks/{task_id}"), ("POST", "/api/tasks/{task_id}/cancel"),
+    ("POST", "/api/notices/dismiss"), ("POST", "/api/jobs/{job_id}/language"),
+    ("POST", "/api/jobs/{job_id}/cv/{language}/lines/{block}"), ("POST", "/api/jobs/{job_id}/cv/{language}/edits/{edit_id}"),
+    ("POST", "/api/jobs/{job_id}/cv/{language}/change"), ("POST", "/api/jobs/{job_id}/cv/{language}/fit"),
+    ("POST", "/api/jobs/{job_id}/cv/{language}/approve"), ("POST", "/api/jobs/{job_id}/cv/{language}/export"),
+    ("GET", "/preview/{job_id}/{language}"), ("GET", "/download/{job_id}/{language}.pdf"),
+    ("POST", "/guest/end"), ("POST", "/logout"),
+})
+GUEST_START_KEEP = 1800  # seconds a welcome page's start token stays usable
 UNSAFE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 MAX_BODY = 256_000
 LANGUAGES = ("en", "zh")
@@ -73,7 +98,9 @@ CV_CHANGED = "This CV changed after the page showed it (another tab or window ch
 PREVIEW_CHANGED = ("<!doctype html><meta charset=\"utf-8\"><p>This CV changed after the page showed it. "
                    "Reload the page to read the current version.</p>")
 REFUSED_STATUS = {"queue_full": 429, "quota_exhausted": 429, "too_many_attempts": 429, "busy": 503,
-                  "tasks_paused": 503, "quota_unconfigured": 503, "consent_required": 403}
+                  "tasks_paused": 503, "quota_unconfigured": 503, "consent_required": 403,
+                  "guest_rate_limited": 429, "guest_full": 503, "guest_disabled": 404, "guest_preparing": 409,
+                  "guest_ended": 409}
 # What each model data flow sends, shown before a user first uses it (tenant_store.CONSENT_STAGES).
 PAGE_OUT_OF_DATE = "This page is out of date; reload it"
 SPONSOR_CHECK_FAILED = "The sponsor wording could not be checked; nothing was saved. Try again later."
@@ -150,6 +177,7 @@ class V2Settings:
         self.session_lifetime, self.session_idle = session_lifetime, session_idle
         self.session_cookie = SESSION_COOKIE if self.secure else LOCAL_SESSION_COOKIE
         self.login_cookie = LOGIN_COOKIE if self.secure else LOCAL_LOGIN_COOKIE
+        self.guest_start_cookie = GUEST_START_COOKIE if self.secure else LOCAL_GUEST_START_COOKIE
 
 
 class ConfirmRequest(BaseModel):
@@ -345,9 +373,12 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
     board_reads = BoardReads(boards, database)
     pdf_readers = threading.BoundedSemaphore(PDF_READERS)
     allowed_hosts = {settings.public_host, "localhost", "127.0.0.1"}
+    guest_starts = threading.Lock()  # one guest workspace is made at a time (this is the one process)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Guest workspaces that ended while the app was stopped go before anything is served.
+        await run_in_threadpool(tenant_store.expire_guests, database)
         runner.start()
         try:
             yield
@@ -361,11 +392,23 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
     def workspace(request: Request) -> UserWorkspace:
         return UserWorkspace(database, request.state.user_id)
 
-    def route_of(request: Request) -> str:
-        route = request.scope.get("route")
+    def matched_route(scope: dict) -> Any:
+        route = scope.get("route")
         if route is None:
-            route = next((item for item in app.router.routes if item.matches(request.scope)[0] == Match.FULL), None)
-        return getattr(route, "path", None) or "(no route)"
+            route = next((item for item in app.router.routes if item.matches(scope)[0] == Match.FULL), None)
+        return route
+
+    def route_of(request: Request) -> str:
+        return getattr(matched_route(request.scope), "path", None) or "(no route)"
+
+    def guest_allowed(request: Request) -> bool:
+        """Whether a guest's session may reach this request's route (GUEST_ROUTES). A path that
+        names no route is left to the router, which answers it as not found."""
+        route = matched_route(request.scope)
+        if route is None:
+            return True
+        method = "GET" if request.method == "HEAD" else request.method
+        return (method, getattr(route, "path", None)) in GUEST_ROUTES
 
     # Middlewares: the last declared runs first. Order: log, then guard, then limit the body.
     app.add_middleware(BodyLimit)
@@ -380,13 +423,15 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
             return JSONResponse({"error": "Unknown host"}, status_code=403)
         path = request.url.path
         request.state.user_id = None
+        request.state.guest = None  # a guest session's end time, when the session is a guest's
         public = path in PUBLIC_PATHS or path.startswith("/static/")
         if not public:
             token = request.cookies.get(settings.session_cookie)
             session = await run_in_threadpool(tenant_store.resolve_session, database, token)
             if session is None:
                 if path == "/":
-                    return RedirectResponse("/login?return_to=/", status_code=303)
+                    guests = (await run_in_threadpool(tenant_store.guest_settings, database))["enabled"]
+                    return RedirectResponse("/welcome" if guests else "/login?return_to=/", status_code=303)
                 response = JSONResponse({"error": "Please sign in again", "code": "signed_out"}, status_code=401)
                 return _headers(response)
             if request.method in UNSAFE_METHODS:
@@ -395,8 +440,12 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
                 if not secrets.compare_digest(supplied, session.csrf_token) or (
                         origin is not None and origin != settings.public_origin):
                     return _headers(JSONResponse({"error": "This page is out of date; reload it"}, status_code=403))
+            if session.guest and not guest_allowed(request):
+                return _headers(JSONResponse({"error": tenant_store.GUEST_ONLY, "code": "guest_not_allowed"},
+                                             status_code=403))
             request.state.user_id = session.user_id
             request.state.csrf = session.csrf_token
+            request.state.guest = session.expires_at if session.guest else None
         return _headers(await call_next(request))
 
     def _headers(response: Response) -> Response:
@@ -504,7 +553,11 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
                         "account_disabled": "This account is disabled. Contact the pilot organizer.",
                         "account_deleted": "This account was deleted."}
             return _page("Not signed in", messages.get(exc.code, str(exc)), None, 403)
-        tenant_store.revoke_session(database, request.cookies.get(settings.session_cookie))
+        earlier = request.cookies.get(settings.session_cookie)
+        before = tenant_store.resolve_session(database, earlier)
+        if before is not None and before.guest:
+            tenant_store.end_guest(database, before.user_id)  # signing in leaves the guest workspace: it goes now
+        tenant_store.revoke_session(database, earlier)
         token, _session = tenant_store.create_session(database, user_id, lifetime=settings.session_lifetime,
                                                       idle=settings.session_idle)
         response = RedirectResponse(return_to, status_code=303)
@@ -519,7 +572,10 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
 
     @app.post("/logout")
     def logout(request: Request) -> JSONResponse:
-        """End this session here first, then send the browser to Cognito's sign-out."""
+        """End this session here first, then send the browser to Cognito's sign-out. A guest's
+        session ends its workspace (nothing could open it again) and goes back to the welcome page."""
+        if request.state.guest is not None:
+            return end_guest_workspace(request)
         tenant_store.revoke_session(database, request.cookies.get(settings.session_cookie))
         response = JSONResponse({"logout_url": identity.logout_url()})
         response.delete_cookie(settings.session_cookie, path="/", secure=settings.secure, httponly=True, samesite="lax")
@@ -529,15 +585,91 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
     def index(request: Request) -> str:
         page = (WEB_DIR / "index.html").read_text(encoding="utf-8")
         page = page.replace("__WORKBENCH_TOKEN__", request.state.csrf)
-        return page.replace('<meta name="workbench-mode" content="local">', '<meta name="workbench-mode" content="v2">')
+        mode = '<meta name="workbench-mode" content="v2">'
+        if request.state.guest is not None:  # the page then shows the guest notice and only what a guest may do
+            mode += f'\n<meta name="workbench-guest" content="{escape(request.state.guest, quote=True)}">'
+        return page.replace('<meta name="workbench-mode" content="local">', mode)
 
     app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+
+    # -- guest workspaces ------------------------------------------------------------------
+
+    @app.get("/welcome", response_model=None)
+    def welcome(request: Request) -> Response:
+        """The public entry page while guest workspaces are on: sign in, or try a guest workspace.
+        It hands this browser a start token (cookie and page alike) that one click sends back."""
+        limits = tenant_store.guest_settings(database)
+        session = tenant_store.resolve_session(database, request.cookies.get(settings.session_cookie))
+        if not limits["enabled"] or (session is not None and not session.guest):
+            return RedirectResponse("/", status_code=303)  # off, or signed in: the usual way in
+        start = secrets.token_urlsafe(32)
+        page = (WEB_DIR / "welcome.html").read_text(encoding="utf-8")
+        for name, value in (("__GUEST_START__", start), ("__GUEST_STATE__", "guest" if session else "none"),
+                            ("__GUEST_ENDS__", session.expires_at if session else ""),
+                            ("__GUEST_LIFETIME__", str(limits["lifetime_minutes"]))):
+            page = page.replace(name, escape(value, quote=True))
+        response = HTMLResponse(page)
+        response.set_cookie(settings.guest_start_cookie, start, max_age=GUEST_START_KEEP, path="/",
+                            secure=settings.secure, httponly=True, samesite="strict")
+        return response
+
+    @app.post("/guest/start")
+    def guest_start(request: Request) -> JSONResponse:
+        """One deliberate click on the welcome page: open this browser's guest workspace, or make
+        one. Only from this site's page (its Origin, and the start token in both its cookie and
+        X-Guest-Start); never over a signed-in user's session. The same start sent twice opens
+        the one workspace it made."""
+        if not tenant_store.guest_settings(database)["enabled"]:
+            raise Refused("Guest workspaces are not available right now; sign in instead", "guest_disabled")
+        cookie = request.cookies.get(settings.guest_start_cookie) or ""
+        supplied = request.headers.get("x-guest-start") or ""
+        if (request.headers.get("origin") != settings.public_origin or not 20 <= len(cookie) <= 128
+                or not secrets.compare_digest(cookie.encode(), supplied.encode())):
+            return JSONResponse({"error": PAGE_OUT_OF_DATE, "code": "guest_start_refused"}, status_code=403)
+        current = tenant_store.resolve_session(database, request.cookies.get(settings.session_cookie))
+        if current is not None and not current.guest:
+            return JSONResponse({"error": "You are signed in already; open your workspace instead.",
+                                 "code": "signed_in", "next": "/"}, status_code=409)
+        if current is not None:  # this browser's guest workspace is still open: back to it
+            return JSONResponse({"next": "/", "resumed": True, "expires_at": current.expires_at})
+        with guest_starts:
+            user_id, made = tenant_store.start_guest(database, start=cookie)
+            if made:
+                try:
+                    guest_sample.seed(UserWorkspace(database, user_id))
+                    tenant_store.guest_ready(database, user_id)
+                except BaseException:
+                    tenant_store.end_guest(database, user_id)  # nothing half-made is kept or opened
+                    raise
+            token, session = tenant_store.create_guest_session(database, user_id)
+        run_log.event(access_log, "guest_started" if made else "guest_resumed")
+        response = JSONResponse({"next": "/", "resumed": not made, "expires_at": session.expires_at})
+        _cookie(response, settings.session_cookie, token)
+        response.delete_cookie(settings.guest_start_cookie, path="/", secure=settings.secure, httponly=True,
+                               samesite="strict")
+        return response
+
+    def end_guest_workspace(request: Request) -> JSONResponse:
+        tenant_store.end_guest(database, request.state.user_id)
+        run_log.event(access_log, "guest_ended")
+        response = JSONResponse({"ended": True, "logout_url": "/welcome?ended=1"})
+        response.delete_cookie(settings.session_cookie, path="/", secure=settings.secure, httponly=True, samesite="lax")
+        return response
+
+    @app.post("/guest/end")
+    def guest_end(request: Request) -> JSONResponse:
+        """The guest ends their workspace now: it and everything made in it are removed."""
+        if request.state.guest is None:
+            return JSONResponse({"error": "Only a guest workspace can be ended here", "code": "not_guest"}, status_code=403)
+        return end_guest_workspace(request)
 
     # -- account ---------------------------------------------------------------------------
 
     @app.get("/api/me")
     def me(request: Request) -> dict:
         user = workspace(request)
+        if request.state.guest is not None:  # no model features, so no allowance or data-flow notices
+            return {"guest": user.guest(), "consents": {}, "usage": None, "notices": {}}
         return {"consents": user.consents(), "usage": user.usage_today(),
                 "notices": {stage: {"version": tenant_store.CONSENT_STAGES[stage], "text": text}
                             for stage, text in CONSENT_NOTICES.items()}}

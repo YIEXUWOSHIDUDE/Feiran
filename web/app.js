@@ -7,6 +7,12 @@ const t = I18n.text;
 const TOKEN = document.querySelector('meta[name="workbench-token"]').content;
 // "v2": signed-in users on a shared server; heavy work runs as tasks the page follows.
 const MODE = (document.querySelector('meta[name="workbench-mode"]') || {}).content || "local";
+// V2 guest workspace: its fixed end time, or null for a signed-in user. The server decides what a
+// guest may do (web_v2.GUEST_ROUTES); the page only leaves out what would be refused and says why.
+const GUEST_ENDS = (() => {
+  const value = MODE === "v2" ? (document.querySelector('meta[name="workbench-guest"]') || {}).content : null;
+  return value && !Number.isNaN(Date.parse(value)) ? value : null;
+})();
 const app = document.getElementById("app");
 const message = document.getElementById("message");
 const TERMINAL = new Set(["succeeded", "failed", "interrupted", "superseded", "cancelled"]);
@@ -98,6 +104,10 @@ async function api(path, options = {}) {
   }
   const { response, body } = await request(path, options);
   if (MODE === "v2" && response.status === 401) {
+    if (GUEST_ENDS) {  // a guest workspace that ended is gone: back to the welcome page, not to sign-in
+      location.href = "/welcome?ended=1";
+      throw new Error(t("This guest workspace has ended."));
+    }
     location.href = `/login?return_to=${encodeURIComponent("/" + location.hash)}`;
     throw new Error(t("Your session ended. Sign in again."));
   }
@@ -338,11 +348,14 @@ async function renderFacts() {
   if (!current()) return;
   const rows = facts.map((fact) => el("tr", { class: "fact-row" },
     el("td", {}, el("code", {}, fact.id), el("div", { class: "muted" }, t`v${fact.version} · ${t(fact.fact_type)}`)),
-    el("td", {}, fact.text, el("div", { class: "tags" }, fact.tags.map((tag) => el("span", { class: "tag" }, tag))), factEditor(fact)),
+    el("td", {}, fact.text, el("div", { class: "tags" }, fact.tags.map((tag) => el("span", { class: "tag" }, tag))),
+      GUEST_ENDS ? null : factEditor(fact)),
   ));
   // The DOM writes a null child out as the text "null", and there is no account panel outside V2.
   app.replaceChildren(...[
-    uploadPanel(languages),
+    GUEST_ENDS ? guestPanel(t("The sample profile"),
+      t("This synthetic profile is what the sample CV is built from. It is read-only here: sign in to upload your own CV and edit your profile."))
+      : uploadPanel(languages),
     el("section", { class: "panel facts-panel" },
       el("h2", {}, t("Personal profile")),
       (interrupted || []).map((notice) => unfinishedNote(notice, renderFacts)),
@@ -350,7 +363,7 @@ async function renderFacts() {
       facts.length === 0
         ? el("p", {}, t("No profile content yet. Upload your CV above to begin."))
         : el("div", {},
-          el("a", { href: "#find", class: "button" }, t("Find jobs")),
+          GUEST_ENDS ? el("a", { href: "#jobs", class: "button" }, t("My jobs")) : el("a", { href: "#find", class: "button" }, t("Find jobs")),
           el("table", {},
             el("thead", {}, el("tr", {}, el("th", {}, t("Profile entry")), el("th", {}, t("Text and tags")))),
             el("tbody", {}, rows))),
@@ -418,6 +431,11 @@ async function renderJobs() {
         el("td", { class: "muted" }, localDate(job.captured_at)),
         el("td", {}, progress(job.steps)),
       ))));
+  if (GUEST_ENDS) {  // a guest workspace has its example job only: adding jobs reads pages and asks a model
+    app.replaceChildren(el("section", { class: "panel jobs-panel" }, el("h2", {}, t("Jobs")), list),
+      guestPanel(t("New job"), t("Sign in to add jobs from a link or a pasted description; a guest workspace works on its example job only.")));
+    return;
+  }
   app.replaceChildren(
     el("section", { class: "panel jobs-panel" }, el("h2", {}, t("Jobs")), list),
     el("section", { class: "panel new-job-panel" },
@@ -587,6 +605,12 @@ function listingRow(item, rank) {
 }
 
 async function renderFind() {
+  if (GUEST_ENDS) {  // reading companies' job boards is for signed-in users only
+    app.replaceChildren(guestPanel(t("Jobs that match your skills"),
+      t("Sign in to follow companies' public job boards and see their postings ranked by your skills. A guest workspace works on its example job only."),
+      el("a", { class: "button", href: "#jobs" }, t("My jobs"))));
+    return;
+  }
   const current = pageGuard();
   let listRequest = 0;
   let sourcesRequest = null;
@@ -771,7 +795,20 @@ function decidedLabel(item) {
   return "";
 }
 
+// A guest sees the sample's requirements as they were found; changing them would prepare the CV
+// again with DeepSeek, which a guest workspace never asks.
+function guestRequirements(view) {
+  const rows = (view.candidates || []).map((item) => el("tr", {},
+    el("td", {}, item.text, el("div", { class: "muted" }, I18n.join([strengthLabel(item.strength), item.section, decidedLabel(item)].filter(Boolean), " · "))),
+    el("td", { class: "choice" }, item.status === "excluded" ? t("Not counted") : t("Counted"))));
+  return el("section", { class: "panel step-panel requirements-panel" },
+    el("h2", {}, t("1. What this job asks for")),
+    el("p", { class: "muted" }, t("Found by Feiran's heading rules when this guest workspace was made: the lines under the example posting's Requirements and Nice to have headings, copied word for word. No AI was used. Sign in to review requirements or find them with DeepSeek.")),
+    rows.length ? el("table", {}, el("tbody", {}, rows)) : el("p", {}, t("No requirement lines were found.")));
+}
+
 function requirementsPanel(view, refresh) {
+  if (GUEST_ENDS) return guestRequirements(view);
   const choiceKey = `requirements:${view.job_id}`;
   const stored = editorDrafts.get(choiceKey);
   const choices = stored ? new Map(stored.value) : new Map();
@@ -883,7 +920,7 @@ const FIT_KEPT = {
 // How fitting this version of the CV on one page went: shown beside the version it is about.
 function fitNote(fit) {
   if (!fit) return null;
-  if (fit.status === "fits") return el("p", { class: "ok-text" }, t("Prints on one page; nothing was left out."));
+  if (fit.status === "fits") return el("p", { class: "ok-text" }, t("The current CV already fits on one page; no further content was omitted."));
   if (fit.status === "fitted") {
     return el("p", { class: "ok-text" },
       t`Fitted to one page: it printed on ${fit.pages_before} pages, so ${fit.left_out} less related line(s) are left out. Each is listed below; undo any you want back.`);
@@ -917,7 +954,8 @@ function localEditRow(view, language, edit, refresh) {
   const buttons = [];
   if (edit.can_undo || edit.can_redo) buttons.push(actionButton(edit.can_redo ? t("Redo") : t("Undo"),
     cvEditAction(view, language, `edits/${edit.id}`, { undone: !edit.undone }, refresh), true));
-  if (edit.can_save) buttons.push(actionButton(t("Save to my profile"),
+  // A guest's sample profile stays as it is: an edit lives in this CV only.
+  if (edit.can_save && !GUEST_ENDS) buttons.push(actionButton(t("Save to my profile"),
     cvEditAction(view, language, `lines/${edit.block}/save`, { expected_text: edit.text }, refresh), true));
   return el("div", { class: edit.undone ? "local-edit undone" : "local-edit" },
     el("p", {}, edit.where ? `${edit.where}: ` : "", edit.text),
@@ -949,7 +987,9 @@ function cvLineEditor(view, language, cv, refresh) {
       }, true));
   });
   return draftDetails(`cv:${view.job_id}:${language}`, { class: "cv-line-editor" }, el("summary", {}, t("Edit this CV")),
-    el("p", { class: "muted" }, t("Edits stay in this job's CV. Save a line to your profile separately to reuse it. Changed CVs need approval again.")),
+    el("p", { class: "muted" }, GUEST_ENDS
+      ? t("Edits stay in this job's CV and can be undone below. Changed CVs need approval again.")
+      : t("Edits stay in this job's CV. Save a line to your profile separately to reuse it. Changed CVs need approval again.")),
     el("p", { class: "muted" }, t("Unsaved words stay while you navigate within this tab. Reloading or closing the tab clears them. After a conflict, copy them or discard them to load the latest line.")),
     lines, recover);
 }
@@ -981,12 +1021,13 @@ function cvBlock(view, language, refresh) {
   }
   const approved = cv.head === "approved" && !cv.stale;
   const tools = [];
-  if (!cv.stale && cv.head === "draft") tools.push(actionButton(t("Reword with DeepSeek"), post("tailor"), true));
-  if (!cv.stale && (cv.head === "draft" || cv.head === "tailored")) tools.push(actionButton(t("Adjust for this job"), post("plan")));
-  if (!cv.stale && cv.head === "planned") tools.push(actionButton(t("Adjust again"), post("plan"), true));
+  // A guest workspace makes no model call: rewording, adjusting and preparing again are for signed-in users.
+  if (!GUEST_ENDS && !cv.stale && cv.head === "draft") tools.push(actionButton(t("Reword with DeepSeek"), post("tailor"), true));
+  if (!GUEST_ENDS && !cv.stale && (cv.head === "draft" || cv.head === "tailored")) tools.push(actionButton(t("Adjust for this job"), post("plan")));
+  if (!GUEST_ENDS && !cv.stale && cv.head === "planned") tools.push(actionButton(t("Adjust again"), post("plan"), true));
   // Leaves out the least related lines until the printed CV fits one page; never rewords.
   if (!cv.stale) tools.push(actionButton(t("Fit to one page"), post("fit"), true));
-  tools.push(actionButton(t("Start over"), post("prepare"), true));
+  if (!GUEST_ENDS) tools.push(actionButton(t("Start over"), post("prepare"), true));
   if (approved && !cv.final_pdf) tools.push(actionButton(t("Create final PDF"), post("export")));
   if (cv.final_pdf) {
     tools.push(el("a", { class: "button", href: `/download/${view.job_id}/${language}.pdf${tokenQuery("?")}` }, t("Download final PDF")));
@@ -996,6 +1037,7 @@ function cvBlock(view, language, refresh) {
   if (approved) notes.push(el("p", { class: "ok-text" }, t`Approved ${I18n.date(cv.approved_at, true)}. Editing this CV requires approval again.`));
   if (cv.stages) notes.push(stageList(cv.stages));
   if (cv.fit && !cv.stale) notes.push(fitNote(cv.fit));
+  else if (GUEST_ENDS && (cv.head === "draft" || cv.head === "planned")) notes.push(el("p", { class: "muted" }, t("This sample CV is the sample profile as written: a guest workspace has no AI rewording or adjustment. Edit its lines, fit it to one page, then approve and download it.")));
   else if (cv.head === "draft") notes.push(el("p", { class: "warning" }, t("This is your usual CV: DeepSeek could not reword or adjust it yet. Use the buttons above.")));
   else if (cv.head === "tailored") notes.push(el("p", { class: "warning" }, t("Reworded, but not adjusted for this job yet: DeepSeek could not plan it. Use Adjust for this job.")));
   if ((cv.language_fallbacks || []).length) {
@@ -1031,7 +1073,10 @@ function cvBlock(view, language, refresh) {
     const read = el("input", { type: "checkbox" });
     read.addEventListener("change", () => { approve.disabled = !read.checked; });
     approval = el("div", { class: "approval" },
-      el("label", {}, read, t(" I read the CV below and every change listed above.")), approve);
+      el("label", {}, read, t(" I read the CV below and every change listed above.")), approve,
+      GUEST_ENDS ? el("p", { class: "muted guest-download" }, t("To download the PDF: tick the box, choose Approve this CV, then Create final PDF. Download final PDF appears above once it is printed.")) : null);
+  } else if (GUEST_ENDS && approved && !cv.final_pdf) {
+    approval = el("p", { class: "muted guest-download" }, t("Approved. Choose Create final PDF above; Download final PDF appears once it is printed."));
   }
   const preview = el("iframe", {
     class: "preview", sandbox: "", title: t`${title} preview`,
@@ -1055,10 +1100,12 @@ function cvPanel(view, refresh) {
   }));
   return el("section", { class: "panel step-panel cv-panel" },
     el("h2", {}, t("2. Your CV for this job")),
-    el("p", { class: "muted" },
-      t("Prepared for this job using your profile: relevant content first, with suggested additions "),
-      t("and wording that follows the job's requirements. You choose which changes to adopt. "),
-      t("DeepSeek sees only your CV lines and this job's requirements, never your name, contact details, schools or employers.")),
+    GUEST_ENDS
+      ? el("p", { class: "muted" }, t("The sample CV for the example job, made from the sample profile when this guest workspace started. Everything you do here uses the real app: edits are saved as new versions, Fit to one page prints the CV to count its pages, and the PDF is printed after you approve it."))
+      : el("p", { class: "muted" },
+        t("Prepared for this job using your profile: relevant content first, with suggested additions "),
+        t("and wording that follows the job's requirements. You choose which changes to adopt. "),
+        t("DeepSeek sees only your CV lines and this job's requirements, never your name, contact details, schools or employers.")),
     field(t("CV language for this job"), language),
     cvBlock(view, main, refresh),
     // A second language is offered only when the resume itself is written in it.
@@ -1273,6 +1320,10 @@ function coverageRow(view, language, item, refresh, post) {
 }
 
 function gapsPanel(view, refresh) {
+  if (GUEST_ENDS) {  // the check and its suggestions are DeepSeek's: for signed-in users only
+    return guestPanel(t("3. What this CV shows for each requirement"),
+      t("Sign in to have DeepSeek compare your CV with each requirement and suggest complete entries to adopt. A guest workspace makes no AI requests."));
+  }
   const gaps = view.gaps && !view.gaps.outdated ? view.gaps : null;
   const acted = shownCheck(view);
   const post = (path, body) => async () => {
@@ -1439,7 +1490,8 @@ async function renderJob(jobId) {
           [jd.company, jd.location].filter(Boolean).join(" · ") || t("Company unknown"), t(" · captured "), localDate(jd.captured_at)),
         el("p", { class: "source-reference muted" }, sourceReference(jd.source)),
         jd.provider === "web" ? el("p", { class: "muted" }, t("Read from a public webpage. Check the description below for completeness; the source and whether the role is still open have not been verified.")) : null,
-        view.review ? sponsorshipSummary(view.review.sponsorship, false, MODE === "v2" ? actionButton(t("Check the sponsor wording"), async () => {
+        GUEST_ENDS ? el("p", { class: "guest-sample-note" }, t("Example job and sample CV, prepared without AI when this guest workspace was made. The person, the company and the posting are synthetic.")) : null,
+        view.review ? sponsorshipSummary(view.review.sponsorship, false, MODE === "v2" && !GUEST_ENDS ? actionButton(t("Check the sponsor wording"), async () => {
           await api(`/api/jobs/${jobId}/sponsorship`, { method: "POST" });
           await refresh(true);
         }, true) : null) : null,
@@ -1502,6 +1554,7 @@ function tokenQuery(separator) {
 let usageRequest = 0;
 async function refreshUsage() {
   if (MODE !== "v2") return;
+  if (GUEST_ENDS) return refreshGuest();
   const ticket = ++usageRequest;
   const box = document.getElementById("account-usage");
   if (!box) return;
@@ -1528,8 +1581,60 @@ async function refreshUsage() {
   }
 }
 
+// A short section for what a guest workspace leaves to signed-in users, saying why.
+function guestPanel(title, text, ...more) {
+  return el("section", { class: "panel guest-panel" }, el("h2", {}, title), el("p", { class: "muted" }, text),
+    el("div", { class: "toolbar" }, el("a", { class: "button", href: "/login?return_to=/" }, t("Sign in")), ...more));
+}
+
+// The guest notice: whose data this is, when the workspace ends (its fixed end and what is left),
+// and how much of its limits it has used. No daily model allowance is shown: a guest has none.
+function guestTimeText(now = Date.now()) {
+  const minutes = Math.ceil((Date.parse(GUEST_ENDS) - now) / 60000);
+  if (minutes <= 0) return t("This guest workspace has ended; everything in it is being deleted.");
+  const left = minutes >= 60 ? t`${Math.floor(minutes / 60)} h ${minutes % 60} min` : t`${minutes} min`;
+  return t`Ends at ${I18n.date(GUEST_ENDS, true)} (${left} left). Everything in it is then deleted.`;
+}
+
+let guestRequest = 0;
+async function refreshGuest() {
+  const ticket = ++guestRequest;
+  const time = document.getElementById("guest-time");
+  if (time) I18n.setText(time, guestTimeText());
+  const limits = document.getElementById("guest-limits");
+  if (!limits) return;
+  try {
+    const { response, body } = await request("/api/me");
+    if (!response.ok || !body.guest) throw new Error("unavailable");
+    if (ticket !== guestRequest) return;
+    const guest = body.guest;
+    I18n.setText(limits, t`Fit and PDF runs used: ${guest.tasks_used} of ${guest.task_limit} · CV versions: ${guest.versions_used} of ${guest.version_limit}`);
+  } catch (_) {
+    if (ticket === guestRequest) I18n.setText(limits, t("The guest workspace's limits are temporarily unavailable."));
+  }
+}
+
+function guestTools() {
+  const end = el("button", { class: "secondary", type: "button" }, t("End guest session"));
+  end.addEventListener("click", () => run(async () => {
+    if (!window.confirm(t("End this guest workspace now? Everything in it is deleted, and it cannot be opened again."))) return;
+    const { logout_url: next } = await api("/guest/end", { method: "POST" });
+    location.href = next;
+  }));
+  const findLink = document.querySelector('nav a[data-route="find"]');
+  if (findLink) findLink.remove();
+  document.querySelector(".header-actions").append(el("a", { class: "button", href: "/login?return_to=/" }, t("Sign in")), end);
+  document.querySelector("header.top").after(el("aside", { id: "guest-banner", class: "guest-banner", "aria-label": t("Guest workspace") },
+    el("p", {}, el("strong", {}, t("Guest workspace")), " · ", t("synthetic sample data"), " · ", el("span", { id: "guest-time" }, guestTimeText())),
+    el("p", { class: "muted" }, t("No AI requests are made here. Sign in to use DeepSeek, upload your own CV or add jobs; a guest workspace is not turned into an account, and its sample stays behind.")),
+    el("p", { class: "muted", id: "guest-limits" }, t("Loading…"))));
+  setInterval(() => { void refreshGuest(); }, 30000);
+  window.addEventListener("focus", () => { void refreshGuest(); });
+}
+
 function accountTools() {
   if (MODE !== "v2") return;
+  if (GUEST_ENDS) return guestTools();
   const signOut = el("button", { class: "secondary", type: "button" }, t("Sign out"));
   signOut.addEventListener("click", () => run(async () => {
     const { logout_url: next } = await api("/logout", { method: "POST" });
@@ -1541,7 +1646,7 @@ function accountTools() {
 }
 
 function accountPanel() {
-  if (MODE !== "v2") return null;
+  if (MODE !== "v2" || GUEST_ENDS) return null;  // a guest ends the workspace from the header instead
   const remove = el("button", { class: "secondary", type: "button" }, t("Delete my account and data"));
   remove.addEventListener("click", () => run(async () => {
     const typed = window.prompt(t("This deletes your facts, CVs, jobs and PDFs now and cannot be undone. Backups are deleted when they expire. Type DELETE to continue."));
@@ -1556,9 +1661,15 @@ function accountPanel() {
 
 const routes = { facts: renderFacts, find: renderFind, jobs: renderJobs };
 
-// With no page chosen, any saved profile content can continue to job discovery.
+// With no page chosen, any saved profile content can continue to job discovery; a guest goes
+// straight to the example job.
 async function openDefault() {
   const current = pageGuard();
+  if (GUEST_ENDS) {
+    const { jobs } = await api("/api/jobs");
+    if (current()) location.replace(jobs.length === 1 ? `#job/${jobs[0].job_id}` : "#jobs");
+    return;
+  }
   const { facts } = await api("/api/facts");
   if (!current()) return;
   location.replace(facts.length ? "#find" : "#facts");
