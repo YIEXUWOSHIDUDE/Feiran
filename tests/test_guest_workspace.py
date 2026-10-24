@@ -1,9 +1,11 @@
 """Guest workspaces end to end with synthetic data: the switch and its bounded limits, the
 one-click start (Origin, start token, double clicks), isolation between guests and from a
-signed-in user, the routes and work a guest is refused (no model call, upload or page read),
-the real edit, fit, approve and print flow, and the end of a workspace: expiry, removal of
-everything it held, restarts, late results, backups and the operator's commands. The model,
-printer and job boards are scripted stand-ins; nothing leaves the machine."""
+signed-in user, the routes and work a guest is refused (uploads, page and board reads, profile
+changes, other work), the real edit, fit, approve and print flow, and the end of a workspace by
+the guest or the operator: removal of everything it held, restarts, late results, backups and
+the operator's commands. Guests' AI allowances and the absence of a time limit are in
+tests/test_guest_ai.py. The model, printer and job boards are scripted stand-ins; nothing leaves
+the machine."""
 import contextlib
 import io
 import json
@@ -147,21 +149,25 @@ class SwitchTests(GuestCase):
         self.assertEqual(guest_ids(self.database), [])
         fresh = Path(tempfile.mkdtemp(dir=self.root)) / "v2.db"
         initialize_store(fresh)
-        self.assertEqual(tenant_store.guest_settings(fresh), {"enabled": False, "max_active": 10, "starts_per_hour": 20,
-                                                             "lifetime_minutes": 120, "max_tasks": 20})
-        for key, bad in [("guest_enabled", "yes"), ("guest_max_active", "0"), ("guest_max_active", "101"),
-                         ("guest_starts_per_hour", "1000"), ("guest_lifetime_minutes", "5"),
-                         ("guest_lifetime_minutes", "100000"), ("guest_max_tasks", "-1"), ("guest_max_tasks", "２")]:
+        self.assertEqual(tenant_store.guest_settings(fresh), {"enabled": False, "max_active": 100, "starts_per_hour": 20,
+                                                             "max_tasks": 20, "lifetime_tokens": 100_000,
+                                                             "daily_tokens": 1_000_000})
+        for key, bad in [("guest_enabled", "yes"), ("guest_max_active", "0"), ("guest_max_active", "1001"),
+                         ("guest_starts_per_hour", "1000"), ("guest_lifetime_tokens", "999"),
+                         ("guest_lifetime_tokens", "1000001"), ("guest_daily_tokens", "9999"),
+                         ("guest_daily_tokens", "100000001"), ("guest_max_tasks", "-1"), ("guest_max_tasks", "２"),
+                         ("guest_lifetime_minutes", "120")]:  # a guest workspace has no time limit to set
             with self.assertRaises(StoreError, msg=(key, bad)):
                 set_setting(self.database, key, bad)
         # A value written past the checks is still read within its bounds.
         with tenant_store.transaction(self.database, write=True) as connection:
             connection.executemany("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                                   [("guest_max_active", "100000"), ("guest_lifetime_minutes", "1"),
-                                    ("guest_starts_per_hour", "junk"), ("guest_max_tasks", "0")])
+                                   [("guest_max_active", "100000"), ("guest_lifetime_tokens", "1"),
+                                    ("guest_starts_per_hour", "junk"), ("guest_max_tasks", "0"),
+                                    ("guest_daily_tokens", str(10 ** 15))])
         self.assertEqual(tenant_store.guest_settings(self.database),
-                         {"enabled": False, "max_active": 100, "starts_per_hour": 20, "lifetime_minutes": 10,
-                          "max_tasks": 20})
+                         {"enabled": False, "max_active": 1000, "starts_per_hour": 20, "max_tasks": 20,
+                          "lifetime_tokens": 1_000, "daily_tokens": 100_000_000})
 
     def test_a_guest_identity_can_never_sign_in_or_be_provisioned(self):
         with self.assertRaises(StoreError):
@@ -380,18 +386,13 @@ class GuestAbilityTests(GuestCase):
                 ("POST", "/api/sources/greenhouse/mongodb/refresh", None), ("GET", "/api/listings", None),
                 ("POST", "/api/listings/start", {}), ("POST", "/api/jobs", {"title": "t", "text": "Requirements:\n- x"}),
                 ("POST", "/api/jobs/from-url", {"url": "https://boards.greenhouse.io/x/jobs/1"}),
-                ("POST", f"/api/jobs/{job_id}/sponsorship", {}), ("POST", f"/api/jobs/{job_id}/requirements/add", {}),
-                ("POST", f"/api/jobs/{job_id}/requirements/find", {}),
-                ("POST", f"/api/jobs/{job_id}/requirements/decide", {}),
-                ("POST", f"/api/jobs/{job_id}/cv/en/prepare", None), ("POST", f"/api/jobs/{job_id}/cv/en/tailor", None),
-                ("POST", f"/api/jobs/{job_id}/cv/en/plan", None), ("POST", f"/api/jobs/{job_id}/gaps", {"language": "en"}),
-                ("POST", f"/api/jobs/{job_id}/gaps/r1/suggest", {}), ("POST", f"/api/jobs/{job_id}/gaps/r1/accept", {}),
-                ("POST", f"/api/jobs/{job_id}/gaps/r1/write", {}), ("POST", f"/api/jobs/{job_id}/gaps/r1/decline", {}),
+                ("POST", f"/api/jobs/{job_id}/sponsorship", {}),
+                # (finding requirements, preparing, rewording, adjusting, checking and its suggestions
+                # are a guest's too since guests may use AI: tests/test_guest_ai.py)
                 ("POST", f"/api/jobs/{job_id}/cv/en/lines/b1/save", {}),
-                ("POST", "/api/consent", {"stage": "job_processing", "version": 1}),
                 ("POST", "/api/account/delete", {}), ("PUT", f"/api/jobs/{job_id}", {}), ("HEAD", "/api/sources", None)]
 
-    def test_every_model_upload_and_page_read_is_refused_before_it_runs(self):
+    def test_every_upload_page_read_and_profile_change_is_refused_before_it_runs(self):
         client, headers, job_id = self.guest()
         before = client.get(f"/api/jobs/{job_id}", headers=headers).json()
         user_id = guest_ids(self.database)[0]
@@ -413,28 +414,33 @@ class GuestAbilityTests(GuestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs WHERE user_id = ?", (user_id,)).fetchone()[0], 1)
         self.assertEqual(client.get(f"/api/jobs/{job_id}", headers=headers).json(), before)
         me = client.get("/api/me", headers=headers).json()
-        self.assertEqual((me["usage"], me["consents"], me["notices"]), (None, {}, {}))
-        self.assertEqual((me["guest"]["lifetime_minutes"], me["guest"]["task_limit"]), (120, 20))
+        self.assertEqual((me["usage"], me["consents"]), (None, {}))  # no daily allowance; nothing agreed yet
+        self.assertEqual((me["guest"]["ai"]["limit"], me["guest"]["ai"]["used"], me["guest"]["print_limit"]),
+                         (100_000, 0, 20))
+        self.assertNotIn("expires_at", me["guest"])
 
-    def test_the_store_refuses_a_guest_any_model_work_whatever_reaches_it(self):
+    def test_the_store_refuses_a_guest_any_work_but_its_own_whatever_reaches_it(self):
         _client, _headers, job_id = self.guest()
         user_id = guest_ids(self.database)[0]
         user = UserWorkspace(self.database, user_id)
-        for operation, heavy in [("tailor_cv", "model"), ("prepare_cv", "model"), ("export_pdf", "model"),
-                                 ("find_requirements", "pdf"), ("read_page", "pdf")]:
+        for operation, heavy, units, job in [("upload_cv", "model", 1, job_id), ("job_from_url", "model", 3, job_id),
+                                             ("start_listing", "model", 3, job_id), ("read_job_url", "model", 0, job_id),
+                                             ("read_listing", "pdf", 0, job_id), ("prepare_job", "model", 3, None),
+                                             ("tailor_cv", "model", 0, job_id), ("export_pdf", "model", 1, job_id),
+                                             ("tailor_cv", "pdf", 0, job_id), ("find_requirements", "pdf", 0, job_id)]:
             with self.assertRaises(Refused, msg=operation) as refused:
-                user.submit_task(operation, key=operation, request={"job_id": job_id}, units=1, heavy=heavy, job_id=job_id)
+                user.submit_task(operation, key=operation, request={"job_id": job_id}, units=units, heavy=heavy, job_id=job)
             self.assertEqual(refused.exception.code, "guest_not_allowed")
-        # A model task written into the queue some other way is ended, never started.
+        # A task written into the queue some other way (an upload, a page read) is ended, never started.
         self.app.state.runner.stop(5)
         task = user.submit_task("export_pdf", key="forged", request={"job_id": job_id}, units=0, heavy="pdf", job_id=job_id)
         with tenant_store.transaction(self.database, write=True) as connection:
-            connection.execute("UPDATE tasks SET operation = 'tailor_cv', heavy = 'model', units = 1 WHERE task_id = ?",
+            connection.execute("UPDATE tasks SET operation = 'upload_cv', heavy = 'model', units = 1 WHERE task_id = ?",
                                (task["task_id"],))
         self.assertEqual(claim_tasks(self.database, total=2, pdf=1, deadline=timedelta(minutes=5)), [])
         ended = user.get_task(task["task_id"])
         self.assertEqual((ended["status"], ended["error_code"]), ("failed", "guest_not_allowed"))
-        # And a running guest task can never start or mark a model call.
+        # And a running guest print can never start or mark a model call.
         task = user.submit_task("export_pdf", key="real", request={"job_id": job_id}, units=0, heavy="pdf", job_id=job_id)
         claimed = claim_tasks(self.database, total=2, pdf=1, deadline=timedelta(minutes=5))
         self.assertEqual([item["task_id"] for item in claimed], [task["task_id"]])
@@ -452,8 +458,9 @@ class GuestAbilityTests(GuestCase):
         cv = job["cv"]["en"]
         messages = [stage["message"] for stage in cv["stages"]]
         self.assertEqual([stage["status"] for stage in cv["stages"]], ["done", "skipped", "skipped"])
-        self.assertTrue(messages[1].startswith("AI rewording not used:"), messages)
-        self.assertTrue(messages[2].startswith("AI adjustment for this job not used:"), messages)
+        self.assertTrue(messages[1].startswith("AI rewording not run yet:"), messages)  # the sample: no AI
+        self.assertTrue(messages[2].startswith("AI adjustment for this job not run yet:"), messages)
+        self.assertNotIn("makes no AI requests", json.dumps(messages))
         self.assertGreaterEqual(len(cv["lines"]), 20)  # long enough to need fitting on a real page
         line = next(item for item in cv["lines"] if item["section"] == "experience")
         edited = client.post(f"/api/jobs/{job_id}/cv/en/lines/{line['block']}", headers=headers,
@@ -481,7 +488,7 @@ class GuestAbilityTests(GuestCase):
         self.assertEqual((pdf.status_code, pdf.content[:5]), (200, b"%PDF-"))
         self.assertIn("attachment", pdf.headers["content-disposition"])
         guest = client.get("/api/me", headers=headers).json()["guest"]
-        self.assertEqual(guest["tasks_used"], 2)
+        self.assertEqual((guest["prints_used"], guest["ai"]["used"]), (2, 0))
         self.assertEqual(self.chat.sent, [])
         # A reload finds it all as it was.
         self.assertEqual(self.cv(client, headers, job_id)["final_pdf"], True)
@@ -570,13 +577,16 @@ class EndTests(GuestCase):
         b, b_headers, b_job = self.guest()
         a_id, b_id = guest_ids(self.database)
         alice_rows = rows_naming(self.database, tenant_store.list_accounts(self.database)[0]["user_id"])
-        self.clock.advance(minutes=91)  # a's fixed two hours are up; b has half an hour left
+        self.clock.advance(days=400)  # no time limit: both are still there, and nothing removes them
+        self.assertTrue(self.app.state.runner.drain(5))
+        self.assertEqual(tenant_store.expire_guests(self.database), 0)
+        self.assertEqual(a.get(f"/download/{a_job}/en.pdf", headers=a_headers).status_code, 200)
+        self.assertTrue(tenant_store.end_guest(self.database, a_id))  # the operator ends one
         self.assertEqual(a.get("/api/me", headers=a_headers).status_code, 401)
         self.assertEqual(a.get(f"/download/{a_job}/en.pdf", headers=a_headers).status_code, 401)
-        with self.assertRaises(NotFound):  # even before it is removed
+        with self.assertRaises(NotFound):
             UserWorkspace(self.database, a_id).list_jobs()
-        self.assertTrue(self.app.state.runner.drain(5))
-        self.assertTrue(self.wait_for(lambda: guest_ids(self.database) == [b_id]))  # the runner's loop removes it
+        self.assertEqual(guest_ids(self.database), [b_id])
         self.assertEqual(rows_naming(self.database, a_id), [])
         self.assertEqual(rows_naming(self.database, a_job), [])
         self.assertEqual(self.cv(b, b_headers, b_job)["head"], "draft")
@@ -584,11 +594,8 @@ class EndTests(GuestCase):
         alice_id = tenant_store.list_accounts(self.database)[0]["user_id"]
         self.assertEqual(UserWorkspace(self.database, alice_id).get_job(alice_job)["job_id"], alice_job)
         self.assertFalse((self.root / "ledger.jsonl").exists() and (self.root / "ledger.jsonl").read_text())
-        # Nothing extends a guest's time: using it right up to the end changes nothing.
-        self.clock.advance(minutes=28)
         self.assertEqual(b.get("/api/me", headers=b_headers).status_code, 200)
-        self.clock.advance(minutes=2)
-        self.assertEqual(b.get("/api/me", headers=b_headers).status_code, 401)
+        tenant_store.end_guest(self.database, b_id)
         self.assertEqual(b.get("/", follow_redirects=False).headers["location"], "/welcome")
 
     def wait_for(self, condition, seconds=5):
@@ -613,15 +620,22 @@ class EndTests(GuestCase):
         self.assertEqual(rows_naming(self.database, b_id), [])
         self.assertEqual(self.cognito.requests, [])
 
-    def test_a_restart_removes_workspaces_that_ended_while_it_was_stopped(self):
-        _client, _headers, _job = self.guest()
+    def test_a_restart_keeps_guest_workspaces_however_long_it_was_stopped(self):
+        client, headers, job_id = self.guest()
         user_id = guest_ids(self.database)[0]
         self.app.state.runner.stop(5)
-        self.clock.advance(hours=3)
-        self.assertEqual(guest_ids(self.database), [user_id])
+        self.clock.advance(days=3 * 365)
+        restarted = self.new_app()
+        with TestClient(restarted, base_url=ORIGIN) as fresh:
+            self.assertEqual(guest_ids(self.database), [user_id])
+            fresh.cookies = client.cookies
+            self.assertEqual(fresh.get(f"/api/jobs/{job_id}", headers=headers).status_code, 200)
+        # A start that failed halfway is still cleaned up at a start.
+        broken, _made = tenant_store.start_guest(self.database, start="b" * 40)
+        self.clock.advance(minutes=6)
         with TestClient(self.new_app(), base_url=ORIGIN):
-            self.assertEqual(guest_ids(self.database), [])
-        self.assertEqual(rows_naming(self.database, user_id), [])
+            self.assertEqual(guest_ids(self.database), [user_id])
+        self.assertEqual(rows_naming(self.database, broken), [])
 
     def test_work_of_an_ended_workspace_is_cancelled_and_its_late_result_refused(self):
         self.app.state.runner.stop(5)
@@ -631,13 +645,7 @@ class EndTests(GuestCase):
         queued = client.post(f"/api/jobs/{job_id}/cv/en/fit", headers=headers).json()["task"]
         self.assertEqual(queued["status"], "queued")
         running = claim_tasks(self.database, total=2, pdf=1, deadline=timedelta(minutes=5))[0]
-        # Past its end but not yet removed: the result is refused, and no new task starts.
-        self.clock.advance(hours=2, seconds=1)
-        with self.assertRaises(LateResult):
-            tenant_store.finish_task(self.database, user_id, running["task_id"], running["token"], "succeeded")
-        with self.assertRaises(NotFound):
-            user.get_task(running["task_id"])
-        self.clock.now -= timedelta(hours=2, seconds=1)
+        self.assertEqual(user.get_task(running["task_id"])["status"], "running")
         line = self.cv(client, headers, job_id)["lines"][0]
         client.post(f"/api/jobs/{job_id}/cv/en/lines/{line['block']}", headers=headers,
                     json={"text": "Edited.", "expected_text": line["text"]})
@@ -649,11 +657,16 @@ class EndTests(GuestCase):
         self.assertEqual(rows_naming(self.database, user_id), [])
         self.assertEqual(rows_naming(self.database, running["task_id"]), [])
 
-    def test_an_expired_guest_task_never_starts(self):
+    def test_a_queued_task_of_an_ended_workspace_never_starts_and_an_old_one_still_does(self):
         self.app.state.runner.stop(5)
         client, headers, job_id = self.guest()
         client.post(f"/api/jobs/{job_id}/cv/en/fit", headers=headers)
-        self.clock.advance(hours=2, seconds=1)
+        self.clock.advance(days=30)  # no end: an old workspace's work starts as any other
+        (first,) = claim_tasks(self.database, total=2, pdf=1, deadline=timedelta(minutes=5))
+        tenant_store.finish_task(self.database, first["user_id"], first["task_id"], first["token"], "succeeded")
+        other, other_headers, other_job = self.guest()
+        other.post(f"/api/jobs/{other_job}/cv/en/fit", headers=other_headers)
+        tenant_store.end_guest(self.database, guest_ids(self.database)[1])
         self.assertEqual(claim_tasks(self.database, total=2, pdf=1, deadline=timedelta(minutes=5)), [])
 
 
@@ -687,7 +700,7 @@ class OperatorTests(GuestCase):
         self.assertEqual(guest_ids(self.database), [b_id])
         self.assertEqual(json.loads(self.admin("guests", "end-all")[1]), {"removed": 1})
         self.assertEqual(guest_ids(self.database), [])
-        self.assertEqual(self.admin("set", "guest_max_active", "500")[0] != 0, True)
+        self.assertEqual(self.admin("set", "guest_max_active", "5000")[0] != 0, True)
         self.assertEqual(tenant_store.list_accounts(self.database)[0]["state"], "active")
 
     def test_disabling_or_deleting_a_signed_in_account_leaves_guests_alone(self):
@@ -760,14 +773,16 @@ class GuestPageCopyTests(unittest.TestCase):
                    "The current CV already fits on one page; no further content was omitted."}
         refusals = {  # each refusal a guest's page can show (tenant_store, web_v2)
             "Guest workspaces are not available right now; sign in instead",
-            "All guest workspaces are in use right now; try again later, or sign in",
+            "No more guest workspaces can be kept on this site right now; sign in, or try again later",
             "Many guest workspaces were started in the last hour; try again later, or sign in",
             "Your guest workspace is still being prepared; try again in a moment",
-            "This guest workspace has ended; reload the page to start a new one",
             "You are signed in already; open your workspace instead.",
             "This guest workspace has used all its fit and PDF runs; start a new guest workspace, or sign in",
-            "This guest workspace has made as many CV versions as it may; start a new guest workspace, or sign in "
+            "This guest workspace has made as many versions as it may; start a new guest workspace, or sign in "
             "to keep editing",
+            "This guest workspace has made as many AI tasks as it may; editing, fitting, approving and downloading "
+            "still work",
+            tenant_store.GUEST_AI_USED, tenant_store.GUEST_AI_BUSY,
             "Guest workspaces are busy right now; try again in a minute"}
         sources = (ROOT / "feiran" / "tenant_store.py").read_text(encoding="utf-8") + (ROOT / "feiran" / "web_v2.py").read_text(encoding="utf-8")
         flat = re.sub(r'"\s*\n\s*"', "", sources)  # literals split over lines, joined
@@ -775,7 +790,7 @@ class GuestPageCopyTests(unittest.TestCase):
         wanted |= refusals
         missing = sorted(text for text in wanted if text not in chinese)
         self.assertEqual(missing, [])
-        self.assertTrue(chinese[guest_sample.NO_AI_REWORDING].startswith("未使用 AI 润色"))
+        self.assertTrue(chinese[guest_sample.NO_AI_REWORDING].startswith("尚未进行 AI 润色"))
         self.assertNotIn("未能", chinese[guest_sample.NO_AI_LAYOUT])
 
     def test_the_scripts_parse(self):

@@ -11,8 +11,8 @@ Those limits count the handlers actually running, each execution (task, token) o
 task cancelled or timed out in the database may still have its handler waiting on a call, and
 until that handler returns it keeps its slot and its user's turn, even when the same task is
 queued again meanwhile. Guest workspaces' tasks start after signed-in users' and one at a time
-(tenant_store.claim_tasks), and this loop removes guest workspaces that have ended
-(tenant_store.expire_guests), cancelling their work.
+(tenant_store.claim_tasks), and this loop removes guest workspaces that cannot be used (a start
+that failed halfway, a disabled account: tenant_store.expire_guests), cancelling their work.
 """
 
 import logging

@@ -85,7 +85,7 @@ v2 sponsorship --limit 500      # 用本地规则补齐当前规则下缺失的 
 v2 sponsorship --limit 500 --after <上一轮输出的 next>   # 从上一轮停下的位置继续
 ```
 
-访客工作区默认关闭：`v2 set guest_enabled 1` 开启、`0` 停止新建，`v2 guests` 查看、`v2 guests end-all` 立即全部删除；各项上限（同时开放数、每小时新建数、固定时长、每个工作区的压缩/PDF 次数）都有不可突破的范围。完整说明、限制和本地试用命令见 [guest-workspaces.md](guest-workspaces.md)。回退到不支持访客的发行版前先执行 `v2 guests end-all`。
+访客工作区默认关闭：`v2 set guest_enabled 1` 开启、`0` 停止新建，`v2 guests` 查看（含所有访客当天的 AI 用量），`v2 guests end <user_id>` / `v2 guests end-all` 立即删除。工作区没有时间限制，不会因时间或 AI 额度用完而自动删除。AI 额度有两项：每个工作区一次性的 `guest_lifetime_tokens`（默认 100,000，不会补充）和所有访客每个 UTC 日共用的 `guest_daily_tokens`（默认 1,000,000）；删除工作区不会退回这两项，也不会退回全站用量。无论 `quota_mode` 是什么，访客额度都生效；访客不能设为测试账号。其余上限也都有不可突破的范围：保存的工作区数 `guest_max_active`（默认 100，满了就拒绝新建，不会为腾空间删除旧的）、每小时新建数、每个工作区的压缩/PDF 次数（与 AI 分开计数）。完整说明、升级迁移、回退和本地试用命令见 [guest-workspaces.md](guest-workspaces.md)。回退到不支持访客的发行版前，先执行 `v2 guests end-all`。
 
 每类操作的额度单位（`v2_flow.UNITS`）：上传简历 1、导入岗位/从 URL/开始岗位列表 3、准备简历 2、改写 1、版面 1、缺口检查 2、导出 PDF 1。提交时为用户和全站原子预留；确定未产生费用（例如在调用模型前失败）才退回，费用未知的不退回、也不自动无限重试。用演练里每个任务记录的 token 用量估算“每单位成本”，再由预算推出两个每日上限。AWS 预算告警不是硬上限，这两个设置和 `tasks_enabled` 才是。
 
