@@ -29,6 +29,8 @@
 
 限制：JD 规则无法证明任意网页全文完整，无标题纯资格文本可能需手动粘贴；同一 fact 同一标签两个 URL 的歧义仍有限制。中文下载响应头已测，中文浏览器文件落盘/简历打印、移动端、真实模型质量和公网部署未作本轮验收。新资料有 field_links/fact_links，回滚 f357fd3 时旧校验器不接受新字段，需考虑发布前数据备份；页数检查计入现有打印额度。
 
+PR #40 容器 CI 首轮发现 `deploy.smoke` 仍直接批准，返回 HTTP 409。已交 CC 补齐真实页数检查、最终 PDF 页数一致性及恢复后记录检查，并新增两项回归；Codex 在 Mac 独立运行 `tests.test_web.SmokeRunTests`（4 项）、真实 Chrome `deploy.smoke create/verify` 和 `tests.acceptance_v2 --only migrate --chrome` 全部通过，迁移下载与 V1 原文件字节一致。更新 PR 后重新等待 Linux/容器 CI，不绕过产品检查。
+
 学习重点：检查必须绑定被检查的内容版本。例如两页 CV 检查后用户又编辑了一行，旧页数不能继续证明新版本可批准。
 
 ## 游客限额 AI 与取消时限（2026-10-23，本地验收通过）

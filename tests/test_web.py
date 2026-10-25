@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 import io
 import json
@@ -1825,6 +1826,67 @@ class SmokeRunTests(unittest.TestCase):
                 (data / "unfinished" / "0123456789abcdef.json").write_text("{}", encoding="utf-8")  # a notice: real use
                 with self.assertRaisesRegex(SystemExit, "REFUSED"):
                     self.smoke.create(data, data / "smoke")
+
+    def run_create(self, pages):
+        """smoke.create on the real single-user app, its printer a stand-in writing the CV's text
+        as a ``pages``-page PDF (no Chrome), stopped before the Chinese CV, which needs Chrome.
+        Returns the paths the run POSTed to, in order, and how it stopped (None when it reached
+        the Chinese CV, else the SystemExit a failed check raised)."""
+        import html as html_module
+        import re
+        from tests.test_cv_import import minimal_pdf
+
+        def printer(html_path, pdf_path):
+            body = Path(html_path).read_text(encoding="utf-8").split("<body", 1)[1]
+            body = re.sub(r'<div class="watermark">.*?</div>', "", body)
+            texts = [html_module.unescape(re.sub(r"<[^>]+>", "", block)).strip()
+                     for block in re.split(r"</(?:li|div|h1|h2|span)>", body)]
+            safe = [re.sub(r"[^ -~]|[()\\]", "", text) for text in texts if text.strip()]
+            data = minimal_pdf([(40, 750 - 14 * index, text) for index, text in enumerate(safe[:50])])
+            extra = b"".join(b"%d 0 obj << /Type /Page >> endobj\n" % (90 + n) for n in range(pages - 1))
+            Path(pdf_path).write_bytes(data.replace(b"%%EOF", extra + b"%%EOF"))
+
+        posted = []
+
+        def client_for(data):
+            app = create_app(facts_db=data / "workbench.db", jobs_root=data / "jobs", token=self.smoke.TOKEN,
+                             profile_path=data / "cv-profile.json", chat=self.smoke.ScriptedDeepSeek(), starter=[],
+                             printer=printer)
+            client = TestClient(app, base_url="http://127.0.0.1:8765")
+            real = client.post
+            client.post = lambda path, **kwargs: posted.append(path) or real(path, **kwargs)
+            return client
+
+        class Stop(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            data = Path(directory) / "data"
+            data.mkdir()
+            (data / self.smoke.DATA_MARKER).write_text("", encoding="utf-8")
+            with patch.object(self.smoke, "client_for", client_for), patch.object(self.smoke, "LINUX", False), \
+                    patch.object(self.smoke, "export_pdf", side_effect=Stop):
+                try:
+                    self.smoke.create(data, Path(directory) / "out")
+                except Stop:
+                    return posted, None
+                except SystemExit as exc:
+                    return posted, exc
+        return posted, None
+
+    def test_its_cv_is_page_checked_before_it_is_approved(self):
+        # Found in CI: the smoke run still approved straight away, which the page check refuses.
+        posted, stopped = self.run_create(pages=1)
+        self.assertIsNone(stopped)
+        approve = next(index for index, path in enumerate(posted) if path.endswith("/cv/en/approve"))
+        pages = next(index for index, path in enumerate(posted) if path.endswith("/cv/en/pages"))
+        self.assertLess(pages, approve)
+        self.assertTrue(any(path.endswith("/cv/en/export") for path in posted[approve:]))
+
+    def test_a_cv_on_two_pages_stops_the_smoke_run_before_any_approval(self):
+        posted, stopped = self.run_create(pages=2)
+        self.assertEqual(str(stopped), "1")  # check() printed FAIL and exited
+        self.assertTrue(posted[-1].endswith("/cv/en/pages"))
+        self.assertFalse(any(path.endswith("/approve") for path in posted))  # extra pages are never accepted for it
 
 
 if __name__ == "__main__":
