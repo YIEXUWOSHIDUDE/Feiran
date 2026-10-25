@@ -62,8 +62,11 @@ def make_v1_workspace(data: Path) -> dict:
         job_id = created.json()["job_id"]
         view = client.get(f"/api/jobs/{job_id}", headers=headers).json()
         language = view["language"]
+        # The single-user app's own page check, then its approval of the (two-page) CV.
+        assert client.post(f"/api/jobs/{job_id}/cv/{language}/pages", headers=headers).status_code == 200
         approved = client.post(f"/api/jobs/{job_id}/cv/{language}/approve", headers=headers,
-                               json={"expected_content_sha256": view["cv"][language]["content_sha256"]})
+                               json={"expected_content_sha256": view["cv"][language]["content_sha256"],
+                                     "allow_multiple_pages": True})
         assert approved.status_code == 200, approved.text
         assert client.post(f"/api/jobs/{job_id}/cv/{language}/export", headers=headers).status_code == 200
         jobs.append((job_id, language))
@@ -74,8 +77,9 @@ def make_v1_workspace(data: Path) -> dict:
     job_id, language = jobs[0]
     client.post(f"/api/jobs/{job_id}/cv/{language}/prepare", headers=headers)
     view = client.get(f"/api/jobs/{job_id}", headers=headers).json()
+    client.post(f"/api/jobs/{job_id}/cv/{language}/pages", headers=headers)
     client.post(f"/api/jobs/{job_id}/cv/{language}/approve", headers=headers,
-                json={"expected_content_sha256": view["cv"][language]["content_sha256"]})
+                json={"expected_content_sha256": view["cv"][language]["content_sha256"], "allow_multiple_pages": True})
     client.post(f"/api/jobs/{job_id}/cv/{language}/export", headers=headers)
     return {"kept": jobs[0], "outdated": jobs[1]}
 

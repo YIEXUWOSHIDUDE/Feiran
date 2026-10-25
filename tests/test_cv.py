@@ -177,6 +177,11 @@ class CVDraftTests(unittest.TestCase):
             (lambda p: p["sections"][2].update(kind="hobbies"), "sections[2].kind"),
             (lambda p: p["sections"][1]["entries"][0].update(
                 links={"REST APIs": "javascript:alert(1)"}), "links.REST APIs"),
+            (lambda p: p["sections"][1]["entries"][0].update(
+                field_links={"title": {"Example Corp": "javascript:alert(1)"}}), "field_links.title.Example Corp"),
+            (lambda p: p["sections"][1]["entries"][0].update(
+                field_links={"unknown": {"x": "https://example.com"}}), "field_links 包含未知字段：unknown"),
+            (lambda p: p["sections"][1]["entries"][0].update(field_links=[]), "field_links 必须是对象"),
         ]
         with tempfile.TemporaryDirectory() as directory:
             database = make_store(directory, confirm=False)
@@ -207,6 +212,30 @@ class CVRenderTests(unittest.TestCase):
         self.assertIn("Content-Security-Policy", html)
         self.assertIn('class="watermark"', html)
         self.assertNotIn('class="watermark"', render_html(draft_for("en"), final=True))
+
+    def test_header_field_links_render_without_changing_old_profile_links(self):
+        def change(profile):
+            entry = profile["sections"][1]["entries"][0]
+            entry["field_links"] = {"title": {"Example Corp": "https://example.com/company"},
+                                    "subtitle": {"Software Intern": "https://example.com/role"},
+                                    "dates": {"2025": "https://example.com/date"},
+                                    "location": {"Remote": "https://example.com/location"}}
+            entry["location"] = "Remote"
+        html = render_html(draft_for("en", change))
+        for phrase, suffix in [("Example Corp", "company"), ("Software Intern", "role"),
+                               ("2025", "date"), ("Remote", "location")]:
+            self.assertIn(f'<a href="https://example.com/{suffix}">{phrase}</a>', html)
+        self.assertIn('href="https://github.com/alex"', html)
+
+    def test_reworded_line_keeps_a_source_link_as_an_explicit_label(self):
+        def change(profile):
+            profile["sections"][1]["entries"][0]["links"] = {"internal tool": "https://example.com/tool"}
+        draft = draft_for("en", change)
+        line = draft["sections"][1]["entries"][0]["lines"][0]
+        line["source_text"], line["text"] = line["text"], "Built REST APIs for colleagues."
+        html = render_html(draft)
+        self.assertIn('Built REST APIs for colleagues. <span class="source-links">(<a href="https://example.com/tool">internal tool</a>)</span>', html)
+        self.assertEqual(html.count('href="https://example.com/tool"'), 1)
 
     def test_language_paper_and_skill_labels_are_rendered(self):
         english = render_html(draft_for("en"))

@@ -445,9 +445,11 @@ def run_pdf(workdir, report):
             job_id = created["result"]["job_id"]
             client.post(f"/api/jobs/{job_id}/language", json={"language": language})
             follow(server, client, client.post(f"/api/jobs/{job_id}/cv/{language}/prepare"))
+            checked = follow(server, client, client.post(f"/api/jobs/{job_id}/cv/{language}/pages"))  # approving needs it
             view = client.get(f"/api/jobs/{job_id}").json()
             approved = client.post(f"/api/jobs/{job_id}/cv/{language}/approve",
-                                   json={"expected_content_sha256": view["cv"][language]["content_sha256"]})
+                                   json={"expected_content_sha256": view["cv"][language]["content_sha256"],
+                                         "allow_multiple_pages": checked["result"]["pages"] > 1})
             assert approved.status_code == 200, approved.text
             exported = follow(server, client, client.post(f"/api/jobs/{job_id}/cv/{language}/export"))
             download = client.get(f"/download/{job_id}/{language}.pdf")

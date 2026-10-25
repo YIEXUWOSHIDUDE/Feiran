@@ -8,7 +8,8 @@ DeepSeek, and real PDFs printed by the container's own Chromium.
 
 `create` goes from an uploaded CV to an approved, exported PDF: upload a CV, confirm its facts,
 create a job (its CV is drafted, reworded and adjusted by itself), check what the CV shows for
-each requirement, approve that exact CV and export it. It also prints a Chinese CV from the
+each requirement, check how many pages that exact CV prints on (approving needs it), approve it
+and export it. It also prints a Chinese CV from the
 synthetic examples. Each PDF is checked for its text, its fonts and its page count. `verify`
 checks that what `create` left is all still there and still consistent.
 
@@ -165,6 +166,12 @@ def create(data: Path, out: Path) -> None:
     check(statuses == {"Experience building REST APIs": "shown", "Hands-on Docker": "none"},
           f"what the CV shows for each requirement: {statuses}")
     shown = view["cv"]["en"]["content_sha256"]  # the CV as opened above; checking requirements leaves it alone
+    # Approving needs a real print of exactly this version, as the final PDF prints (the page does
+    # the same). The smoke CV fits one page, so it is approved without accepting extra pages.
+    checked = ok(client.post(f"/api/jobs/{job}/cv/en/pages", headers=HEADERS), "check the opened CV's pages")["cv"]["en"]
+    pages = (checked.get("pagination") or {}).get("pages")
+    check(checked["content_sha256"] == shown and pages == 1,
+          f"the CV that was opened prints on one page before approval ({pages})")
     ok(client.post(f"/api/jobs/{job}/cv/en/approve", json={"expected_content_sha256": shown}, headers=HEADERS),
        "approve the CV that was opened")
     view = ok(client.post(f"/api/jobs/{job}/cv/en/export", headers=HEADERS), "export the PDF")
@@ -175,6 +182,7 @@ def create(data: Path, out: Path) -> None:
     english.write_bytes(download.content)
     en = pdf_facts(english)
     check(en["pages"] == 1, f"English CV fits one page ({en['pages']})")
+    check(en["pages"] == pages, f"the final PDF has the pages checked before approval ({en['pages']}, {pages})")
     for line in ("Built REST APIs for an internal tool.", "Languages: Python, Java", "Example Corp"):
         check(re.sub(r"\s+", "", line).casefold() in en["text"].casefold(), f"English CV shows {line!r}")
     check("DRAFT" not in en["text"], "approved CV has no watermark")
@@ -217,6 +225,7 @@ def verify(data: Path) -> None:
     check(len(jobs) == 1, "the job is still there")
     view = ok(client.get(f"/api/jobs/{jobs[0]['job_id']}", headers=HEADERS), "open the job")
     check(view["cv"]["en"]["head"] == "approved" and view["cv"]["en"]["final_pdf"], "approved CV and final PDF still there")
+    check((view["cv"]["en"].get("pagination") or {}).get("pages") == 1, "the approved CV's page check is still there")
     approved = json.loads((data / "jobs" / jobs[0]["job_id"] / "cv-approved-en.json").read_text(encoding="utf-8"))
     check(is_final_approval(approved), "the approval still matches the CV's content")
     check(not view["gaps"].get("outdated") and not view["gaps"]["stale"], "the requirement check is still current")

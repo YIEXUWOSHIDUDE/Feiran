@@ -52,7 +52,7 @@ make guests unlimited.
 | `guest_daily_tokens` | 1,000,000 | 10,000–100,000,000 | All guest workspaces' AI use per UTC day, removed ones included |
 | `guest_max_active` | 100 | 1–1000 | Guest workspaces **stored** at once. None expires, so this is a storage cap; none is removed to make room. When full, new starts are refused (`guest_full`) until one is ended |
 | `guest_starts_per_hour` | 20 | 1–200 | Workspaces started in the last hour, across the site (ending one early does not give its start back) |
-| `guest_max_tasks` | 20 | 1–100 | **Fit and PDF runs** one workspace may make. AI tasks are counted apart, so using AI never uses up printing |
+| `guest_max_tasks` | 20 | 1–100 | **Print runs** one workspace may make: fitting, page checks before approval, and final PDFs. AI tasks are counted apart, so using AI never uses up printing |
 
 `guest_lifetime_minutes` from the previous release is gone: `v2 set` refuses it, and a stored
 value is ignored.
@@ -114,15 +114,15 @@ The server enforces this in three places, not only by hiding buttons:
    - on its sample job: finding requirements again, adding or deciding requirements; preparing,
      rewording and adjusting the CV; checking it, and asking for, adopting, writing or declining
      a suggestion (on this CV only);
-   - editing a CV line, undoing or redoing an edit or a change, fitting to one page, approving,
-     creating the final PDF, preview, download;
+   - editing a CV line, undoing or redoing an edit or a change, fitting to one page, checking the
+     page count, approving, creating the final PDF, preview, download;
    - `/guest/end` and `/logout`.
 
    Every other route answers **403 `guest_not_allowed`** before it runs. That covers uploads, new
    jobs (pasted or from a URL), followed boards and listings, the sponsor check, saving lines to
    the profile, editing or confirming facts, account deletion, and any route added later.
-2. **Tasks** (`UserWorkspace.submit_task`). A guest may queue `fit_cv` and `export_pdf` (on the
-   PDF queue, no model call), and `prepare_job` (on its existing job only), `prepare_cv`,
+2. **Tasks** (`UserWorkspace.submit_task`). A guest may queue `fit_cv`, `check_pages` and
+   `export_pdf` (on the PDF queue, no model call and no data-flow agreement needed), and `prepare_job` (on its existing job only), `prepare_cv`,
    `tailor_cv`, `plan_cv`, `check_gaps` and `suggest_gap`. None of these reads a page or a board.
    `claim_tasks` ends any other guest task it finds as failed (`guest_not_allowed`) without
    starting it.
@@ -132,9 +132,10 @@ The server enforces this in three places, not only by hiding buttons:
 The usual per-user rules still apply: one task running and one waiting per workspace, the CSRF
 token on every write, the Origin check, task deadlines, retries and idempotency.
 
-**Download flow.** As for a signed-in user: tick the review box, choose **Approve this CV**, then
-**Create final PDF**; **Download final PDF** appears once it is printed. Any later edit or fit
-needs a new approval.
+**Download flow.** As for a signed-in user: choose **Check page count**, accept the extra pages if
+it prints on more than one, tick the review box, choose **Approve this CV**, then **Create final
+PDF**; **Download final PDF** appears once it is printed. Any later edit or fit needs a new check
+and approval.
 
 **The sample.** `examples/guest_sample.json` is put in by `feiran/guest_sample.py` through the
 store's own entry points; the person, school, employers, company and posting are made up.

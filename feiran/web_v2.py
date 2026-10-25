@@ -45,6 +45,7 @@ from starlette.routing import Match
 from feiran import guest_sample
 from feiran import run_log
 from feiran import tenant_store
+from feiran.download_name import pdf_disposition
 from feiran.cv import CVError, rejected_lines, render_html, rewritten_lines
 from feiran.cv_edit import edits_view, lines_view, shown_places, with_adoptions
 from feiran.cv_import import MAX_PDF_BYTES, CVImportError, read_pdf_limited
@@ -86,6 +87,7 @@ GUEST_ROUTES = frozenset({
     ("POST", "/api/notices/dismiss"), ("POST", "/api/jobs/{job_id}/language"),
     ("POST", "/api/jobs/{job_id}/cv/{language}/lines/{block}"), ("POST", "/api/jobs/{job_id}/cv/{language}/edits/{edit_id}"),
     ("POST", "/api/jobs/{job_id}/cv/{language}/change"), ("POST", "/api/jobs/{job_id}/cv/{language}/fit"),
+    ("POST", "/api/jobs/{job_id}/cv/{language}/pages"),
     ("POST", "/api/jobs/{job_id}/cv/{language}/approve"), ("POST", "/api/jobs/{job_id}/cv/{language}/export"),
     ("GET", "/preview/{job_id}/{language}"), ("GET", "/download/{job_id}/{language}.pdf"),
     ("POST", "/guest/end"), ("POST", "/logout"), ("POST", "/api/consent"),
@@ -273,6 +275,7 @@ class ChangeRequest(BaseModel):
 
 class ApproveRequest(BaseModel):
     expected_content_sha256: str
+    allow_multiple_pages: bool = False
 
 
 class GapRequest(BaseModel):
@@ -1085,11 +1088,16 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
         user.change_cv(job_id, _language(language), body.change_id, body.undone)
         return job_view(user, job_id)
 
+    @app.post("/api/jobs/{job_id}/cv/{language}/pages")
+    def cv_pages(request: Request, job_id: str, language: str) -> JSONResponse:
+        return redo(request, job_id, language, "check_pages")
+
     @app.post("/api/jobs/{job_id}/cv/{language}/approve", response_model=None)
     def cv_approve(request: Request, job_id: str, language: str, body: ApproveRequest) -> dict | JSONResponse:
         user = workspace(request)
         try:
-            user.approve(job_id, _language(language), body.expected_content_sha256)
+            user.approve(job_id, _language(language), body.expected_content_sha256,
+                         require_page_check=True, allow_multiple_pages=body.allow_multiple_pages)
         except Conflict as exc:
             message = CV_CHANGED if "page showed" in str(exc) else str(exc)
             return JSONResponse({"error": message}, status_code=409)
@@ -1221,9 +1229,12 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
 
     @app.get("/download/{job_id}/{language}.pdf")
     def download(request: Request, job_id: str, language: str) -> Response:
-        data = workspace(request).final_pdf(job_id, _language(language))
-        return Response(data, media_type="application/pdf",
-                        headers={"Content-Disposition": f'attachment; filename="CV-{language.upper()}.pdf"'})
+        """The final PDF, named for its job and the version it prints (download_name): read with
+        the PDF in one transaction, so a CV changed meanwhile can never lend its name."""
+        data, named = workspace(request).final_download(job_id, _language(language))
+        return Response(data, media_type="application/pdf", headers={"Content-Disposition": pdf_disposition(
+            company=named["company"], title=named["title"], language=language, job_id=job_id,
+            version=named["content_sha256"])})
 
     return app
 
@@ -1297,6 +1308,10 @@ def _cv_view(snapshot: dict, language: str) -> dict:
     fit = (status or {}).get("fit")
     if fit and fit.get("material_id") == material["material_id"]:
         view["fit"] = {key: value for key, value in fit.items() if key != "material_id"}
+    pagination = (status or {}).get("pagination")
+    if (pagination and material["inputs_current"] and pagination.get("material_id") == material["material_id"]
+            and pagination.get("content_sha256") == material["content_sha256"]):
+        view["pagination"] = {key: pagination[key] for key in ("pages", "checked_at")}
     if approval:
         view["approved_at"] = approval["approved_at"]
     return view

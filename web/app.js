@@ -987,6 +987,23 @@ function stageList(stages) {
     el("span", { class: "stage-mark" }, STAGE_MARKS[stage.status] || "·"), " ", I18n.serverText(stage.message))));
 }
 
+// Before approval: how many pages the final PDF of this version prints on, from a real print
+// of it (no watermark); without a check, a button to make one.
+function pageCheck(cv, post) {
+  const check = cv.pagination;
+  if (!check) {
+    return el("div", { class: "page-check" },
+      el("p", { class: "muted" }, t("Before approving, check how many pages this version prints on.")),
+      actionButton(t("Check page count"), post("pages"), true));
+  }
+  const when = I18n.date(check.checked_at, true);
+  return el("div", { class: "page-check" },
+    check.pages === 1
+      ? el("p", { class: "ok-text" }, t`The final PDF of this version prints on 1 page (checked ${when}).`)
+      : el("p", { class: "warning" }, t`The final PDF of this version prints on ${check.pages} pages (checked ${when}). Use Fit to one page above, or accept the extra pages below.`),
+    actionButton(t("Check pages again"), post("pages"), true));
+}
+
 function cvBlock(view, language, refresh) {
   const cv = view.cv[language];
   const title = CV_TITLES[language];
@@ -1052,14 +1069,22 @@ function cvBlock(view, language, refresh) {
   let approval = null;
   if (!approved && !cv.stale) {
     // Only the CV shown below can be approved: if another tab changed it since, the server
-    // refuses and the page shows the current one to read again.
-    const approve = actionButton(t("Approve this CV"), post("approve", { expected_content_sha256: cv.content_sha256 }));
-    approve.disabled = true;
+    // refuses and the page shows the current one to read again. Its pages are checked first,
+    // for this version only (the server forgets the check once the CV changes); more than one
+    // page needs the user to accept them.
+    const pages = cv.pagination ? cv.pagination.pages : null;
+    const accept = pages > 1 ? el("input", { type: "checkbox" }) : null;
+    const approve = actionButton(t("Approve this CV"), () => post("approve", {
+      expected_content_sha256: cv.content_sha256, allow_multiple_pages: Boolean(accept && accept.checked) })());
     const read = el("input", { type: "checkbox" });
-    read.addEventListener("change", () => { approve.disabled = !read.checked; });
-    approval = el("div", { class: "approval" },
+    const update = () => { approve.disabled = pages === null || !read.checked || Boolean(accept && !accept.checked); };
+    read.addEventListener("change", update);
+    if (accept) accept.addEventListener("change", update);
+    update();
+    approval = el("div", { class: "approval" }, pageCheck(cv, post),
+      accept ? el("label", { class: "accept-pages" }, accept, t` I accept that this CV prints on ${pages} pages.`) : null,
       el("label", {}, read, t(" I read the CV below and every change listed above.")), approve,
-      GUEST ? el("p", { class: "muted guest-download" }, t("To download the PDF: tick the box, choose Approve this CV, then Create final PDF. Download final PDF appears above once it is printed.")) : null);
+      GUEST ? el("p", { class: "muted guest-download" }, t("To download the PDF: check the page count, tick the box, choose Approve this CV, then Create final PDF. Download final PDF appears above once it is printed.")) : null);
   } else if (GUEST && approved && !cv.final_pdf) {
     approval = el("p", { class: "muted guest-download" }, t("Approved. Choose Create final PDF above; Download final PDF appears once it is printed."));
   }
@@ -1502,7 +1527,7 @@ const TASK_NAMES = {
   start_listing: t("reading the job and preparing the CV"), prepare_cv: t("preparing your CV"),
   tailor_cv: t("rewording your CV"), plan_cv: t("adjusting your CV"), check_gaps: t("checking what your CV shows"),
   suggest_gap: t("suggesting a related experience entry"),
-  export_pdf: t("creating the final PDF"), fit_cv: t("fitting your CV on one page"), upload_cv: t("reading your CV"),
+  export_pdf: t("creating the final PDF"), fit_cv: t("fitting your CV on one page"), check_pages: t("checking the page count"), upload_cv: t("reading your CV"),
 };
 
 function taskNote(task, refresh) {
@@ -1590,8 +1615,8 @@ async function refreshGuest() {
     const guest = body.guest, ai = guest.ai;
     I18n.setText(allowance, guestAllowanceText(ai));
     I18n.setText(limits, ai.pending_calls || ai.unknown_calls
-      ? t`Fit and PDF runs used: ${guest.prints_used} of ${guest.print_limit} · versions: ${guest.versions_used} of ${guest.version_limit} · AI calls running ${ai.pending_calls}, usage unknown ${ai.unknown_calls} (counted at their reservation)`
-      : t`Fit and PDF runs used: ${guest.prints_used} of ${guest.print_limit} · versions: ${guest.versions_used} of ${guest.version_limit}`);
+      ? t`Print runs used (fitting, page checks, PDFs): ${guest.prints_used} of ${guest.print_limit} · versions: ${guest.versions_used} of ${guest.version_limit} · AI calls running ${ai.pending_calls}, usage unknown ${ai.unknown_calls} (counted at their reservation)`
+      : t`Print runs used (fitting, page checks, PDFs): ${guest.prints_used} of ${guest.print_limit} · versions: ${guest.versions_used} of ${guest.version_limit}`);
   } catch (_) {
     if (ticket === guestRequest) I18n.setText(limits, t("The guest workspace's limits are temporarily unavailable. This does not mean zero usage."));
   }

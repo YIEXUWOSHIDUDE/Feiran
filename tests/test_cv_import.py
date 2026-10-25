@@ -227,6 +227,24 @@ class CVImportTests(unittest.TestCase):
         self.assertEqual((alpha["links"], beta["links"]),
                          ({"Git Hub": "https://example.com/alpha"}, {"Hub": "https://example.com/beta"}))
 
+    def test_links_in_consumed_header_fields_keep_their_original_field(self):
+        lines = [["Alex Example"], ["alex@example.com"], ["PROJECTS"],
+                 ["Demo Project", "GitHub"], ["Built search."], ["PUBLICATIONS"], ["Research Paper"]]
+        links = [{"url": "https://example.com/project", "pieces": ["GitHub"], "context": "Demo Project GitHub"},
+                 {"url": "https://example.com/paper", "pieces": ["Research Paper"], "context": "Research Paper"}]
+        answer = {"sections": [
+            {"kind": "projects", "heading": 3, "entries": [{"title": [4, 1], "subtitle": [4, 2],
+                "facts": [{"lines": [5], "tags": []}]}]},
+            {"kind": "publications", "heading": 6, "entries": [{"title": [7, 1]}]}]}
+        proposal = structure_cv(lines, FakeStructurer(answer), links=links)
+        project, paper = [s["entries"][0] for s in proposal["sections"]]
+        self.assertEqual(project["field_links"], {"subtitle": {"GitHub": "https://example.com/project"}})
+        self.assertEqual(paper["field_links"], {"title": {"Research Paper": "https://example.com/paper"}})
+        self.assertEqual(proposal["not_imported"], [])
+        with tempfile.TemporaryDirectory() as directory:
+            profile, _, _ = build_profile(proposal, proposal["private"], Path(directory) / "facts.db")
+        self.assertEqual(profile["sections"][0]["entries"][0]["field_links"], project["field_links"])
+
     def test_uploading_an_old_cv_again_never_undoes_a_later_correction(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "workbench.db"
