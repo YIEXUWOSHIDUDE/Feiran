@@ -24,7 +24,7 @@ from feiran.cv_status import STAGE_FAILED, STAGES, adjusted, job_language, reaso
 from feiran.deepseek_client import CallRefused
 from feiran.gaps import find_gaps, suggest_gap
 from feiran.job_search import SearchError, fetch_selected, prepare_review_input
-from feiran.job_url import fetch_job_url
+from feiran.job_url import fetch_job_url, require_complete_jd
 from feiran.requirement_flow import RequirementError, apply_requirement_decisions, propose_requirements
 
 
@@ -33,12 +33,14 @@ from feiran.requirement_flow import RequirementError, apply_requirement_decision
 # reserved: each model call reserves its own estimated tokens as it starts (tenant_store.begin_call).
 UNITS = {"upload_cv": 1, "prepare_job": 3, "job_from_url": 3, "start_listing": 3, "prepare_cv": 2,
          "tailor_cv": 1, "plan_cv": 1, "check_gaps": 2, "suggest_gap": 1, "export_pdf": 1, "fit_cv": 1,
-         "read_job_url": 0, "read_listing": 0}
+         "check_pages": 1, "read_job_url": 0, "read_listing": 0}
 # The data flow each operation needs the user's agreement to (tenant_store.CONSENT_STAGES).
 CONSENT = {"upload_cv": "upload_parsing", "prepare_job": "job_processing", "job_from_url": "job_processing",
            "start_listing": "job_processing", "prepare_cv": "job_processing", "tailor_cv": "job_processing",
            "plan_cv": "job_processing", "check_gaps": "job_processing", "suggest_gap": "job_processing"}
-HEAVY = {"export_pdf": "pdf", "fit_cv": "pdf"}  # fitting prints the CV to count its pages; no model call
+# Printing: the final PDF, fitting (which prints to count pages) and the page check before
+# approval; none makes a model call.
+HEAVY = {"export_pdf": "pdf", "fit_cv": "pdf", "check_pages": "pdf"}
 
 
 class TaskFailed(Exception):
@@ -88,12 +90,22 @@ def _stages_after(status: dict | None, draft_id: str | None, stage: dict, not_ru
     return sorted([*kept, stage, *again], key=lambda item: STAGES.index(item["stage"]))
 
 
+def _complete_jd(ctx: Any, job_id: str) -> None:
+    """Before any model work on a job: a JD read automatically from a web page that holds only
+    a summary is refused (job_url.require_complete_jd), so nothing is generated from it."""
+    try:
+        require_complete_jd(ctx.user.get_job(job_id)["jd"])
+    except SearchError as exc:
+        raise TaskFailed(str(exc), "incomplete_jd") from exc
+
+
 def prepare_cv(ctx: Any, job_id: str, language: str, *, explicit: bool, result: dict | None = None) -> None:
     """Draft, reword and adjust one language's CV for the job's current requirements, and publish
     them as new versions with how each stage went. When the model cannot reword or adjust, the
     CV stays at the last stage that worked and says why. ``explicit``: the user asked for this;
     a CV that cannot even be drafted then fails the task, while after finding requirements it
     only records why (the job itself was made)."""
+    _complete_jd(ctx, job_id)
     inputs = ctx.user.cv_inputs(job_id, language)
     head = inputs["head"]
     base = ctx.request.get("base_head", head["material_id"] if head else None)
@@ -145,6 +157,7 @@ def _redo_stage(ctx: Any, stage: str) -> None:
     publish the result as the newest version, with the job's own changes of the current CV applied
     again (the model sees the CV as prepared, without them); a failure keeps the CV and records why."""
     job_id, language = ctx.request["job_id"], ctx.request["language"]
+    _complete_jd(ctx, job_id)
     inputs = ctx.user.cv_inputs(job_id, language)
     head = inputs["head"]
     if head is None:
@@ -200,6 +213,7 @@ def _redo_stage(ctx: Any, stage: str) -> None:
 def _find_and_prepare(ctx: Any, job_id: str, base_version: int, kept: dict | None, result: dict) -> None:
     """Find the job's requirements (the model picks JD lines; the heading rules if it cannot),
     count them, save them, then prepare the CV in the job's language."""
+    _complete_jd(ctx, job_id)
     current = ctx.user.requirements(job_id)
     if not (current and current.get("task_id") == ctx.task_id):  # a retry that saved them already goes on
         if (current["version"] if current else 0) != base_version:  # changed since: no model call for nothing
@@ -300,6 +314,7 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
     def run_check_gaps(ctx: Any) -> None:
         """Check the job's CV in the language asked for, against that language's last check."""
         request = ctx.request
+        _complete_jd(ctx, request["job_id"])
         inputs = ctx.user.gaps_inputs(request["job_id"], request["language"])
         if inputs["head"] is None:
             raise TaskFailed("请先准备这个岗位的简历，再检查缺口", "no_cv")
@@ -316,6 +331,7 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
 
     def run_suggest_gap(ctx: Any) -> None:
         request = ctx.request
+        _complete_jd(ctx, request['job_id'])
         inputs = ctx.user.gaps_inputs(request['job_id'], request['language'])
         if (not inputs['head'] or not inputs['requirements'] or not inputs['gaps']
                 or inputs['gaps']['version'] != request['base_gaps_version']
@@ -354,6 +370,24 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         ctx.user.publish_pdf(task_id=ctx.task_id, token=ctx.token, approval_id=inputs["approval_id"], data=data,
                              pages=summary["pages"])
 
+    def run_page_check(ctx: Any) -> None:
+        """Print the current CV as its final PDF would be (no watermark) and record how many pages
+        that is for exactly this version (publish_page_check): the approval needs it. A failed
+        print records nothing; a CV changed meanwhile supersedes the check."""
+        job_id, language = ctx.request["job_id"], ctx.request["language"]
+        inputs = ctx.user.cv_inputs(job_id, language)
+        head = inputs["head"]
+        if head is None or head["material_id"] != ctx.request.get("base_head") or not head["inputs_current"]:
+            ctx.finish("superseded", error_code="inputs_changed", message="The CV changed; check the current version")
+            return
+        ctx.stage("printing")
+        try:
+            pages = rendered_pages(head["draft"], printer, final=True)
+        except CVError as exc:
+            raise TaskFailed(str(exc), "pdf_failed") from exc
+        ctx.user.publish_page_check(task_id=ctx.task_id, token=ctx.token, job_id=job_id, language=language,
+                                    base_head=head["material_id"], pages=pages)
+
     def run_fit(ctx: Any) -> None:
         """Leave out the lines that help the job least until the current CV prints on one page
         (cv_fit), published as the CV's next version; or, when it already fits or cannot, only
@@ -384,4 +418,5 @@ def make_handlers(*, printer: Callable[[Path, Path], None] = print_with_chrome,
         "read_listing": lambda ctx: run_start_listing(ctx, review_only=True),
         "tailor_cv": lambda ctx: _redo_stage(ctx, "rewording"), "plan_cv": lambda ctx: _redo_stage(ctx, "layout"),
         "check_gaps": run_check_gaps, "suggest_gap": run_suggest_gap, "export_pdf": run_export, "fit_cv": run_fit,
+        "check_pages": run_page_check,
     }

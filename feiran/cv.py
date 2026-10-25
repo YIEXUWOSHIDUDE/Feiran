@@ -39,7 +39,7 @@ SECTION_TITLES = {
 PROFILE_KEYS = {"profile_version", "name", "contact", "sections"}
 CONTACT_KEYS = {"location", "phone", "email", "links"}
 SECTION_KEYS = {"kind", "title", "entries"}
-ENTRY_KEYS = {"title", "title_link", "location", "subtitle", "dates", "facts", "links"}
+ENTRY_KEYS = {"title", "title_link", "location", "subtitle", "dates", "facts", "links", "field_links", "fact_links"}
 PAGE_SIZES = {"letter": "Letter", "a4": "A4"}
 WATERMARK = {"en": "DRAFT", "zh": "草稿"}
 BULLET_KINDS = {"experience", "projects"}
@@ -167,6 +167,26 @@ def _phrase_links(value: Any, path: str) -> dict[str, str]:
     return links
 
 
+def _field_links(value: Any, path: str) -> dict[str, dict[str, str]]:
+    """Anchor phrases scoped to their header field; old profiles need none."""
+    if value is None:
+        return {}
+    _check_keys(value, {"title", "subtitle", "location", "dates"}, path)
+    return {field: _phrase_links(links, f"{path}.{field}") for field, links in value.items()}
+
+
+def _fact_links(value: Any, fact_ids: list[str], path: str) -> dict[str, dict[str, str]] | None:
+    """Anchor phrases of each line, by the entry's fact IDs (cv_import writes them for every
+    entry whose lines had links). With them, a line carries only its own links, so the same
+    words on another line (a second "GitHub") never borrow them; a line with none has none.
+    None for an older profile, whose lines carry the entry's ``links`` as before."""
+    if value is None:
+        return None
+    _check_keys(value, set(value), path)  # an object; a fact no longer in the entry links nothing
+    return {fact_id: _phrase_links(links, f"{path}.{fact_id}") for fact_id, links in value.items()
+            if fact_id in fact_ids}
+
+
 def _header(profile: dict[str, Any], language: str, fallbacks: list[str]) -> dict[str, Any]:
     name = _localized(profile.get("name"), language, "name", fallbacks)
     if name is None:
@@ -272,6 +292,8 @@ def _profile_layout(profile: Any, language: str) -> tuple:
                 "dates": _localized(entry.get("dates"), language, f"{path}.dates", fallbacks),
                 "lines": fact_ids,
                 "links": _phrase_links(entry.get("links"), f"{path}.links"),
+                "field_links": _field_links(entry.get("field_links"), f"{path}.field_links"),
+                "fact_links": _fact_links(entry.get("fact_links"), fact_ids, f"{path}.fact_links"),
             })
         sections.append({
             "kind": kind,
@@ -406,31 +428,58 @@ def _items(items: list[dict[str, Any]]) -> str:
     )
 
 
+def _line_links(entry: dict[str, Any], line: dict[str, Any]) -> dict[str, str]:
+    """The links one line may carry: its own fact's (fact_links) when the entry records links
+    per line, so no line borrows another's, and a line left out takes its links with it;
+    otherwise (an older profile or draft) the entry's links, as before."""
+    own = entry.get("fact_links")
+    if own is None:
+        return entry["links"]
+    return own.get(line.get("fact_id"), {})
+
+
+def _line_html(line: dict[str, Any], links: dict[str, str], labelled: bool = False) -> str:
+    rendered = (_labelled if labelled else _linked)(line["text"], links)
+    # A rewrite may remove an anchor phrase. Keep its original label explicit rather
+    # than guessing which new words mean the same thing; hidden lines stay hidden.
+    missing = {phrase: url for phrase, url in links.items()
+               if phrase in line.get("source_text", "") and phrase not in line["text"]}
+    if missing:
+        ordered = sorted(missing.items(), key=lambda item: line["source_text"].find(item[0]))  # as the line had them
+        labels = " | ".join(_linked(phrase, {phrase: url}) for phrase, url in ordered)
+        rendered += f' <span class="source-links">({labels})</span>'
+    return rendered
+
+
 def _entry_html(kind: str, entry: dict[str, Any]) -> str:
     rows = []
+
+    def field(name: str) -> str:
+        return _linked(entry.get(name) or "", entry.get("field_links", {}).get(name, {}))
+
     if entry["title"] or entry["location"]:
-        left = f"<strong>{escape(entry['title'])}</strong>" if entry["title"] else ""
+        left = f"<strong>{field('title')}</strong>" if entry["title"] else ""
         if entry["title_link"]:
             link = entry["title_link"]
             left += f' | <a href="{escape(link["url"], quote=True)}">{escape(link["text"])}</a>'
         right = ""
         if entry["location"]:
             style = "italic" if kind == "projects" else "strong"
-            right = f'<span class="right {style}">{escape(entry["location"])}</span>'
+            right = f'<span class="right {style}">{field("location")}</span>'
         rows.append(f'<div class="row"><span class="left">{left}</span>{right}</div>')
     if entry["subtitle"] or entry["dates"]:
         rows.append(
-            f'<div class="row"><span class="left"><em>{escape(entry["subtitle"] or "")}</em></span>'
-            f'<span class="right"><em>{escape(entry["dates"] or "")}</em></span></div>'
+            f'<div class="row"><span class="left"><em>{field("subtitle")}</em></span>'
+            f'<span class="right"><em>{field("dates")}</em></span></div>'
         )
     lines = entry["lines"]
     if lines and kind in BULLET_KINDS:
         rows.append("<ul>" + "".join(
-            f"<li>{_linked(line['text'], entry['links'])}</li>" for line in lines
+            f"<li>{_line_html(line, _line_links(entry, line))}</li>" for line in lines
         ) + "</ul>")
     elif lines:
-        render = _labelled if kind in LABEL_KINDS else _linked
-        rows.extend(f'<div class="line">{render(line["text"], entry["links"])}</div>' for line in lines)
+        rows.extend(f'<div class="line">{_line_html(line, _line_links(entry, line), kind in LABEL_KINDS)}</div>'
+                    for line in lines)
     return f'<div class="entry">{"".join(rows)}</div>'
 
 
@@ -602,13 +651,22 @@ def _count_pages(data: bytes) -> int | None:
     return count or None
 
 
-def rendered_pages(draft: dict[str, Any], printer: Callable[[Path, Path], None] = print_with_chrome) -> int:
+# Why an approval was refused for its pages (both apps): no page check of exactly this version,
+# or more pages than one without the user accepting them.
+PAGES_UNCHECKED = "Check how many pages this version prints on before approving it."
+PAGES_OVER = "This CV prints on more than one page. Fit it to one page, or accept the extra pages, then approve."
+
+
+def rendered_pages(draft: dict[str, Any], printer: Callable[[Path, Path], None] = print_with_chrome, *,
+                   final: bool = False) -> int:
     """How many pages the CV prints on: the HTML the preview and the final PDF show, printed the
-    same way (the draft watermark is fixed in place, so it moves nothing). Nothing is kept."""
+    same way (the draft watermark is fixed in place, so it moves nothing). With ``final``, the
+    HTML exactly as the final PDF prints it, without the watermark: what a check before
+    approval counts. Nothing is kept."""
     with tempfile.TemporaryDirectory(prefix="cv-pages-") as directory:
         html_path = Path(directory) / "cv.html"
         pdf_path = Path(directory) / "cv.pdf"
-        html_path.write_text(render_html(draft), encoding="utf-8")
+        html_path.write_text(render_html(draft, final=final), encoding="utf-8")
         printer(html_path, pdf_path)
         data = pdf_path.read_bytes() if pdf_path.exists() else b""
     pages = _count_pages(data) if data.startswith(b"%PDF") else None

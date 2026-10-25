@@ -99,7 +99,9 @@ class SingleUserFitTests(unittest.TestCase):
     def test_an_approval_and_its_pdf_do_not_carry_over_and_one_that_fits_stays(self):
         self.adopt_bullet()
         before = self.view()
-        self.client.post(f"/api/jobs/{self.job_id}/cv/en/approve", json={"expected_content_sha256": before["content_sha256"]})
+        self.client.post(f"/api/jobs/{self.job_id}/cv/en/pages")  # the page check approving needs
+        self.client.post(f"/api/jobs/{self.job_id}/cv/en/approve",
+                         json={"expected_content_sha256": before["content_sha256"], "allow_multiple_pages": True})
         self.client.post(f"/api/jobs/{self.job_id}/cv/en/export")
         self.assertTrue(self.view()["final_pdf"])
         fitted = self.client.post(f"/api/jobs/{self.job_id}/cv/en/fit").json()["cv"]["en"]
@@ -107,6 +109,7 @@ class SingleUserFitTests(unittest.TestCase):
         self.assertEqual(self.client.get(f"/download/{self.job_id}/en.pdf", params={"token": TOKEN}).status_code, 400)
         self.assertEqual(self.client.post(f"/api/jobs/{self.job_id}/cv/en/export").status_code, 400)
         # Approve and export the one-page CV; fitting it again changes nothing and keeps both.
+        self.assertEqual(self.client.post(f"/api/jobs/{self.job_id}/cv/en/pages").json()["cv"]["en"]["pagination"]["pages"], 1)
         self.client.post(f"/api/jobs/{self.job_id}/cv/en/approve", json={"expected_content_sha256": fitted["content_sha256"]})
         self.client.post(f"/api/jobs/{self.job_id}/cv/en/export")
         again = self.client.post(f"/api/jobs/{self.job_id}/cv/en/fit").json()["cv"]["en"]
@@ -191,7 +194,7 @@ class V2FitTests(test_web_v2.V2Case):
                                json={"text": "Built and tested REST APIs in Python.", "expected_text": edited["text"]})
         self.assertEqual(response.status_code, 200, response.text)
         cv = self.cv(client, headers, job_id)
-        client.post(f"/api/jobs/{job_id}/cv/en/approve", headers=headers, json={"expected_content_sha256": cv["content_sha256"]})
+        self.approve(client, headers, job_id, expected=cv["content_sha256"])
         self.assertEqual(self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/en/export", headers=headers))["status"],
                          "succeeded")
         profile, facts = self.profile_versions(), client.get("/api/facts", headers=headers).json()

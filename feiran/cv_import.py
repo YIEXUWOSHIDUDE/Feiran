@@ -535,11 +535,15 @@ def _sections(content: Any, public: list[dict[str, Any]], links: _Links) -> tupl
         for entry in sorted((entry for entry in entries if isinstance(entry, dict)), key=_first_line):
             taken: list[tuple[int, int]] = []
             fields: dict[str, Any] = {}
+            field_links: dict[str, dict[str, str]] = {}
             for field in FIELDS:
                 ref = reader.part(entry.get(field), taken)
                 if ref is not None:
                     taken.append(ref)
                     fields[field] = reader.lines[ref[0]]["parts"][ref[1]]
+                    attached = links.phrases(fields[field], [ref[0]])
+                    if attached:
+                        field_links[field] = attached
             header = {number for number, _ in taken}
             facts = [fact for value in entry.get("facts") or [] if (fact := reader.fact(value, header))]
             if not fields and not facts:
@@ -549,6 +553,7 @@ def _sections(content: Any, public: list[dict[str, Any]], links: _Links) -> tupl
             section["entries"].append({
                 **{field: fields.get(field) for field in FIELDS},
                 "title_link": None, "facts": facts, "links": {}, "header": sorted(header),
+                **({"field_links": field_links} if field_links else {}),
             })
             added += 1
         if is_new and added:
@@ -570,8 +575,18 @@ def _sections(content: Any, public: list[dict[str, Any]], links: _Links) -> tupl
                         reader.parts[number].add(part)
     for section in ordered:
         for entry in section["entries"]:
+            # Each line keeps the links on its own text (two projects' "GitHub" go to two URLs);
+            # the entry keeps those no other line of it gives another URL, as older profiles did.
+            ambiguous: set[str] = set()
             for fact in entry["facts"]:
-                entry["links"].update(links.phrases(fact["text"], fact.pop("lines")))
+                phrases = links.phrases(fact["text"], fact.pop("lines"))
+                if phrases:
+                    fact["links"] = phrases
+                for phrase, url in phrases.items():
+                    if entry["links"].setdefault(phrase, url) != url:
+                        ambiguous.add(phrase)
+            for phrase in ambiguous:
+                del entry["links"][phrase]
     not_imported = []
     for line in public:
         if line["n"] in reader.whole:
@@ -647,6 +662,7 @@ def build_profile(
         entries = []
         for entry in section["entries"]:
             ids = []
+            fact_links: dict[str, dict[str, str]] = {}
             for fact in entry["facts"]:
                 fact_id = known.get(fact["text"]) or next(
                     (item["id"] for item in items if item["text"] == fact["text"]), None
@@ -655,6 +671,8 @@ def build_profile(
                     continue  # the same line twice; a CV lists each fact once
                 placed.add(fact_id)
                 ids.append(fact_id)
+                if fact.get("links"):
+                    fact_links[fact_id] = fact["links"]
                 if fact["text"] in known:
                     reused += 1
                 else:
@@ -664,6 +682,10 @@ def build_profile(
                 item["facts"] = ids
             if entry.get("links"):
                 item["links"] = entry["links"]
+            if entry.get("field_links"):
+                item["field_links"] = entry["field_links"]
+            if fact_links:
+                item["fact_links"] = fact_links
             if item:
                 entries.append(item)
         if entries:

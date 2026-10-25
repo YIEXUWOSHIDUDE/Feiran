@@ -837,8 +837,17 @@ class WebTests(unittest.TestCase):
         ).json()["job_id"]
 
     def approve(self, job_id, fingerprint, language="en"):
+        """Approve as the page does: check the current version's pages first (the stand-in
+        printer prints two), then approve, accepting them."""
+        self.check_pages(job_id, language)
         return self.client.post(f"/api/jobs/{job_id}/cv/{language}/approve",
-                                json={"expected_content_sha256": fingerprint}, headers=self.headers)
+                                json={"expected_content_sha256": fingerprint, "allow_multiple_pages": True},
+                                headers=self.headers)
+
+    def check_pages(self, job_id, language="en"):
+        checked = self.client.post(f"/api/jobs/{job_id}/cv/{language}/pages", headers=self.headers)
+        self.assertEqual(checked.status_code, 200, checked.text)
+        return checked.json()["cv"][language]["pagination"]
 
     def put_back_the_cut_line(self, job_id):
         self.client.post(f"/api/jobs/{job_id}/cv/en/change",
@@ -1291,8 +1300,7 @@ def upload_and_save():
         save, body = self.adopted_line(job_id, gaps)
         line_url = save.removesuffix("/save")
         head = self.job(job_id)["cv"]["en"]["content_sha256"]
-        approved = self.client.post(f"/api/jobs/{job_id}/cv/en/approve", headers=self.headers,
-                                    json={"expected_content_sha256": head})
+        approved = self.approve(job_id, head)
         self.assertEqual(approved.status_code, 200, approved.text)
         changed = self.client.post(line_url, headers=self.headers,
                                    json={"text": "New local wording.", **body})
@@ -1331,7 +1339,9 @@ def upload_and_save():
         job_id = self.planned_job()
         shown = self.job(job_id)["cv"]["en"]["content_sha256"]
         approve = f"/api/jobs/{job_id}/cv/en/approve"
-        self.die_in_app(f"client.post({approve!r}, headers=headers, json={{'expected_content_sha256': {shown!r}}})",
+        self.check_pages(job_id)
+        self.die_in_app(f"client.post({approve!r}, headers=headers, json={{'expected_content_sha256': {shown!r}, "
+                        "'allow_multiple_pages': True})",
                         dies_before_renaming_into("cv-approved-en.json"))
         view = self.restarted().get(f"/api/jobs/{job_id}", headers=self.headers).json()
         self.assertEqual(view["cv"]["en"]["head"], "planned")  # recovery never approves

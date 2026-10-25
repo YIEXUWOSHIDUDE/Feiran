@@ -128,10 +128,10 @@ class GuestCase(test_web_v2.V2Case):
         self.printer.rows = self.printer.count(html) - 1
 
     def printed(self, client, headers, job_id):
-        """Approve the CV as shown and print it; returns the export task."""
+        """Check its pages, approve the CV as shown (accepting more than one page) and print it;
+        returns the export task."""
         cv = self.cv(client, headers, job_id)
-        approved = client.post(f"/api/jobs/{job_id}/cv/en/approve", headers=headers,
-                               json={"expected_content_sha256": cv["content_sha256"]})
+        approved = self.approve(client, headers, job_id, expected=cv["content_sha256"])
         self.assertEqual(approved.status_code, 200, approved.text)
         return self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/en/export", headers=headers))
 
@@ -488,13 +488,13 @@ class GuestAbilityTests(GuestCase):
         self.assertEqual((pdf.status_code, pdf.content[:5]), (200, b"%PDF-"))
         self.assertIn("attachment", pdf.headers["content-disposition"])
         guest = client.get("/api/me", headers=headers).json()["guest"]
-        self.assertEqual((guest["prints_used"], guest["ai"]["used"]), (2, 0))
+        self.assertEqual((guest["prints_used"], guest["ai"]["used"]), (3, 0))  # fit, page check, PDF
         self.assertEqual(self.chat.sent, [])
         # A reload finds it all as it was.
         self.assertEqual(self.cv(client, headers, job_id)["final_pdf"], True)
 
     def test_a_guest_makes_a_bounded_number_of_runs_and_versions(self):
-        set_setting(self.database, "guest_max_tasks", "2")
+        set_setting(self.database, "guest_max_tasks", "3")  # a fit, a page check and a PDF
         client, headers, job_id = self.guest()
         self.assertEqual(self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/en/fit", headers=headers))["status"],
                          "succeeded")
@@ -777,7 +777,8 @@ class GuestPageCopyTests(unittest.TestCase):
             "Many guest workspaces were started in the last hour; try again later, or sign in",
             "Your guest workspace is still being prepared; try again in a moment",
             "You are signed in already; open your workspace instead.",
-            "This guest workspace has used all its fit and PDF runs; start a new guest workspace, or sign in",
+            "This guest workspace has used all its print runs (fitting, page checks and PDFs); start a new guest "
+            "workspace, or sign in",
             "This guest workspace has made as many versions as it may; start a new guest workspace, or sign in "
             "to keep editing",
             "This guest workspace has made as many AI tasks as it may; editing, fitting, approving and downloading "

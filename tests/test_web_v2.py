@@ -107,6 +107,20 @@ class V2Case(unittest.TestCase):
         self.assertTrue(self.app.state.runner.drain(20))
         return client.get(f"/api/tasks/{body['task']['task_id']}", headers=headers).json()["task"]
 
+    def check_pages(self, client, headers, job_id, language="en"):
+        """The page check before approval, as the page asks for it; returns the finished task."""
+        task = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/{language}/pages", headers=headers))
+        self.assertEqual(task["status"], "succeeded", task)
+        return task
+
+    def approve(self, client, headers, job_id, language="en", expected=None):
+        """Approve as the page does: check the current version's pages first (the stand-in
+        printer prints two), then approve exactly what the page shows, accepting them."""
+        self.check_pages(client, headers, job_id, language)
+        expected = expected or client.get(f"/api/jobs/{job_id}", headers=headers).json()["cv"][language]["content_sha256"]
+        return client.post(f"/api/jobs/{job_id}/cv/{language}/approve", headers=headers,
+                           json={"expected_content_sha256": expected, "allow_multiple_pages": True})
+
     def consent(self, client, headers, *stages):
         for stage in stages:
             self.assertEqual(client.post("/api/consent", json={"stage": stage, "version": 1}, headers=headers).status_code, 200)
@@ -246,8 +260,7 @@ class FlowTests(V2Case):
         preview = client.get(f"/preview/{job_id}/en", params={"v": cv["content_sha256"]}, headers=headers)
         self.assertIn("DRAFT", preview.text)
         self.assertEqual(client.get(f"/download/{job_id}/en.pdf").status_code, 404)
-        approved = client.post(f"/api/jobs/{job_id}/cv/en/approve", headers=headers,
-                               json={"expected_content_sha256": cv["content_sha256"]})
+        approved = self.approve(client, headers, job_id, expected=cv["content_sha256"])
         self.assertEqual(approved.json()["cv"]["en"]["head"], "approved")
         exported = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/en/export", headers=headers))
         self.assertEqual(exported["status"], "succeeded", exported)
@@ -266,8 +279,7 @@ class FlowTests(V2Case):
         stale = client.post(f"/api/jobs/{job_id}/cv/en/approve", json={"expected_content_sha256": "0" * 64},
                             headers=headers)
         self.assertEqual(stale.status_code, 409)
-        client.post(f"/api/jobs/{job_id}/cv/en/approve", json={"expected_content_sha256": head["content_sha256"]},
-                    headers=headers)
+        self.approve(client, headers, job_id, expected=head["content_sha256"])
         self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/en/export", headers=headers))
         self.assertEqual(client.get(f"/download/{job_id}/en.pdf").status_code, 200)
         fact = next(fact for fact in client.get("/api/facts", headers=headers).json()["facts"]
@@ -409,8 +421,7 @@ class IsolationTests(V2Case):
         a, a_headers = self.ready_user("alice")
         job_id = self.new_job(a, a_headers)
         cv = a.get(f"/api/jobs/{job_id}", headers=a_headers).json()["cv"]["en"]
-        a.post(f"/api/jobs/{job_id}/cv/en/approve", json={"expected_content_sha256": cv["content_sha256"]},
-               headers=a_headers)
+        self.approve(a, a_headers, job_id, expected=cv["content_sha256"])
         export = a.post(f"/api/jobs/{job_id}/cv/en/export", headers=a_headers)
         self.settle(a, a_headers, export)
         task_id = export.json()["task"]["task_id"]
@@ -426,6 +437,7 @@ class IsolationTests(V2Case):
             ("get", f"/download/{job_id}/en.pdf", None), ("get", f"/api/tasks/{task_id}", None),
             ("post", f"/api/tasks/{task_id}/cancel", None), ("post", "/api/notices/dismiss", {"id": task_id}),
             ("post", f"/api/jobs/{job_id}/cv/en/approve", {"expected_content_sha256": cv["content_sha256"]}),
+            ("post", f"/api/jobs/{job_id}/cv/en/pages", None),
             ("post", f"/api/jobs/{job_id}/cv/en/export", None), ("post", f"/api/jobs/{job_id}/cv/en/prepare", None),
             ("post", f"/api/jobs/{job_id}/cv/en/tailor", None), ("post", f"/api/jobs/{job_id}/cv/en/plan", None),
             ("post", f"/api/jobs/{job_id}/cv/en/change", {"change_id": "x", "undone": True}),
@@ -571,8 +583,7 @@ class MoreRouteTests(V2Case):
         self.assertEqual(sum(f['text'] == text for f in after), 0)
         self.assertTrue(any(f['status'] == 'pending' for f in after))
         view = self.job(client, headers, job_id)
-        approved = client.post(f"/api/jobs/{job_id}/cv/en/approve",
-            json={'expected_content_sha256': view['cv']['en']['content_sha256']}, headers=headers)
+        approved = self.approve(client, headers, job_id, expected=view['cv']['en']['content_sha256'])
         self.assertEqual(approved.status_code, 200)
         exported = self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/en/export", headers=headers))
         self.assertEqual(exported['status'], 'succeeded')

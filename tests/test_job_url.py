@@ -52,6 +52,67 @@ class ExtractionTests(unittest.TestCase):
         self.assertIn("Qualifications\nExperience with SQL", jd["text"])
         self.assertEqual(jd["extraction_method"], "jobposting-jsonld")
 
+    def test_jsonld_summary_uses_same_job_visible_sections(self):
+        summary = "Join our engineering team and build reliable services. " * 10
+        page = schema_page(title="Backend Engineer", description=summary) + HTML
+        jd = extract_job(page, URL)["jd"]
+        self.assertIn("Python and SQL experience.", jd["text"])
+        self.assertNotIn("Navigation", jd["text"])
+        self.assertEqual(jd["extraction_method"], "jobposting-jsonld+html-text")
+        self.assertEqual(jd["company"], "Example")
+
+    def test_summary_with_only_javascript_shell_is_not_a_complete_jd(self):
+        summary = "Join our engineering team and build reliable services. " * 10
+        page = schema_page(description=summary) + '<div id="app"></div><script src="jobs.js"></script>'
+        with self.assertRaisesRegex(SearchError, "正文"):
+            extract_job(page, URL)
+
+    def test_obviously_truncated_schema_is_rejected_or_replaced_by_full_body(self):
+        summary = "Responsibilities\nBuild reliable services with the team and test APIs. Requirements\nExperience with Python..."
+        with self.assertRaisesRegex(SearchError, "正文"):
+            extract_job(schema_page(title="Backend Engineer", description=summary), URL)
+        jd = extract_job(schema_page(title="Backend Engineer", description=summary) + HTML, URL)["jd"]
+        self.assertIn("Python and SQL experience.", jd["text"])
+
+    def test_short_chinese_jsonld_with_explicit_sections_is_kept(self):
+        text = "岗位职责\n负责开发和维护后端服务，与团队一起完成需求分析和接口测试。\n岗位要求\n熟悉 Python 和数据库，能够编写自动化测试，与产品和设计团队沟通需求，维护清晰的接口文档。"
+        self.assertEqual(extract_job(schema_page(description=text), URL)["jd"]["text"], text)
+
+    def test_plain_html_summary_with_generic_job_heading_is_rejected(self):
+        page = '<title>Backend Engineer</title><main><h1>Job description</h1><p>' + "Join our engineering team and build reliable services. " * 10 + '</p></main>'
+        with self.assertRaisesRegex(SearchError, "正文"):
+            extract_job(page, URL)
+
+    def test_summary_without_an_app_marker_is_also_rejected(self):
+        page = schema_page(description="Join our engineering team and build reliable services. " * 10)
+        with self.assertRaisesRegex(SearchError, "正文"):
+            extract_job(page + "<main>Welcome to our careers site.</main>", URL)
+
+    def test_short_jsonld_with_unheaded_duties_is_kept(self):
+        jd = extract_job(schema_page(), URL)["jd"]
+        self.assertEqual(jd["text"], DESCRIPTION)
+
+    def test_unscoped_matching_title_cannot_validate_unrelated_main(self):
+        page = '<h1>Backend Engineer</h1><main><h2>Requirements</h2><p>Unrelated site information.</p></main>'
+        jd = extract_job(schema_page(title="Backend Engineer") + page, URL)["jd"]
+        self.assertEqual(jd["text"], DESCRIPTION)
+
+    def test_complete_short_jsonld_in_javascript_shell_is_kept(self):
+        description = "<h2>Responsibilities</h2><p>Build Python backend services for our product.</p><h2>Requirements</h2><p>Experience with SQL and automated tests.</p>"
+        page = schema_page(description=description) + '<div id="app"></div>'
+        jd = extract_job(page, URL)["jd"]
+        self.assertIn("Experience with SQL", jd["text"])
+        self.assertEqual(jd["extraction_method"], "jobposting-jsonld")
+
+    def test_other_job_and_navigation_cannot_replace_structured_description(self):
+        for page in (HTML.replace("Backend Engineer", "Data Scientist"),
+                     HTML.replace("<main>", "<nav>").replace("</main>", "</nav>"),
+                     HTML.replace("</main>", "<h1>Data Scientist</h1></main>")):
+            with self.subTest(page=page):
+                jd = extract_job(schema_page(title="Backend Engineer") + page, URL)["jd"]
+                self.assertEqual(jd["text"], DESCRIPTION)
+                self.assertEqual(jd["extraction_method"], "jobposting-jsonld")
+
     def test_hidden_navigation_scripts_and_forms_are_not_jd(self):
         html = HTML.replace("</main>", "<div hidden>Secret</div><script>alert('Bad')</script><form>Apply now</form></main>")
         text = extract_job(html, URL)["jd"]["text"]

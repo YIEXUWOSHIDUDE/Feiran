@@ -40,7 +40,7 @@ JOB_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 # Small status files kept beside the steps and replaced in place: how the latest CV preparation
 # went, stage by stage. They are not part of the step chain.
 NOTES = (*(f"cv-status-{language}" for language in LANGUAGES), *(f"cv-fit-{language}" for language in LANGUAGES),
-         "interrupted", "cv-language")
+         *(f"cv-pages-{language}" for language in LANGUAGES), "interrupted", "cv-language")
 # Written before a step is replaced and removed once the new file is in place. One this code
 # did not write is set aside under the second name, for a person to look at.
 JOURNAL = "change-in-progress.json"

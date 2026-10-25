@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from feiran import sponsorship
-from feiran.cv import (CVError, _profile_hash, approve_draft, build_draft_from_facts, content_fingerprint,
+from feiran.cv import (PAGES_OVER, PAGES_UNCHECKED, CVError, _profile_hash, approve_draft, build_draft_from_facts, content_fingerprint,
                 is_final_approval, profile_fact_ids, profile_languages, verify_draft)
 from feiran.cv_edit import EditError, StaleEdit, adopt_for, already_saved, change_line, mark_saved, save_plan, save_target, set_edit
 from feiran.cv_import import build_profile
@@ -112,7 +112,7 @@ GUEST_ISSUER = "urn:feiran:guest"
 GUEST_LIMITS = {"guest_max_active": (100, 1, 1000), "guest_starts_per_hour": (20, 1, 200),
                 "guest_max_tasks": (20, 1, 100), "guest_lifetime_tokens": (100_000, 1_000, 1_000_000),
                 "guest_daily_tokens": (1_000_000, 10_000, 100_000_000)}
-GUEST_PRINT_OPERATIONS = ("fit_cv", "export_pdf")  # print work: no model call, no page read
+GUEST_PRINT_OPERATIONS = ("fit_cv", "export_pdf", "check_pages")  # print work: no model call, no page read
 # Model work on the guest's own sample job only: no upload, no new job, no page or board read.
 GUEST_MODEL_OPERATIONS = ("prepare_job", "prepare_cv", "tailor_cv", "plan_cv", "check_gaps", "suggest_gap")
 GUEST_OPERATIONS = GUEST_PRINT_OPERATIONS + GUEST_MODEL_OPERATIONS
@@ -2342,11 +2342,15 @@ class UserWorkspace:
 
     def record_stages(self, *, task_id: str, token: str, job_id: str, language: str, draft_id: str | None,
                       stages: list[dict]) -> None:
-        """How a preparation that produced nothing went (for example, a fact still pending)."""
+        """How a preparation that produced nothing went (for example, a fact still pending). The
+        CV did not change, so what was found about it (its fit, its page check) stays."""
         with self._transaction(write=True) as connection:
             _running_task(connection, self.user_id, task_id, token)
-            self._set_note(connection, job_id, f'cv-status-{language}',
-                           {'draft_material_id': draft_id, 'stages': stages, 'updated_at': _now()})
+            name = f'cv-status-{language}'
+            kept = {key: value for key, value in (self._note(connection, job_id, name) or {}).items()
+                    if key in ('fit', 'pagination')}
+            self._set_note(connection, job_id, name,
+                           {**kept, 'draft_material_id': draft_id, 'stages': stages, 'updated_at': _now()})
 
     def change_cv(self, job_id: str, language: str, change_id: str, undone: bool) -> dict:
         """Undo or redo one of the job adjustments the user sees listed: a new CV version, so the
@@ -2405,6 +2409,31 @@ class UserWorkspace:
             status = self._note(connection, job_id, name) or {'draft_material_id': None, 'stages': []}
             self._set_note(connection, job_id, name, {**status, 'fit': {**outcome, 'material_id': material_id}})
             result = {'job_id': job_id, 'language': language, 'fit': outcome['status'], 'materials': published}
+            _end_task(connection, self.user_id, task_id, 'succeeded', result=result)
+            return result
+
+    def publish_page_check(self, *, task_id: str, token: str, job_id: str, language: str,
+                           base_head: str, pages: int) -> dict:
+        """Keep how many pages the final PDF of the CV prints on, for exactly the version the task
+        read (material and content hash): only while the task holds its execution and that
+        version is still the current one with current inputs; otherwise the task is superseded
+        and nothing is kept. Approving needs it (approve with require_page_check)."""
+        if type(pages) is not int or pages < 1:
+            raise StoreError("Invalid PDF page count")
+        with self._transaction(write=True) as connection:
+            _running_task(connection, self.user_id, task_id, token)
+            head = self._head(connection, job_id, language)
+            if (head is None or head['material_id'] != base_head
+                    or not self._inputs_current(connection, head)):
+                _end_task(connection, self.user_id, task_id, 'superseded', error_code='inputs_changed',
+                          message="The CV or its inputs changed while pages were checked")
+                return {'superseded': True}
+            name = f'cv-status-{language}'
+            status = self._note(connection, job_id, name) or {'draft_material_id': None, 'stages': []}
+            check = {'material_id': base_head, 'content_sha256': head['content_sha256'],
+                     'pages': pages, 'checked_at': _now()}
+            self._set_note(connection, job_id, name, {**status, 'pagination': check})
+            result = {'job_id': job_id, 'language': language, 'pages': pages}
             _end_task(connection, self.user_id, task_id, 'succeeded', result=result)
             return result
 
@@ -2529,11 +2558,14 @@ class UserWorkspace:
             return None
         return approval
 
-    def approve(self, job_id: str, language: str, expected_content_sha256: str) -> dict:
+    def approve(self, job_id: str, language: str, expected_content_sha256: str, *,
+                require_page_check: bool = False, allow_multiple_pages: bool = False) -> dict:
         """The user approves exactly the CV their page showed (its fingerprint). Refused if the
         CV changed since, or if its facts, profile or requirements are no longer current, so an
         old page can never approve a newer or outdated CV. The reviewer is the signed-in owner.
-        Approving the same CV again changes nothing."""
+        Approving the same CV again changes nothing. With ``require_page_check`` (the page's
+        approval) it also needs a page check of exactly this version, and, when that found more
+        than one page, ``allow_multiple_pages``: the user accepted them."""
         _text(expected_content_sha256, 'expected content', 128)
         with self._transaction(write=True) as connection:
             head = self._head(connection, _text(job_id, 'job_id'), _language(language))
@@ -2546,6 +2578,13 @@ class UserWorkspace:
             existing = self._approval(connection, head['material_id'])
             if existing:
                 return dict(existing)
+            if require_page_check:  # the page check of exactly this version (publish_page_check)
+                check = (self._note(connection, job_id, f'cv-status-{language}') or {}).get('pagination')
+                if (not check or check.get('material_id') != head['material_id']
+                        or check.get('content_sha256') != head['content_sha256']):
+                    raise Conflict(PAGES_UNCHECKED)
+                if check['pages'] > 1 and not allow_multiple_pages:
+                    raise Conflict(PAGES_OVER)
             document = json.loads(head['payload'])
             facts = FactSnapshot(self._list_facts(connection))
             try:
@@ -2599,8 +2638,15 @@ class UserWorkspace:
     def final_pdf(self, job_id: str, language: str) -> bytes:
         """The final PDF of the current, still valid approval; bytes are checked against the
         hash recorded when it was registered."""
+        return self.final_download(job_id, language)[0]
+
+    def final_download(self, job_id: str, language: str) -> tuple[bytes, dict[str, Any]]:
+        """The final PDF (final_pdf) and what names it, read in the same transaction so the name
+        is always that PDF's: the job's company and title, and the content hash of the approved
+        CV it prints."""
         with self._transaction() as connection:
-            approval = self._valid_approval(connection, _text(job_id, 'job_id'), _language(language))
+            job = self._job(connection, _text(job_id, 'job_id'))
+            approval = self._valid_approval(connection, job_id, _language(language))
             row = connection.execute('SELECT data, sha256 FROM artifacts WHERE user_id = ? AND approval_id = ?',
                                      (self.user_id, approval['approval_id'])).fetchone() if approval else None
         if row is None:
@@ -2608,7 +2654,8 @@ class UserWorkspace:
         data = bytes(row['data'])
         if hashlib.sha256(data).hexdigest() != row['sha256']:
             raise StoreError("The stored PDF is damaged")
-        return data
+        return data, {"company": job["jd"].get("company"), "title": job["jd"].get("title"),
+                      "content_sha256": approval["content_sha256"]}
 
     def preview(self, job_id: str, language: str, expected_content_sha256: str | None = None) -> tuple[dict, bool]:
         """The current CV as it prints, and whether it prints as final (approved and still valid)."""
@@ -3111,8 +3158,8 @@ class UserWorkspace:
             kind_used = connection.execute('SELECT COUNT(*) FROM tasks WHERE user_id = ? AND heavy = ?',
                                            (self.user_id, heavy)).fetchone()[0]
             if existing is None and heavy == 'pdf' and kind_used >= prints:
-                raise Refused("This guest workspace has used all its fit and PDF runs; start a new guest workspace, "
-                              "or sign in", "guest_task_limit", {"limit": prints})
+                raise Refused("This guest workspace has used all its print runs (fitting, page checks and PDFs); "
+                              "start a new guest workspace, or sign in", "guest_task_limit", {"limit": prints})
             if existing is None and heavy == 'model' and kind_used >= GUEST_MAX_MODEL_TASKS:
                 raise Refused("This guest workspace has made as many AI tasks as it may; editing, fitting, approving "
                               "and downloading still work", "guest_model_task_limit", {"limit": GUEST_MAX_MODEL_TASKS})

@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.routing import Match
 from pydantic import BaseModel
 
+from feiran.download_name import pdf_disposition
 from feiran.cv import (
     CVError,
     _profile_hash,
@@ -45,6 +46,8 @@ from feiran.cv import (
     rejected_lines,
     render_html,
     rendered_pages,
+    PAGES_OVER,
+    PAGES_UNCHECKED,
     rewritten_lines,
     tailor_draft,
 )
@@ -95,7 +98,7 @@ from feiran.job_search import (
     prepare_review_input,
 )
 from feiran.job_review import build_job_review
-from feiran.job_url import fetch_job_url, normalize_url
+from feiran.job_url import fetch_job_url, normalize_url, require_complete_jd
 from feiran.listings import (
     ListingsError,
     add_source,
@@ -247,9 +250,11 @@ class DismissRequest(BaseModel):
 
 
 class ApproveRequest(BaseModel):
-    """The fingerprint of the CV the page showed; only that CV can be approved."""
+    """The fingerprint of the CV the page showed; only that CV can be approved. A CV whose page
+    check found more than one page is approved only with ``allow_multiple_pages``."""
 
     expected_content_sha256: str
+    allow_multiple_pages: bool = False
 
 
 class ContactLink(BaseModel):
@@ -569,6 +574,10 @@ def create_app(
             raise WorkspaceError(f"请先完成上一步（缺少 {step}）")
         return data
 
+    def complete_jd(job_id: str) -> None:
+        """Before model work on a job: a web page's summary alone is refused (job_url.require_complete_jd)."""
+        require_complete_jd(require(job_id, "input").get("jd"))
+
     def job_view(job_id: str) -> dict:
         """What the page needs for one job: the JD and the current file of each step, all read
         while no step is being moved or replaced, so they agree with each other."""
@@ -719,6 +728,9 @@ def create_app(
         fit = workspace.read_note(job_id, f"cv-fit-{language}")
         if head and fit and fit.get("content_sha256") == view["content_sha256"]:
             view["fit"] = {key: value for key, value in fit.items() if key != "content_sha256"}
+        pages = workspace.read_note(job_id, f"cv-pages-{language}")
+        if head and not stale and pages and pages.get("content_sha256") == view["content_sha256"]:
+            view["pagination"] = {key: pages[key] for key in ("pages", "checked_at")}
         return view
 
     def profile_file(language: str | None = None, *, writing: bool = False) -> Path:
@@ -833,6 +845,7 @@ def create_app(
         and the page says why, so a usable CV is never mistaken for a tailored one. The job's own
         changes of the CV until now (adopted and edited lines) go on again, word for word, after
         what the model did (cv_edit.carry_over); the model sees the CV without them."""
+        complete_jd(job_id)
         job = require(job_id, "decided")
         previous = cv_head(job_id, check_language(language))[1]
         started = time.monotonic()
@@ -889,6 +902,7 @@ def create_app(
         """Optional talking points: the confirmed fact that best speaks to each requirement."""
         if not Path(facts_db).exists():
             raise FactStoreError("还没有事实库；请先导入并确认事实")
+        complete_jd(job_id)
         matches = propose_matches(require(job_id, "decided"), facts_db, chat=chat, private=known_private_terms())
         workspace.write(job_id, "matches", matches)
         links, no_match = first_candidates(matches)
@@ -915,6 +929,7 @@ def create_app(
         prepare_cv_quietly(job_id)
 
     def create_prepared_job(review_input: dict) -> str:
+        require_complete_jd(review_input.get("jd"))
         candidates = propose_requirements(review_input, chat=chat)
         job_id = workspace.create_job(review_input)
         workspace.write(job_id, "candidates", candidates)
@@ -1136,6 +1151,7 @@ def create_app(
 
     @app.post("/api/jobs/{job_id}/requirements/find")
     def find_requirements(job_id: str) -> dict:
+        complete_jd(job_id)
         workspace.write(job_id, "candidates", propose_requirements(require(job_id, "input"), chat=chat))
         prepare_automatically(job_id)
         return job_view(job_id)
@@ -1182,6 +1198,7 @@ def create_app(
     @app.post("/api/jobs/{job_id}/cv/{language}/tailor")
     def cv_tailor(job_id: str, language: str) -> dict:
         """Reword again from the draft as prepared; the job's own changes go on again after."""
+        complete_jd(job_id)
         draft = without_edits(require(job_id, f"cv-draft-{check_language(language)}"))
         previous = cv_head(job_id, language)[1]
         started = time.monotonic()
@@ -1207,6 +1224,7 @@ def create_app(
         _, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历，再检查缺口")
+        complete_jd(job_id)
         workspace.write(job_id, "gaps", find_gaps(require(job_id, "decided"), head, facts_db, chat,
                                                   private=known_private_terms(), previous=workspace.read(job_id, "gaps")))
         return job_view(job_id)
@@ -1220,6 +1238,7 @@ def create_app(
         _, head = cv_head(job_id, gaps.get("language", "en"))
         if head is None:
             raise WorkspaceError("请先准备这个岗位的简历")
+        complete_jd(job_id)
         try:
             updated = suggest_gap(gaps, require(job_id, "decided"), head, facts_db, requirement_id, chat,
                                   private=known_private_terms())
@@ -1329,6 +1348,7 @@ def create_app(
     def cv_plan(job_id: str, language: str) -> dict:
         """Adjust (again) for this job, starting from the reworded CV, or the draft if none, as
         prepared; the job's own changes go on again after."""
+        complete_jd(job_id)
         base = workspace.read(job_id, f"cv-tailored-{check_language(language)}") or require(job_id, f"cv-draft-{language}")
         previous = cv_head(job_id, language)[1]
         started = time.monotonic()
@@ -1364,16 +1384,37 @@ def create_app(
                              {**outcome, "content_sha256": content_fingerprint(fitted or document)})
         return job_view(job_id)
 
+    @app.post("/api/jobs/{job_id}/cv/{language}/pages")
+    def cv_pages(job_id: str, language: str) -> dict:
+        """Print the current CV as its final PDF would be and keep how many pages that is, for
+        exactly this version (its fingerprint): approving needs it. A failed print keeps
+        nothing. It runs alone (one_change_at_a_time), so no edit lands while it prints."""
+        _step, head = cv_head(job_id, check_language(language))
+        if head is None:
+            raise WorkspaceError("请先生成简历草稿")
+        require_current_cv(head, language)
+        pages = rendered_pages(head, printer, final=True)
+        workspace.write_note(job_id, f"cv-pages-{language}", {"content_sha256": content_fingerprint(head), "pages": pages,
+                                                              "checked_at": datetime.now(timezone.utc).isoformat()})
+        return job_view(job_id)
+
     @app.post("/api/jobs/{job_id}/cv/{language}/approve", response_model=None)
     def cv_approve(job_id: str, language: str, request: ApproveRequest) -> dict | JSONResponse:
-        """Approve exactly the CV the page showed. If another tab changed it since, nothing is
-        approved; a second click on the same CV approves nothing new."""
+        """Approve exactly the CV the page showed, once its pages were checked for exactly that
+        version (cv_pages); one that prints on more than one page only when the user accepts
+        that. If another tab changed it since, nothing is approved; a second click on the same CV
+        approves nothing new."""
         head_step, head = cv_head(job_id, language)
         if head is None:
             raise WorkspaceError("请先生成简历草稿")
         require_current_cv(head, language)
         if content_fingerprint(head) != request.expected_content_sha256:
             return JSONResponse({"error": CV_CHANGED}, status_code=409)
+        pages = workspace.read_note(job_id, f"cv-pages-{language}")
+        if head_step != "approved" and (not pages or pages.get("content_sha256") != request.expected_content_sha256):
+            return JSONResponse({"error": PAGES_UNCHECKED}, status_code=409)
+        if head_step != "approved" and pages["pages"] > 1 and not request.allow_multiple_pages:
+            return JSONResponse({"error": PAGES_OVER}, status_code=409)
         if head_step != "approved":
             workspace.write(job_id, f"cv-approved-{language}", approve_draft(head, facts_db))
         return job_view(job_id)
@@ -1408,14 +1449,19 @@ def create_app(
 
     @app.get("/download/{job_id}/{language}.pdf")
     def cv_download(job_id: str, language: str) -> Response:
-        approved = require(job_id, f"cv-approved-{check_language(language)}")
+        # The approval, its PDF and the job read together, so the name (download_name) is always
+        # that PDF's. Read whole (a CV is small), so a new export moving this one to history cannot
+        # cut it off.
+        with workspace.lock:
+            approved = require(job_id, f"cv-approved-{check_language(language)}")
+            data = workspace.read_bytes(job_id, f"cv-final-{check_language(language)}")
+            jd = (workspace.read(job_id, "input") or {}).get("jd", {})
         require_current_cv(approved, language)
-        # Read whole (a CV is small), so a new export moving this one to history cannot cut it off.
-        data = workspace.read_bytes(job_id, f"cv-final-{check_language(language)}")
         if data is None:
             raise WorkspaceError("还没有已批准的最终 PDF")
-        return Response(data, media_type="application/pdf",
-                        headers={"Content-Disposition": f'attachment; filename="CV-{language.upper()}.pdf"'})
+        return Response(data, media_type="application/pdf", headers={"Content-Disposition": pdf_disposition(
+            company=jd.get("company"), title=jd.get("title"), language=language, job_id=job_id,
+            version=content_fingerprint(approved))})
 
     app.state.workspace = workspace
     return app

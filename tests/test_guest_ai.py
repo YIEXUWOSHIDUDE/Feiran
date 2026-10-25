@@ -374,7 +374,7 @@ class GuestAIWebTests(GuestCase):
             self.assertEqual(client.post(path, headers=headers, json={}).json()["code"], "guest_not_allowed")
 
     def test_with_the_allowance_used_up_editing_fitting_and_printing_still_work(self):
-        set_setting(self.database, "guest_max_tasks", "2")
+        set_setting(self.database, "guest_max_tasks", "3")  # a fit, a page check and a PDF
         client, headers, job_id = self.guest()
         client.post("/api/consent", headers=headers, json={"stage": "job_processing", "version": 1})
         self.assertEqual(self.settle(client, headers, client.post(f"/api/jobs/{job_id}/cv/en/tailor", headers=headers))
@@ -396,7 +396,7 @@ class GuestAIWebTests(GuestCase):
         guest = client.get("/api/me", headers=headers).json()["guest"]
         # What is left is less than any AI task needs to start; the page shows it as it is.
         self.assertEqual((guest["prints_used"], guest["print_limit"], guest["ai"]["remaining"]),
-                         (2, 2, max(1_000, used) - used))
+                         (3, 3, max(1_000, used) - used))
         self.assertLess(guest["ai"]["remaining"], tenant_store.MIN_START_TOKENS)
         self.assertEqual(guest_ids(self.database), [guest_ids(self.database)[0]])  # still there: nothing removed it
 

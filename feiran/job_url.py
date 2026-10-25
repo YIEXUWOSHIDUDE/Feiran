@@ -27,6 +27,89 @@ BLOCK = {"p", "div", "li", "br", "section", "h1", "h2", "h3", "h4", "article", "
 JOB_SIGNAL = re.compile(r"job description|requirements|qualifications|responsibilities|what you.ll (?:do|bring)|about (?:the|this) (?:role|job)|岗位职责|岗位要求|任职要求|职位描述|工作职责|任职资格|职位要求|任职条件|职责描述|岗位描述", re.I)
 
 
+SECTION_HEADING = re.compile(r"(?:^|\n)\s*(?:responsibilities|qualifications|requirements|skills|"
+                             r"what you.ll (?:do|bring)|岗位职责|岗位要求|任职要求|"
+                             r"工作职责|任职资格|职位要求|任职条件|职责描述)\b", re.I)
+QUALIFICATION = re.compile(r"\b(?:experience (?:with|in)|proficien(?:t|cy) (?:in|with)|"
+                           r"must have|required qualifications)\b|熟悉|精通|具备.+经验", re.I)
+DUTY = re.compile(r"(?:^|[.!?。；;]\s*|\n)\s*(?:[-•]\s*)?"
+                  r"(build|develop|maintain|design|implement|collaborate|test|负责|参与)", re.I)
+
+
+def has_job_details(text: str) -> bool:
+    """Require identifiable duties/qualifications, rather than trusting summary length: a
+    duties or qualifications heading; or a qualification phrase together with a duty clause; or
+    at least two distinct duty clauses. A qualification phrase alone ("a role requiring
+    experience with Python") is how page summaries read, so it is not enough.
+
+    This is evidence of usable job content, not proof that a publisher supplied every
+    section: an unheaded description that names only qualifications is refused (a false
+    negative the user answers by pasting the text), and a summary with two duty clauses passes.
+    """
+    if re.search(r"(?:\.\.\.|…)\s*$|(?:read|see) more[.!]?\s*$|查看全文\s*$", text, re.I):
+        return False
+    if SECTION_HEADING.search(text):
+        return True
+    duties = {duty.casefold() for duty in DUTY.findall(text)}
+    return len(duties) >= 2 or (len(duties) >= 1 and QUALIFICATION.search(text) is not None)
+
+
+INCOMPLETE_JD = ("这个岗位只保存了网页上的简介，没有可识别的职责或资格正文；为避免据简介生成简历，没有调用模型。"
+                 "请打开原岗位页，复制完整 JD 后粘贴添加。")
+
+
+def require_complete_jd(jd: dict) -> None:
+    """Refuse to generate from a JD read automatically from a general web page (provider "web")
+    whose saved text shows no duties or qualifications (has_job_details): a job imported before
+    the reader checked this may hold only a page summary. Pasted text and the native job-board
+    readers are never refused here; this is a heuristic, not proof the text is complete."""
+    if isinstance(jd, dict) and jd.get("provider") == "web" and not has_job_details(str(jd.get("text") or "")):
+        raise SearchError(INCOMPLETE_JD)
+
+
+def _canonical(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _same_job_visible_text(parser, title: str) -> str:
+    """The page's main content (<main>, <article>), when it is this posting's and shows its
+    duties or qualifications; otherwise "". It is this posting's when its own H1 is the posting's
+    title or, with no H1 in it, when no H1 on the page names another and the document title names
+    this one. Multiple or conflicting H1s make the scope ambiguous, and a matching document title
+    never overrides a heading for a different posting. Full-page length is not job evidence."""
+    main = _lines(parser.main)
+    heading = _lines(parser.main_heading)
+    if not title or not main:
+        return ""
+    if heading:
+        if _canonical(heading) != _canonical(title):
+            return ""
+    else:
+        page_heading = _lines(parser.heading)
+        if page_heading and _canonical(page_heading) != _canonical(title):
+            return ""
+        if not _titled(_lines(parser.title), title):
+            return ""
+    return main if has_job_details(main) else ""
+
+
+TITLE_SEPARATOR = re.compile(r"\s+[|\-–—·:]\s+|\s*[｜丨]\s*")
+
+
+def _titled(document_title: str, title: str) -> bool:
+    """Whether the document title names this posting: one of its parts, split where a site adds
+    its name ("Backend Engineer | Example Careers"), is the posting's title. Part of another
+    title ("Engineer" in "Data Engineer") is not."""
+    return _canonical(title) in {_canonical(part) for part in TITLE_SEPARATOR.split(document_title)}
+
+
+def _covers(visible: str, text: str) -> bool:
+    """Whether the visible text says every line the structured description says (and so more,
+    when it is longer): only then is it the fuller copy of the same text, not just a longer one."""
+    seen = _canonical(visible)
+    return all(_canonical(line) in seen for line in text.splitlines() if line.strip())
+
+
 def normalize_url(value: str) -> str:
     """Validate HTTP(S) syntax; DNS is checked separately at every connection."""
     value = value.strip()
@@ -171,7 +254,7 @@ class JobHTML(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.stack = []
-        self.body, self.main, self.title, self.heading = [], [], [], []
+        self.body, self.main, self.title, self.heading, self.main_heading = [], [], [], [], []
         self.schemas, self.script = [], None
 
     def handle_starttag(self, tag, attrs):
@@ -207,6 +290,8 @@ class JobHTML(HTMLParser):
         self.body.append(data)
         if tags & {"main", "article"} or any(item[2] for item in self.stack):
             self.main.append(data)
+            if "h1" in tags:
+                self.main_heading.append(data)
         if "h1" in tags:
             self.heading.append(data)
 
@@ -274,6 +359,16 @@ def extract_job(html: str, source: str) -> dict:
         location = "; ".join(filter(None, locations)) or None
         posted = job.get("datePosted") if isinstance(job.get("datePosted"), str) else None
         method = "jobposting-jsonld"
+        visible = _same_job_visible_text(parser, title)
+        # The posting's own page text replaces a structured description that names no duties or
+        # qualifications (a summary); one without duty or qualification headings when the page's
+        # text has them (an overview read as a description: the page need not repeat it word for
+        # word); or one it fully contains and adds to.
+        if visible and (not has_job_details(text)
+                        or (SECTION_HEADING.search(visible) and not SECTION_HEADING.search(text))
+                        or (len(visible) > len(text) and _covers(visible, text))):
+            text = visible
+            method = "jobposting-jsonld+html-text"
     else:
         # Document titles are less likely to combine unrelated H1s from banners,
         # navigation and job metadata. They may retain the publisher's site suffix.
@@ -283,6 +378,8 @@ def extract_job(html: str, source: str) -> dict:
         method = "html-text"
         if not JOB_SIGNAL.search(text):
             raise SearchError("未读到明确的职位正文；页面可能需要 JavaScript、登录或验证码，也可能不是岗位详情页。请手动粘贴 JD。")
+    if not has_job_details(text):
+        raise SearchError("只读到岗位简介，未读到明确的职责或资格正文；页面可能需要 JavaScript。请手动粘贴完整 JD。")
     if not title or len(text) < 80:
         raise SearchError("读取到的职位标题或正文不完整，请手动粘贴 JD。")
     if len(text) > 100_000 or len(title) > 500:
