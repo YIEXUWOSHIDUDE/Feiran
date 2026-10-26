@@ -44,8 +44,9 @@ from starlette.routing import Match
 
 from feiran import guest_sample
 from feiran import run_log
+from feiran import batch_zip
 from feiran import tenant_store
-from feiran.download_name import pdf_disposition
+from feiran.download_name import pdf_disposition, pdf_filename
 from feiran.cv import CVError, rejected_lines, render_html, rewritten_lines
 from feiran.cv_edit import edits_view, lines_view, shown_places, with_adoptions
 from feiran.cv_import import MAX_PDF_BYTES, CVImportError, read_pdf_limited
@@ -55,6 +56,7 @@ from feiran.gaps import coverage, suggestion_target
 from feiran.identity import Identity, IdentityError, OIDCSettings
 from feiran.job_search import SearchError, check_board, fetch_board, parse_board_link, parse_posting_link, prepare_pasted_jd
 from feiran.job_url import normalize_url
+from feiran.jd_diagnostics import jd_diagnostics
 from feiran.job_review import build_job_review
 from feiran.listings import STALE_AFTER, ListingsError, group_postings, load_starter
 from feiran.requirement_flow import RequirementError, add_manual_requirements, apply_requirement_decisions
@@ -90,6 +92,7 @@ GUEST_ROUTES = frozenset({
     ("POST", "/api/jobs/{job_id}/cv/{language}/pages"),
     ("POST", "/api/jobs/{job_id}/cv/{language}/approve"), ("POST", "/api/jobs/{job_id}/cv/{language}/export"),
     ("GET", "/preview/{job_id}/{language}"), ("GET", "/download/{job_id}/{language}.pdf"),
+    ("GET", "/download/batch.zip"),
     ("POST", "/guest/end"), ("POST", "/logout"), ("POST", "/api/consent"),
     ("POST", "/api/jobs/{job_id}/requirements/find"), ("POST", "/api/jobs/{job_id}/requirements/add"),
     ("POST", "/api/jobs/{job_id}/requirements/decide"), ("POST", "/api/jobs/{job_id}/cv/{language}/prepare"),
@@ -1227,6 +1230,23 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
             return HTMLResponse(PREVIEW_CHANGED, status_code=409)
         return render_html(document, final=final)
 
+    @app.get("/download/batch.zip", response_model=None)
+    def download_batch(request: Request, jobs: str = "") -> Response:
+        """Every ready final PDF of a batch of this user's jobs (``jobs``: their IDs, at most
+        batch_zip.MAX_JOBS) in one ZIP with a manifest of the whole batch, read in one store
+        transaction (batch_finals). ``ready`` (repeated: job:language:content hash) is what the
+        page saw ready; anything else ready or changed now refuses the whole download. A job not
+        found, or another user's, refuses it too. Reading starts no task and touches no quota."""
+        try:
+            ids, expected = batch_zip.parse_request(jobs, request.query_params.getlist("ready"))
+            data, manifest = batch_zip.build(workspace(request).batch_finals(ids), expected)
+        except NotFound:
+            return JSONResponse({"error": batch_zip.NOT_FOUND}, status_code=404)
+        except batch_zip.BatchError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status)
+        return Response(data, media_type="application/zip",
+                        headers={"Content-Disposition": batch_zip.disposition(manifest["included"])})
+
     @app.get("/download/{job_id}/{language}.pdf")
     def download(request: Request, job_id: str, language: str) -> Response:
         """The final PDF, named for its job and the version it prints (download_name): read with
@@ -1249,7 +1269,7 @@ def build_job_view(snapshot: dict) -> dict:
     jd = {key: value for key, value in job["jd"].items() if key != "raw_content"}
     language = cv_language(snapshot["notes"].get("cv-language"), jd["text"], snapshot["cv_languages"])
     steps = ["input"]
-    view: dict[str, Any] = {"job_id": job["job_id"], "jd": jd, "language": language,
+    view: dict[str, Any] = {"job_id": job["job_id"], "jd": jd, "jd_diagnostics": jd_diagnostics(jd), "language": language,
                             "cv_languages": snapshot["cv_languages"],
                             "requirements_version": requirements["version"] if requirements else 0,
                             "review": build_job_review(jd, snapshot.get("facts", []), snapshot.get("sponsorship"))}
@@ -1314,6 +1334,10 @@ def _cv_view(snapshot: dict, language: str) -> dict:
         view["pagination"] = {key: pagination[key] for key in ("pages", "checked_at")}
     if approval:
         view["approved_at"] = approval["approved_at"]
+    if cv["final_pdf"]:  # the name its download (and a batch ZIP) gives it
+        jd = snapshot["job"]["jd"]
+        view["download_name"] = pdf_filename(company=jd.get("company"), title=jd.get("title"), language=language,
+                                             job_id=snapshot["job"]["job_id"], version=material["content_sha256"])
     return view
 
 

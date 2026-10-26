@@ -50,6 +50,15 @@ def pdf_disposition(*, company: object, title: object, language: object,
     exports several jobs for the same company and role. The Unicode filename is bounded to
     150 UTF-8 bytes; the fallback contains only conservative ASCII filename characters.
     """
+    name = pdf_filename(company=company, title=title, language=language, job_id=job_id, version=version)
+    fallback = _ascii_fallback(name)
+    extended = quote(name, safe=_ATTR_CHAR, encoding="utf-8", errors="strict")
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{extended}'
+
+
+def pdf_filename(*, company: object, title: object, language: object, job_id: object, version: object) -> str:
+    """The Unicode file name of a CV PDF (pdf_disposition's): no path separator or control
+    character, at most 150 UTF-8 bytes, ending in .pdf."""
     company_name = _clean(company, default="Job", limit=48)
     title_name = _clean(title, default="Job", limit=48)
     language_name = _clean(language, default="unknown", limit=8).upper()
@@ -69,6 +78,15 @@ def pdf_disposition(*, company: object, title: object, language: object,
     while len(name.encode("utf-8")) > _MAX_NAME_BYTES and title_name:
         title_name = title_name[:-1].rstrip(" .")
         name = f"CV-{company_name}-{title_name or 'Job'}{suffix}"
-    fallback = _ascii_fallback(name)
-    extended = quote(name, safe=_ATTR_CHAR, encoding="utf-8", errors="strict")
-    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{extended}'
+    return name
+
+
+def folder_name(*, company: object, title: object, job_id: object) -> str:
+    """A ZIP folder for one job's files: company, title and the whole job ID, cleaned like a
+    file name (no separator, no control character, no leading dot), at most 154 UTF-8 bytes. The
+    whole ID, not the short one in file names: a single-user job ID starts with its creation
+    date, so two jobs of the same company and title made the same day would share a short ID."""
+    company_name = _fit_utf8(_clean(company, default="Job", limit=48), 40) or "Job"
+    title_name = _fit_utf8(_clean(title, default="Job", limit=48), 48) or "Job"
+    job = re.sub(r"[^A-Za-z0-9_-]", "", str(job_id or ""))[:64] or "unknown"
+    return f"{company_name}-{title_name}-{job}".lstrip(".")
