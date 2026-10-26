@@ -31,7 +31,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.routing import Match
 from pydantic import BaseModel
 
-from feiran.download_name import pdf_disposition
+from feiran import batch_zip
+from feiran.download_name import pdf_disposition, pdf_filename
 from feiran.cv import (
     CVError,
     _profile_hash,
@@ -98,6 +99,7 @@ from feiran.job_search import (
     prepare_review_input,
 )
 from feiran.job_review import build_job_review
+from feiran.jd_diagnostics import jd_diagnostics
 from feiran.job_url import fetch_job_url, normalize_url, require_complete_jd
 from feiran.listings import (
     ListingsError,
@@ -153,6 +155,9 @@ HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTI
 # companies and their postings (a SQLite database of their own, with its own transactions) and a
 # new CV upload (its own new file; saving it, which changes facts and the profile, does wait).
 OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload")
+# Reads that must see the facts, the CV profiles and the jobs at one moment: they wait for a
+# change being made and hold the next one out until they are done, as a change does.
+SNAPSHOT_READS = re.compile(r"/download/batch\.zip")
 # How long a change waits for the one before it (DeepSeek can take a minute) before the page is
 # told to try again.
 CHANGE_WAIT_SECONDS = 90
@@ -446,8 +451,11 @@ def create_app(
     async def one_change_at_a_time(request: Request, call_next):
         """Requests that change the facts, the CV profile or a job's files run one at a time, so
         two tabs or a double click never write the same files at the same moment. Reading never
-        waits here."""
-        if request.method in READ_ONLY_METHODS or OWN_STORE.fullmatch(request.url.path):
+        waits here, except a batch download: it checks many CVs against the facts and profiles,
+        which a change could otherwise edit between two of them (one job's CV checked before the
+        edit, the next after), and so serve a mix that never existed."""
+        if ((request.method in READ_ONLY_METHODS and not SNAPSHOT_READS.fullmatch(request.url.path))
+                or OWN_STORE.fullmatch(request.url.path)):
             return await call_next(request)
         app.state.waiting_changes += 1  # how many changes wait here now (the event loop's thread only)
         try:
@@ -594,7 +602,7 @@ def create_app(
         jd = {key: value for key, value in require(job_id, "input")["jd"].items() if key != "raw_content"}
         # Reuse analysis for unchanged saved descriptions. V2 persists it when saving.
         view: dict = {
-            "job_id": job_id, "steps": steps, "jd": jd,
+            "job_id": job_id, "steps": steps, "jd": jd, "jd_diagnostics": jd_diagnostics(jd),
             "language": job_cv_language(jd["text"], job_id), "cv_languages": cv_languages(),
             "review": build_job_review(jd, list_facts(facts_db) if facts_db.exists() else [],
                                        sponsor_for_text(jd["text"])),
@@ -731,6 +739,10 @@ def create_app(
         pages = workspace.read_note(job_id, f"cv-pages-{language}")
         if head and not stale and pages and pages.get("content_sha256") == view["content_sha256"]:
             view["pagination"] = {key: pages[key] for key in ("pages", "checked_at")}
+        if view["final_pdf"] and head_step == "approved":  # the name its download (and a batch ZIP) gives it
+            jd = (workspace.read(job_id, "input") or {}).get("jd", {})
+            view["download_name"] = pdf_filename(company=jd.get("company"), title=jd.get("title"), language=language,
+                                                 job_id=job_id, version=view["content_sha256"])
         return view
 
     def profile_file(language: str | None = None, *, writing: bool = False) -> Path:
@@ -1446,6 +1458,58 @@ def create_app(
         except (CVError, FactStoreError):
             final = False
         return render_html(head, final=final)
+
+    def batch_finals(job_ids: list[str]) -> list[dict]:
+        """What a batch download needs of each job (batch_zip.build), so the PDFs, their names
+        and the manifest describe the same moment: its request holds out every change (facts,
+        profiles, jobs; see one_change_at_a_time), and the workspace's lock is held as well. A
+        job that is not found refuses the whole batch."""
+        jobs = []
+        with workspace.lock:
+            for job_id in job_ids:
+                jd = (workspace.read(job_id, "input") or {}).get("jd") or {}
+                cvs: dict = {}
+                for language in CV_LANGUAGES:
+                    head_step, head = cv_head(job_id, language)
+                    if head is None:
+                        continue
+                    try:
+                        require_current_cv(head, language)
+                        stale = False
+                    except (CVError, FactStoreError):
+                        stale = True
+                    version = content_fingerprint(head)
+                    approved = head_step == "approved" and not stale and is_final_approval(head)
+                    pages = workspace.read_note(job_id, f"cv-pages-{language}") or {}
+                    draft = workspace.read(job_id, f"cv-draft-{language}") or {}
+                    status = workspace.read_note(job_id, f"cv-status-{language}") or {}
+                    cvs[language] = {
+                        "content_sha256": version, "stale": stale, "approved": approved,
+                        "pdf": workspace.read_bytes(job_id, f"cv-final-{language}") if approved else None,
+                        "pages": pages.get("pages") if pages.get("content_sha256") == version else None,
+                        "stages": [{"stage": item.get("stage"), "status": item.get("status")}
+                                   for item in status.get("stages") or []]
+                        if status.get("draft_created_at") == draft.get("created_at") else [],
+                    }
+                if not cvs:
+                    cvs[job_cv_language(jd.get("text") or "", job_id)] = {"content_sha256": None}
+                jobs.append({"job_id": job_id, "company": jd.get("company"), "title": jd.get("title"), "cvs": cvs})
+        return jobs
+
+    @app.get("/download/batch.zip", response_model=None)
+    def download_batch(request: Request, jobs: str = "") -> Response:
+        """Every ready final PDF of a batch of jobs in one ZIP with a manifest (batch_zip), as
+        the V2 app does: ``ready`` is what the page saw ready, and any difference now, or a job
+        not found, refuses the whole download. Reading starts nothing and calls no model."""
+        try:
+            ids, expected = batch_zip.parse_request(jobs, request.query_params.getlist("ready"))
+            data, manifest = batch_zip.build(batch_finals(ids), expected)
+        except WorkspaceError:
+            return JSONResponse({"error": batch_zip.NOT_FOUND}, status_code=404)
+        except batch_zip.BatchError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status)
+        return Response(data, media_type="application/zip",
+                        headers={"Content-Disposition": batch_zip.disposition(manifest["included"])})
 
     @app.get("/download/{job_id}/{language}.pdf")
     def cv_download(job_id: str, language: str) -> Response:

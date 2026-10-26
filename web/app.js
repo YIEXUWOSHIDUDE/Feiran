@@ -420,15 +420,44 @@ async function renderJobs() {
     const { job_id } = await api("/api/jobs", { method: "POST", body: JSON.stringify(body) });
     location.hash = `#job/${job_id}`;
   }));
+  // Ticked jobs open together on a batch page (at most BATCH_MAX), named in its address.
+  for (const id of [...BATCH_PICK]) if (!jobs.some((job) => job.job_id === id)) BATCH_PICK.delete(id);
+  const boxes = [];
+  const openBatch = el("button", { type: "button", class: "secondary" });
+  const updatePick = () => {
+    I18n.setText(openBatch, t`Open selected together (${BATCH_PICK.size}/${BATCH_MAX})`);
+    openBatch.disabled = BATCH_PICK.size === 0;
+    for (const box of boxes) box.disabled = !box.checked && BATCH_PICK.size >= BATCH_MAX;
+  };
+  openBatch.addEventListener("click", () => {
+    const ids = jobs.map((job) => job.job_id).filter((id) => BATCH_PICK.has(id)).slice(0, BATCH_MAX);
+    if (ids.length) location.hash = `#batch/${ids.join(",")}`;
+  });
+  const pickBox = (job) => {
+    const box = el("input", { type: "checkbox", "aria-label": t`Add ${job.title || job.job_id} to the batch` });
+    box.checked = BATCH_PICK.has(job.job_id);
+    box.addEventListener("change", () => {
+      if (box.checked && BATCH_PICK.size < BATCH_MAX) BATCH_PICK.add(job.job_id);
+      else { BATCH_PICK.delete(job.job_id); box.checked = false; }
+      updatePick();
+    });
+    boxes.push(box);
+    return box;
+  };
   const list = jobs.length === 0
     ? el("p", { class: "muted" }, t("No jobs yet."))
-    : el("table", {},
-      el("thead", {}, el("tr", {}, el("th", {}, t("Job")), el("th", {}, t("Captured")), el("th", {}, t("Progress")))),
-      el("tbody", {}, jobs.map((job) => el("tr", {},
-        el("td", {}, el("a", { href: `#job/${job.job_id}` }, job.title || job.job_id), el("div", { class: "muted" }, job.company || "")),
-        el("td", { class: "muted" }, localDate(job.captured_at)),
-        el("td", {}, progress(job.steps)),
-      ))));
+    : el("div", {},
+      el("table", {},
+        el("thead", {}, el("tr", {}, el("th", {}, t("Batch")), el("th", {}, t("Job")), el("th", {}, t("Captured")), el("th", {}, t("Progress")))),
+        el("tbody", {}, jobs.map((job) => el("tr", {},
+          el("td", {}, pickBox(job)),
+          el("td", {}, el("a", { href: `#job/${job.job_id}` }, job.title || job.job_id), el("div", { class: "muted" }, job.company || "")),
+          el("td", { class: "muted" }, localDate(job.captured_at)),
+          el("td", {}, progress(job.steps)),
+        )))),
+      el("div", { class: "toolbar" }, openBatch,
+        el("span", { class: "muted" }, t`Tick up to ${BATCH_MAX} jobs to see their CVs side by side and download the ready ones in one ZIP.`)));
+  updatePick();
   if (GUEST) {  // a guest workspace has its example job only: adding jobs reads pages and asks a model
     app.replaceChildren(el("section", { class: "panel jobs-panel" }, el("h2", {}, t("Jobs")), list),
       guestPanel(t("New job"), t("Sign in to add jobs from a link or a pasted description; a guest workspace works on its example job only.")));
@@ -520,6 +549,48 @@ const SPONSORSHIP_LABELS = {
 };
 
 // Source data is untrusted: only web URLs become links, and quoted evidence stays text.
+// What the saved description is and what can be said about it (jd_diagnostics on the server: no
+// new read, no model). Open by default, so what was imported is seen, and folded on request.
+const JD_READERS = {
+  pasted: t("pasted by you"), job_board: t("the job board's public API"), structured: t("the page's structured job data"),
+  structured_and_page: t("the page's structured data, replaced by the posting's own page text"),
+  page_text: t("the page's visible text"), page: t("a public webpage"), unknown: t("unknown"),
+};
+const JD_NOTES = {
+  no_source: t("No source link was saved, so where this text came from is unknown."),
+  unsafe_source: t("The saved source is not a web address, so it is not linked."),
+  no_posted_at: t("The source gave no posting date; the capture time is not a posting date."),
+  no_captured_at: t("When this text was captured is unknown."),
+  no_duties: t("No duties were identified in this text."),
+  no_qualifications: t("No qualifications were identified in this text."),
+  short: t("This text is short; check that it holds the whole posting, not a summary."),
+  truncated: t("This text seems cut off at its end."),
+  web_summary: t("This looks like a webpage summary: AI steps refuse it. Paste the full description as a new job."),
+};
+
+const JD_FOLDED = new Set();  // jobs whose description the user folded, kept while the page refreshes
+
+function jdPanel(jd, diagnostics, jobId) {
+  const facts = diagnostics || {};
+  const row = (label, value) => el("tr", {}, el("th", {}, label), el("td", {}, value));
+  const detected = (found) => found ? t("detected") : t("not identified");
+  const panel = el("details", { class: "jd-panel", open: !JD_FOLDED.has(jobId) },
+    el("summary", {}, t("Job description"), " ", el("span", { class: "muted" }, t`(${Number(facts.characters || 0).toLocaleString()} characters)`)),
+    el("table", { class: "jd-facts" }, el("tbody", {},
+      row(t("Source"), facts.source ? sourceReference(facts.source) : jd.source ? String(jd.source) : t("unknown")),
+      row(t("Captured"), facts.captured_at ? I18n.date(facts.captured_at, true) : t("unknown")),
+      row(t("Posted"), facts.posted_at ? I18n.date(facts.posted_at) : t("not given by the source")),
+      row(t("Read from"), JD_READERS[facts.reader] || JD_READERS.unknown),
+      row(t("Length"), t`${Number(facts.characters || 0).toLocaleString()} characters, ${facts.lines || 0} lines`),
+      row(t("Duties"), detected(facts.duties_detected)),
+      row(t("Qualifications"), detected(facts.qualifications_detected)))),
+    (facts.notes || []).length ? el("ul", { class: "jd-notes warning" }, facts.notes.map((code) => el("li", {}, JD_NOTES[code] || code))) : null,
+    el("p", { class: "muted" }, t("Detected means Feiran's rules found that kind of content; it does not prove the text is the whole posting, that the source is official or that the role is still open.")),
+    el("pre", { class: "jd" }, jd.text));
+  panel.addEventListener("toggle", () => { if (panel.open) JD_FOLDED.delete(jobId); else JD_FOLDED.add(jobId); });
+  return panel;
+}
+
 function sourceReference(source) {
   try {
     const url = new URL(source);
@@ -1004,6 +1075,16 @@ function pageCheck(cv, post) {
     actionButton(t("Check pages again"), post("pages"), true));
 }
 
+// Parts of a CV printed in the other language, because the profile has none in this one: named
+// on the job page and on the batch page, where the CV can be approved and downloaded too.
+function languageFallbackNote(cv, language) {
+  if (!(cv.language_fallbacks || []).length) return null;
+  const missing = language === "zh" ? t("Chinese") : t("English");
+  return el("p", { class: "warning language-fallbacks" },
+    t`Shown in the other language because your profile has no ${missing} text for — `,
+    cv.language_fallbacks.join("; "));
+}
+
 function cvBlock(view, language, refresh) {
   const cv = view.cv[language];
   const title = CV_TITLES[language];
@@ -1042,12 +1123,8 @@ function cvBlock(view, language, refresh) {
   else if (GUEST && cv.head === "draft") notes.push(el("p", { class: "muted" }, t("This sample CV is the sample profile as written, prepared without AI. Reword or adjust it with DeepSeek (this uses the guest workspace's AI allowance), or edit its lines, fit it to one page, then approve and download it.")));
   else if (cv.head === "draft") notes.push(el("p", { class: "warning" }, t("This is your usual CV: DeepSeek could not reword or adjust it yet. Use the buttons above.")));
   else if (cv.head === "tailored") notes.push(el("p", { class: "warning" }, t("Reworded, but not adjusted for this job yet: DeepSeek could not plan it. Use Adjust for this job.")));
-  if ((cv.language_fallbacks || []).length) {
-    const missing = language === "zh" ? t("Chinese") : t("English");
-    notes.push(el("p", { class: "warning" },
-      t`Shown in the other language because your profile has no ${missing} text for — `,
-      cv.language_fallbacks.join("; ")));
-  }
+  const fallbacks = languageFallbackNote(cv, language);
+  if (fallbacks) notes.push(fallbacks);
   const rewrites = (cv.rewrites || []).map((line) => ({
     id: `reword:${line.fact_id}`, type: "reword", undone: line.undone, reason: null,
     label: el("span", {}, el("span", { class: "muted" }, line.from), " → ", line.to),
@@ -1501,7 +1578,7 @@ async function renderJob(jobId) {
           await api(`/api/jobs/${jobId}/sponsorship`, { method: "POST" });
           await refresh(true);
         }, true) : null) : null,
-        el("details", {}, el("summary", {}, t("Job description")), el("pre", { class: "jd" }, jd.text)),
+        jdPanel(jd, view.jd_diagnostics, jobId),
         interruptedNote(view.interrupted),
         (view.interrupted_operations || []).map((notice) => unfinishedNote(notice, refresh)),
         (view.tasks || []).map((task) => taskNote(task, refresh)),
@@ -1553,6 +1630,226 @@ function taskNote(task, refresh) {
 // address. V2 pages are signed in with a cookie, so the token never goes into an address there.
 function tokenQuery(separator) {
   return MODE === "v2" ? "" : `${separator}token=${encodeURIComponent(TOKEN)}`;
+}
+
+// A batch: up to BATCH_MAX jobs opened together, named only in the address (#batch/a,b,c), so a
+// reload, back and forward, and coming back from a job's page open the same batch. Opening it
+// only reads each job's page view: nothing is prepared and no model is asked. Every action is
+// the job page's own, for one job and one language; the rest is a link to that job.
+const BATCH_MAX = 20;
+const BATCH_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const BATCH_PICK = new Set();  // jobs ticked on the jobs list, kept while this tab is open
+const BATCH_TICKS = new Map();  // "job:language:version" -> the approval boxes ticked for that version
+const CV_STATES = {
+  ready: t("Ready to download"), approved_no_pdf: t("Approved; final PDF not created yet"),
+  not_approved: t("Not approved yet"), stale: t("Out of date: your profile or facts changed"), not_prepared: t("Not prepared yet."),
+};
+const HEAD_STEPS = { draft: t("Draft"), tailored: t("Reworded"), planned: t("Adjusted for this job"), approved: t("Approved") };
+
+function batchIds(text) {
+  const ids = [];
+  for (const value of decodeURIComponent(text || "").split(",")) {
+    if (BATCH_ID.test(value) && !ids.includes(value)) ids.push(value);
+  }
+  return ids.slice(0, BATCH_MAX);
+}
+
+// The same rule the download uses (batch_zip.state_of): ready only when the approved version is
+// the current one, its inputs are current and its final PDF exists.
+function cvState(cv) {
+  if (!cv || !cv.head || !cv.content_sha256) return "not_prepared";
+  if (cv.stale) return "stale";
+  if (cv.head !== "approved") return "not_approved";
+  return cv.final_pdf ? "ready" : "approved_no_pdf";
+}
+
+// The CVs a job counts in the batch, as the download's manifest lists them: each language with a
+// CV, or, before any, the language its CV would be in.
+function batchItems(view) {
+  const cvs = view.cv || {};
+  const languages = ["en", "zh"].filter((language) => cvs[language] && cvs[language].head);
+  return (languages.length ? languages : [view.language || "en"])
+    .map((language) => ({ language, cv: cvs[language] || {}, state: cvState(cvs[language]) }));
+}
+
+function batchRow(view, item, refresh) {
+  const { language, cv, state } = item;
+  const jobLink = `#job/${view.job_id}`;
+  const post = (action, body) => async () => {
+    try {
+      await api(`/api/jobs/${view.job_id}/cv/${language}/${action}`,
+        body ? { method: "POST", body: JSON.stringify(body) } : { method: "POST" });
+    } finally {
+      await refresh();
+    }
+  };
+  const version = cv.content_sha256 ? cv.content_sha256.slice(0, 8) : null;
+  const steps = el("td", { "data-label": t("Steps") },
+    cv.head ? el("div", {}, t`Current: ${HEAD_STEPS[cv.head] || cv.head}`) : null,
+    stageList(cv.stages) || el("div", { class: "muted" }, cv.head ? t("No stage record for this draft.") : t("Not prepared yet.")));
+  const pages = el("td", { "data-label": t("Pages") });
+  if (cv.pagination) {
+    pages.append(cv.pagination.pages === 1 ? el("span", {}, t("1 page")) : el("span", { class: "warning" }, t`${cv.pagination.pages} pages`));
+  } else if (cv.head && !cv.stale) {
+    pages.append(el("div", { class: "muted" }, t("Not checked")));
+  }
+  if (cv.head && !cv.stale && state === "not_approved") pages.append(actionButton(cv.pagination ? t("Check pages again") : t("Check page count"), post("pages"), true));
+  const approval = el("td", { "data-label": t("Approval") });
+  if (state === "ready" || state === "approved_no_pdf") {
+    approval.append(el("span", { class: "ok-text" }, t`Approved ${I18n.date(cv.approved_at, true)}`));
+  } else if (state === "not_prepared" || state === "stale") {
+    approval.append(el("a", { href: jobLink }, state === "stale" ? t("Start over on the job page") : t("Prepare it on the job page")));
+  } else {
+    // As on the job page: this version, read there, with its pages checked and more than one page
+    // accepted. The server refuses it if the CV changed since this page read it.
+    const key = `${view.job_id}:${language}:${cv.content_sha256}`;
+    const ticks = BATCH_TICKS.get(key) || { read: false, pages: false };
+    const count = cv.pagination ? cv.pagination.pages : null;
+    const read = el("input", { type: "checkbox" });
+    read.checked = ticks.read;
+    const accept = count > 1 ? el("input", { type: "checkbox" }) : null;
+    if (accept) accept.checked = ticks.pages;
+    const approve = actionButton(t("Approve this version"), () => post("approve", {
+      expected_content_sha256: cv.content_sha256, allow_multiple_pages: Boolean(accept && accept.checked) })());
+    const update = () => {
+      BATCH_TICKS.set(key, { read: read.checked, pages: Boolean(accept && accept.checked) });
+      approve.disabled = count === null || !read.checked || Boolean(accept && !accept.checked);
+    };
+    read.addEventListener("change", update);
+    if (accept) accept.addEventListener("change", update);
+    update();
+    approval.append(...[
+      count === null ? el("div", { class: "muted" }, t("Check its pages first.")) : null,
+      accept ? el("label", { class: "accept-pages" }, accept, t` I accept that this CV prints on ${count} pages.`) : null,
+      el("label", {}, read, t` I read version ${version} and its changes on `, el("a", { href: jobLink }, t("its job page")), "."),
+      approve].filter(Boolean));
+  }
+  const pdf = el("td", { "data-label": t("Final PDF") });
+  if (state === "ready") {
+    pdf.append(el("a", { href: `/download/${view.job_id}/${language}.pdf${tokenQuery("?")}` }, cv.download_name || t("Download final PDF")));
+  } else if (state === "approved_no_pdf") {
+    pdf.append(actionButton(t("Create final PDF"), post("export")));
+  } else {
+    pdf.append(el("span", { class: "muted" }, "—"));
+  }
+  return el("tr", { class: `batch-cv ${state}`, "data-language": language },
+    el("th", {}, CV_TITLES[language], el("div", { class: state === "ready" ? "ok-text" : "muted" }, CV_STATES[state]),
+      languageFallbackNote(cv, language)),
+    steps,
+    el("td", { "data-label": t("Version") }, version ? el("code", {}, version) : "—", cv.stale ? el("div", { class: "warning" }, t("out of date")) : null),
+    pages, approval, pdf);
+}
+
+function batchJob(view, refresh) {
+  const jd = view.jd || {};
+  return [  // flat and without empty entries: replaceChildren takes nodes, not lists or null
+    el("h3", {}, el("a", { href: `#job/${view.job_id}` }, jd.title || view.job_id), " ",
+      el("span", { class: "muted" }, jd.company || t("Company unknown"))),
+    interruptedNote(view.interrupted),
+    // A task belongs to the job, not to a language: it is shown here once, never on a CV row.
+    (view.tasks || []).map((task) => taskNote(task, refresh)),
+    el("table", { class: "batch-cvs" },
+      el("thead", {}, el("tr", {}, el("th", {}, t("CV")), el("th", {}, t("Steps")), el("th", {}, t("Version")),
+        el("th", {}, t("Pages")), el("th", {}, t("Approval")), el("th", {}, t("Final PDF")))),
+      el("tbody", {}, batchItems(view).map((item) => batchRow(view, item, refresh)))),
+  ].flat().filter(Boolean);
+}
+
+// The ZIP is asked for with the versions this page shows ready; the server sends it only when
+// exactly those are ready now, so it never holds a CV the page did not show.
+async function downloadBatch(ids, ready) {
+  const query = new URLSearchParams({ jobs: ids.join(",") });
+  for (const item of ready) query.append("ready", item);
+  const response = await fetch(`/download/batch.zip?${query}${tokenQuery("&")}`, { credentials: "same-origin" });
+  if (!response.ok) {
+    let body = {};
+    try { body = await response.json(); } catch { /* not JSON */ }
+    throw new Error(body.error || `HTTP ${response.status}`);
+  }
+  const blob = await response.blob();
+  const name = (/filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") || "") || [])[1] || "Feiran-CVs.zip";
+  const link = el("a", { href: URL.createObjectURL(blob), download: name });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 60000);
+}
+
+async function renderBatch(text) {
+  const current = pageGuard();
+  const ids = batchIds(text);
+  if (!ids.length) {
+    location.replace("#jobs");
+    return;
+  }
+  BATCH_PICK.clear();
+  ids.forEach((id) => BATCH_PICK.add(id));
+  const views = new Map(), cards = new Map(), polls = new Map(), tickets = new Map();
+  const summary = el("div", { class: "batch-summary" });
+  for (const id of ids) cards.set(id, el("section", { class: "panel batch-job", "data-job": id }, el("p", { class: "muted" }, t("Loading…"))));
+  const drawSummary = () => {
+    if (!current()) return;
+    if (ids.some((id) => !views.has(id))) {
+      summary.replaceChildren(el("p", { class: "muted" }, t("Loading…")));
+      return;
+    }
+    const missing = ids.filter((id) => views.get(id) === null);
+    const items = ids.filter((id) => views.get(id)).flatMap((id) => batchItems(views.get(id)).map((item) => ({ ...item, view: views.get(id) })));
+    const ready = items.filter((item) => item.state === "ready");
+    const waiting = items.filter((item) => item.state !== "ready");
+    const reload = actionButton(t("Reload the batch"), async () => { await Promise.all(ids.map((id) => refreshJob(id))); }, true);
+    let download;
+    if (missing.length) {
+      const rest = ids.filter((id) => views.get(id));
+      download = el("p", { class: "warning" }, t("A job in this batch is not available, so nothing can be downloaded together. "),
+        rest.length ? el("a", { href: `#batch/${rest.join(",")}` }, t("Open the batch without it")) : null);
+    } else if (!ready.length) {
+      download = el("p", { class: "muted" }, t("Nothing is ready to download yet, so no ZIP is made."));
+    } else {
+      download = actionButton(t("Download ready CVs (ZIP)"), () => downloadBatch(ids,
+        ready.map((item) => `${item.view.job_id}:${item.language}:${item.cv.content_sha256}`)));
+    }
+    summary.replaceChildren(
+      el("p", {}, el("strong", { class: "batch-count" }, t`${ready.length}/${items.length} downloadable`),
+        el("span", { class: "muted" }, t(" — only CVs whose current version is approved and printed; earlier or out-of-date PDFs are never included."))),
+      el("div", { class: "toolbar" }, download, reload),
+      waiting.length ? el("details", {}, el("summary", {}, t`${waiting.length} not ready`),
+        el("ul", { class: "batch-waiting" }, waiting.map((item) => el("li", {},
+          [item.view.jd.company, item.view.jd.title || item.view.job_id].filter(Boolean).join(" — "),
+          ` (${item.language.toUpperCase()}): `, CV_STATES[item.state])))) : null);
+  };
+  // Each job reads, polls and refreshes on its own: one job's answer never lands in another's card.
+  const refreshJob = async (id) => {
+    if (!current()) return;
+    clearTimeout(polls.get(id));
+    const ticket = (tickets.get(id) || 0) + 1;
+    tickets.set(id, ticket);
+    let view;
+    try {
+      view = await api(`/api/jobs/${encodeURIComponent(id)}`);
+    } catch (error) {
+      if (!current() || tickets.get(id) !== ticket) return;
+      views.set(id, null);
+      cards.get(id).replaceChildren(el("p", { class: "warning" }, t("This job is not available: "), I18n.serverText(error.message)));
+      drawSummary();
+      return;
+    }
+    if (!current() || tickets.get(id) !== ticket) return;
+    views.set(id, view);
+    cards.get(id).replaceChildren(...batchJob(view, () => refreshJob(id)));
+    drawSummary();
+    if ((view.tasks || []).some((task) => !TERMINAL.has(task.status))) {
+      polls.set(id, setTimeout(() => { if (current()) run(() => refreshJob(id)); }, 2000));
+    }
+  };
+  app.replaceChildren(
+    el("section", { class: "panel batch-panel" },
+      el("h2", {}, t`Batch of ${ids.length} job(s)`),
+      el("p", { class: "muted" }, t("Each job's CVs, read as they are now. Opening the batch prepares nothing and asks no model; to prepare or reword a CV, open its job.")),
+      summary),
+    ...cards.values());
+  drawSummary();
+  await Promise.all(ids.map((id) => refreshJob(id)));
 }
 
 // V2: sign out (this server's session first, then Cognito's) and delete the account.
@@ -1687,9 +1984,10 @@ function route() {
   pageGeneration += 1;
   const [name, id] = location.hash.slice(1).split("/");
   for (const link of document.querySelectorAll("nav a")) {
-    link.classList.toggle("active", link.dataset.route === (name === "job" ? "jobs" : name));
+    link.classList.toggle("active", link.dataset.route === (name === "job" || name === "batch" ? "jobs" : name));
   }
   if (name === "job" && id) run(() => renderJob(id));
+  else if (name === "batch") run(() => renderBatch(id));
   else run(routes[name] || openDefault);
   if (flash) {
     show(...flash);

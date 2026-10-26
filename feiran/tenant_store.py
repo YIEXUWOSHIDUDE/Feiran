@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from feiran import sponsorship
+from feiran.cv_status import job_language
 from feiran.cv import (PAGES_OVER, PAGES_UNCHECKED, CVError, _profile_hash, approve_draft, build_draft_from_facts, content_fingerprint,
                 is_final_approval, profile_fact_ids, profile_languages, verify_draft)
 from feiran.cv_edit import EditError, StaleEdit, adopt_for, already_saved, change_line, mark_saved, save_plan, save_target, set_edit
@@ -2886,6 +2887,51 @@ class UserWorkspace:
                     '''SELECT * FROM tasks WHERE user_id = ? AND job_id = ? AND dismissed = 0
                        ORDER BY created_at DESC LIMIT 10''', (self.user_id, job_id)).fetchall()],
             }
+
+    def batch_finals(self, job_ids: list[str]) -> list[dict[str, Any]]:
+        """For a batch download (batch_zip): each job's company and title and, per CV language,
+        its current version (content hash), whether its inputs are stale, whether that version's
+        approval holds, its page check, its preparation stages, and the approved final PDF's bytes
+        (checked against their recorded hash), all from one transaction, so the PDFs, their names
+        and the manifest describe the same moment. A job that is not this user's is NotFound,
+        which refuses the whole batch. Nothing is written and no quota is touched."""
+        with self._transaction() as connection:
+            jobs = []
+            for job_id in job_ids:
+                job = self._job(connection, _text(job_id, 'job_id'))
+                cvs: dict[str, Any] = {}
+                for language in LANGUAGES:
+                    head = self._head(connection, job_id, language)
+                    if head is None:
+                        continue
+                    root = head
+                    while root['parent_id'] is not None:
+                        root = self._material_row(connection, root['parent_id'])
+                    status = self._note(connection, job_id, f'cv-status-{language}') or {}
+                    approval = self._valid_approval(connection, job_id, language)
+                    pdf = None
+                    if approval is not None:
+                        row = connection.execute('SELECT data, sha256 FROM artifacts WHERE user_id = ? AND approval_id = ?',
+                                                 (self.user_id, approval['approval_id'])).fetchone()
+                        if row is not None:
+                            pdf = bytes(row['data'])
+                            if hashlib.sha256(pdf).hexdigest() != row['sha256']:
+                                raise StoreError("The stored PDF is damaged")
+                    pages = status.get('pagination') or {}
+                    cvs[language] = {
+                        'content_sha256': head['content_sha256'], 'stale': not self._inputs_current(connection, head),
+                        'approved': approval is not None, 'pdf': pdf,
+                        'pages': pages.get('pages') if pages.get('material_id') == head['material_id'] else None,
+                        'stages': [{'stage': item.get('stage'), 'status': item.get('status')}
+                                   for item in status.get('stages') or []]
+                        if status.get('draft_material_id') == root['material_id'] else [],
+                    }
+                if not cvs:  # nothing prepared yet: listed in the language its CV would be in (v2_flow.cv_language)
+                    have, wanted = self._languages(connection), job_language(job['jd'].get('text') or '')
+                    cvs[wanted if wanted in have else (have or ['en'])[0]] = {'content_sha256': None}
+                jobs.append({'job_id': job_id, 'company': job['jd'].get('company'), 'title': job['jd'].get('title'),
+                             'cvs': cvs})
+            return jobs
 
     def job_summaries(self) -> list[dict[str, Any]]:
         """Every job, newest first, with what the jobs list shows: title, company, source, when

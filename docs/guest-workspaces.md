@@ -115,7 +115,8 @@ The server enforces this in three places, not only by hiding buttons:
      rewording and adjusting the CV; checking it, and asking for, adopting, writing or declining
      a suggestion (on this CV only);
    - editing a CV line, undoing or redoing an edit or a change, fitting to one page, checking the
-     page count, approving, creating the final PDF, preview, download;
+     page count, approving, creating the final PDF, preview, download, and the batch ZIP of its
+     own approved sample (`/download/batch.zip`; another user's job refuses it as not found);
    - `/guest/end` and `/logout`.
 
    Every other route answers **403 `guest_not_allowed`** before it runs. That covers uploads, new
