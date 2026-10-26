@@ -1813,10 +1813,11 @@ async function renderBatch(text) {
       el("p", {}, el("strong", { class: "batch-count" }, t`${ready.length}/${items.length} downloadable`),
         el("span", { class: "muted" }, t(" — only CVs whose current version is approved and printed; earlier or out-of-date PDFs are never included."))),
       el("div", { class: "toolbar" }, download, reload),
-      waiting.length ? el("details", {}, el("summary", {}, t`${waiting.length} not ready`),
+      // Only when something is not ready: replaceChildren would show a null as the word "null".
+      ...(waiting.length ? [el("details", {}, el("summary", {}, t`${waiting.length} not ready`),
         el("ul", { class: "batch-waiting" }, waiting.map((item) => el("li", {},
           [item.view.jd.company, item.view.jd.title || item.view.job_id].filter(Boolean).join(" — "),
-          ` (${item.language.toUpperCase()}): `, CV_STATES[item.state])))) : null);
+          ` (${item.language.toUpperCase()}): `, CV_STATES[item.state]))))] : []));
   };
   // Each job reads, polls and refreshes on its own: one job's answer never lands in another's card.
   const refreshJob = async (id) => {
