@@ -660,6 +660,25 @@ assert(find(row("job-busy", "en"), n => n.tagName === "button" && n.textContent 
 '''.replace("INTERFACE", json.dumps(interface)).replace("INTERFACE", json.dumps(interface))
                     .replace("INTERFACE", json.dumps(interface)).replace("EXPECTED", json.dumps(expected)))
 
+    def test_a_batch_with_everything_ready_shows_no_stray_text(self):
+        # Found live by Codex: a guest's one approved PDF showed "1/1 downloadable" and the word
+        # "null" under the ZIP button, where the list of what is not ready goes.
+        self.check_js(BATCH_VIEW + r'''
+// The double keeps the DOM's own behaviour that showed this: a null given to append is the text "null".
+const probe = run('document.createElement("div")');
+probe.append(null);
+assert.equal(probe.textContent, "null");
+sandbox.__views["job-ready"].cv.zh = {head: null};
+sandbox.location.hash = "#batch/job-ready";
+await run('renderBatch("job-ready")');
+const summary = find(app, n => n.attributes?.class === "batch-summary");
+assert.equal(find(summary, n => n.attributes?.class === "batch-count").textContent, "1/1 downloadable");
+assert(button(summary, "Download ready CVs (ZIP)"));
+assert(!find(summary, n => n.tagName === "details"));  // nothing listed as not ready
+assert(!nodes(summary).some(n => !(n.tagName) && n.textContent === "null"));
+assert(!app.textContent.includes("null"));
+''')
+
     def test_polling_reloads_only_the_busy_job_and_stops_when_the_page_is_left(self):
         self.check_js(BATCH_VIEW + r'''
 const timers = [];
