@@ -176,6 +176,14 @@ button:active:not(:disabled), a.button:active { transform: translateY(0); }
 button.secondary { background: #fff; color: var(--ink-soft); border-color: var(--line-strong); box-shadow: none; }
 button.secondary:hover:not(:disabled) { background: var(--accent-soft); border-color: #8fa4ff; color: var(--accent-dark); box-shadow: none; }
 button:disabled { opacity: 0.46; cursor: default; box-shadow: none; }
+/* The one step that moves a CV on now (nextStep in app.js): a secondary button looks primary, and
+   every kind gets the same ring. Nothing else on the page changes. */
+button.secondary.next-step { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.secondary.next-step:hover:not(:disabled) { background: var(--accent-dark); color: #fff; border-color: var(--accent-dark); }
+.next-step { box-shadow: 0 0 0 3px #315caa38; }
+a.next-step:not(.button) { font-weight: 700; box-shadow: none; }
+/* Going back to where the user was scrolls a part of the page to the top: clear of the fixed header. */
+[data-area], .cv-block[data-language] { scroll-margin-top: 96px; }
 
 input[type="text"], input[type="url"], textarea, select {
   width: 100%;

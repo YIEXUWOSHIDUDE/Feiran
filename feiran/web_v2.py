@@ -94,6 +94,7 @@ GUEST_ROUTES = frozenset({
     ("GET", "/preview/{job_id}/{language}"), ("GET", "/download/{job_id}/{language}.pdf"),
     ("GET", "/download/batch.zip"),
     ("POST", "/guest/end"), ("POST", "/logout"), ("POST", "/api/consent"),
+    ("GET", "/api/recent"), ("POST", "/api/recent"),
     ("POST", "/api/jobs/{job_id}/requirements/find"), ("POST", "/api/jobs/{job_id}/requirements/add"),
     ("POST", "/api/jobs/{job_id}/requirements/decide"), ("POST", "/api/jobs/{job_id}/cv/{language}/prepare"),
     ("POST", "/api/jobs/{job_id}/cv/{language}/tailor"), ("POST", "/api/jobs/{job_id}/cv/{language}/plan"),
@@ -311,6 +312,13 @@ class SaveLineRequest(BaseModel):
 class ConsentRequest(BaseModel):
     stage: str
     version: int
+
+
+class RecentWorkRequest(BaseModel):
+    place: dict[str, Any]
+    action: str | None = None
+    ago_ms: int | None = None
+    unless_changed_since: str | None = None
 
 
 class DeleteAccountRequest(BaseModel):
@@ -707,6 +715,18 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
     @app.post("/api/consent")
     def consent(request: Request, body: ConsentRequest) -> dict:
         return {"consents": workspace(request).give_consent(body.stage, body.version)}
+
+    @app.get("/api/recent")
+    def recent_work(request: Request) -> dict:
+        """Where this account last worked, for the page to go back to when opened with no address
+        (feiran.recent_work); a job gone, or never this account's, is simply not there."""
+        return workspace(request).recent_work()
+
+    @app.post("/api/recent")
+    def remember_work(request: Request, body: RecentWorkRequest) -> dict:
+        """Keep where the user is working now; it starts nothing and costs nothing."""
+        return workspace(request).remember_work(body.place, action=body.action, ago_ms=body.ago_ms,
+                                                unless_changed_since=body.unless_changed_since)
 
     @app.post("/api/account/delete")
     def delete_my_account(request: Request, body: DeleteAccountRequest) -> JSONResponse:

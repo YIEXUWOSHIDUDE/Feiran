@@ -619,5 +619,8 @@ window.WorkbenchChinese = {
   " I read version {0} and its changes on ": " 我已阅读版本 {0} 及其改动，位置：",
   "{0}/{1} downloadable": "{0}/{1} 可下载",
   "{0} not ready": "{0} 份尚未就绪",
-  "Batch of {0} job(s)": "批次：{0} 个岗位"
+  "Batch of {0} job(s)": "批次：{0} 个岗位",
+  "The job you were last working on is no longer available.": "你上次处理的岗位已无法打开。",
+  "This CV changed since you were last here; the current version is shown.": "这份简历在你上次离开后有变化；下面显示的是当前版本。",
+  "{0} CV(s) in this batch changed since you were last here; their current versions are shown.": "此批次中有 {0} 份简历在你上次离开后有变化；下面显示的是当前版本。"
 };
