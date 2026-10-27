@@ -17,11 +17,12 @@ import secrets
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Mapping, NamedTuple
+from typing import Any, Callable, Iterable, Iterator, Mapping, NamedTuple
 
 import anyio
 from fastapi import FastAPI, Request
@@ -123,6 +124,7 @@ from feiran.requirement_flow import (
 )
 from feiran.review import build_report
 from feiran import run_log
+from feiran.recent_work import PlaceError, action_time, clean_place, replaces, still_there
 from feiran.sponsorship import assess_sponsorship
 from feiran.workspace import (
     DEFAULT_ROOT,
@@ -152,9 +154,10 @@ READ_ONLY_METHODS = ("GET", "HEAD", "OPTIONS")
 # HTTP's own methods: a request's method is logged only if it is one of these.
 HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"})
 # Changes to their own store only, so they neither wait for nor hold up the others: the followed
-# companies and their postings (a SQLite database of their own, with its own transactions) and a
-# new CV upload (its own new file; saving it, which changes facts and the profile, does wait).
-OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload")
+# companies and their postings (a SQLite database of their own, with its own transactions), a
+# new CV upload (its own new file; saving it, which changes facts and the profile, does wait) and
+# where the user last worked (its own small file, feiran.recent_work).
+OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload|/api/recent")
 # Reads that must see the facts, the CV profiles and the jobs at one moment: they wait for a
 # change being made and hold the next one out until they are done, as a change does.
 SNAPSHOT_READS = re.compile(r"/download/batch\.zip")
@@ -180,6 +183,13 @@ class StalePage(Exception):
 
 class ConfirmRequest(BaseModel):
     refs: list[str]
+
+
+class RecentWorkRequest(BaseModel):
+    place: dict[str, Any]
+    action: str | None = None
+    ago_ms: int | None = None
+    unless_changed_since: str | None = None
 
 
 class NewJobRequest(BaseModel):
@@ -971,6 +981,54 @@ def create_app(
         updated, changed = revise_fact(facts_db, fact_id, text=request.text, tags=request.tags,
                                        expected_version=request.expected_version)
         return {"fact": updated, "changed": changed}
+
+    # Where the user last worked (feiran.recent_work), so opening the page with no address goes back
+    # there: one small file in the data folder, replaced each time; never CV or job text.
+    recent_file = Path(facts_db).parent / "recent-work.json"
+    recent_lock = threading.Lock()  # this route does not wait at the change boundary (OWN_STORE)
+
+    def job_exists(job_id: str) -> bool:
+        try:
+            return workspace.path(job_id, "input").exists()
+        except WorkspaceError:
+            return False
+
+    def kept_place() -> dict:
+        try:
+            kept = json.loads(recent_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return kept if isinstance(kept, dict) else {}
+
+    @app.get("/api/recent")
+    def recent_work() -> dict:
+        return still_there(kept_place().get("place"), lambda jobs: {job for job in jobs if job_exists(job)})
+
+    @app.post("/api/recent")
+    def remember_work(request: RecentWorkRequest) -> dict:
+        """Keep where the user is working now, as V2 does (tenant_store.remember_work): never over
+        a place that records a later action of the user's, timed on this server's clock. It
+        changes no job."""
+        try:
+            place = clean_place(request.place)
+            action, acted = action_time(request.action, request.ago_ms, int(time.time() * 1000))
+        except PlaceError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        with recent_lock:
+            kept = kept_place()
+            stamp = kept.get("updated_at")
+            if kept:
+                newer, acted = replaces(kept, action, acted)
+                if not newer or (request.unless_changed_since is not None and stamp != request.unless_changed_since):
+                    return {"place": None, "updated_at": stamp, "saved": False}
+            if not kept and request.unless_changed_since is not None:
+                return {"place": None, "updated_at": None, "saved": False}
+            if not all(job_exists(job) for job in place["jobs"]):
+                return JSONResponse({"error": "Job not found"}, status_code=404)
+            stamp = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            write_atomically(recent_file, json.dumps({"place": place, "acted_at": acted, "action": action, "updated_at": stamp},
+                                                     ensure_ascii=False).encode("utf-8"))
+        return {"place": place, "updated_at": stamp, "saved": True}
 
     @app.post("/api/facts/confirm")
     def confirm(request: ConfirmRequest) -> dict:

@@ -49,6 +49,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 from feiran import sponsorship
 from feiran.cv_status import job_language
+from feiran.recent_work import PlaceError, action_time, clean_place, kept_record, replaces, still_there
 from feiran.cv import (PAGES_OVER, PAGES_UNCHECKED, CVError, _profile_hash, approve_draft, build_draft_from_facts, content_fingerprint,
                 is_final_approval, profile_fact_ids, profile_languages, verify_draft)
 from feiran.cv_edit import EditError, StaleEdit, adopt_for, already_saved, change_line, mark_saved, save_plan, save_target, set_edit
@@ -571,15 +572,27 @@ GUEST_SCHEMA = (
     charged_tokens INTEGER NOT NULL CHECK(charged_tokens >= 0)
 )""",
 )
-ADDED_TABLES = SPONSOR_TABLES + METER_TABLES + GUEST_TABLES
+# Where each account last worked (feiran.recent_work), added the same way: one small row per
+# account, replaced each time, holding job IDs, a CV language, a part of the page, the content
+# hashes of the CVs it showed, and which user action it records and when that was on this server's
+# clock ({"place", "acted_at", "action"} as JSON); never CV or job text. A release before it neither reads nor needs it.
+RECENT_TABLES = ("recent_work",)
+RECENT_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS recent_work (
+    user_id TEXT PRIMARY KEY REFERENCES users(user_id),
+    place TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)""",
+)
+ADDED_TABLES = SPONSOR_TABLES + METER_TABLES + GUEST_TABLES + RECENT_TABLES
 ADDED_INDEXES = ("model_calls_by_day", "model_calls_by_task", "guest_workspaces_by_expiry", "guest_sessions_by_user")
-ADDED_SCHEMA = SPONSOR_SCHEMA + METER_SCHEMA + GUEST_SCHEMA
+ADDED_SCHEMA = SPONSOR_SCHEMA + METER_SCHEMA + GUEST_SCHEMA + RECENT_SCHEMA
 # What one call counts against a limit: a settled call what was reported; any other at least its
 # reservation, and more if a part that was reported says so.
 _CHARGE = ("CASE WHEN status = 'settled' THEN prompt_tokens + completion_tokens "
            "ELSE MAX(reserved, COALESCE(prompt_tokens, 0) + COALESCE(completion_tokens, 0)) END")
 # Every table holding one user's rows, children before parents: deleting an account goes in this order.
-USER_TABLES = ("artifacts", "approvals", "material_facts", "materials", "job_gaps", "job_notes",
+USER_TABLES = ("recent_work", "artifacts", "approvals", "material_facts", "materials", "job_gaps", "job_notes",
                "job_requirements", "jobs", "profile_facts", "profile_versions", "profiles", "fact_versions",
                "facts", "uploads", "posting_matches", "user_sponsor_assessments", "followed_boards", "model_calls",
                "quota_exemptions", "tasks", "request_keys", "sessions", "guest_sessions", "guest_workspaces")
@@ -699,7 +712,7 @@ def _add_tables(connection: sqlite3.Connection) -> None:
 # Rows of the added tables that an older release, not knowing them, left behind for accounts it deleted.
 _ORPHANS = {table: f'''SELECT 1 FROM {table} t JOIN users u ON u.user_id = t.user_id
                        WHERE u.deleted_at IS NOT NULL LIMIT 1'''
-            for table in ("user_sponsor_assessments", "model_calls", "quota_exemptions")}
+            for table in ("user_sponsor_assessments", "model_calls", "quota_exemptions", "recent_work")}
 
 
 _GUEST_ENDS_LEFT = ("SELECT 1 FROM guest_workspaces WHERE expires_at != ? "
@@ -2932,6 +2945,50 @@ class UserWorkspace:
                 jobs.append({'job_id': job_id, 'company': job['jd'].get('company'), 'title': job['jd'].get('title'),
                              'cvs': cvs})
             return jobs
+
+    def recent_work(self) -> dict[str, Any]:
+        """Where this account last worked, with only its jobs that still exist (recent_work.still_there).
+        Read only; a job of another account is never there, as it is never this account's."""
+        with self._transaction() as connection:
+            row = connection.execute('SELECT place FROM recent_work WHERE user_id = ?', (self.user_id,)).fetchone()
+            if row is None:
+                return {"place": None, "gone": False}
+
+            def exists(jobs):
+                return {job for job in jobs if connection.execute(
+                    'SELECT 1 FROM jobs WHERE user_id = ? AND job_id = ?', (self.user_id, job)).fetchone()}
+
+            return still_there(kept_record(json.loads(row['place']))[0], exists)
+
+    def remember_work(self, place: Any, *, action: str | None = None, ago_ms: int | None = None,
+                      unless_changed_since: str | None = None) -> dict[str, Any]:
+        """Keep where this account is working now (recent_work.clean_place), replacing the last
+        place unless that one records a later action of the user's (recent_work.action_time and
+        replaces: times on this server's clock): an older page saving late, or closing, never puts
+        back an older place. Returns {"place", "updated_at", "saved"}. Every job must be this
+        account's (NotFound otherwise, like any job it cannot see). With ``unless_changed_since``
+        nothing is written when any other save came after that one. Nothing else is written: no
+        task, version or quota."""
+        try:
+            place = clean_place(place)
+            action, acted = action_time(action, ago_ms, int(_clock().timestamp() * 1000))
+        except PlaceError as exc:
+            raise StoreError(str(exc)) from exc
+        with self._transaction(write=True) as connection:
+            row = connection.execute('SELECT place, updated_at FROM recent_work WHERE user_id = ?', (self.user_id,)).fetchone()
+            if row is not None:
+                newer, acted = replaces(json.loads(row['place']), action, acted)
+                if not newer or (unless_changed_since is not None and row['updated_at'] != unless_changed_since):
+                    return {"place": None, "updated_at": row['updated_at'], "saved": False}
+            elif unless_changed_since is not None:
+                return {"place": None, "updated_at": None, "saved": False}
+            for job in place["jobs"]:
+                self._job(connection, job)
+            stamp = _now()
+            connection.execute('INSERT INTO recent_work (user_id, place, updated_at) VALUES (?, ?, ?) '
+                               'ON CONFLICT(user_id) DO UPDATE SET place = excluded.place, updated_at = excluded.updated_at',
+                               (self.user_id, _json({"place": place, "acted_at": acted, "action": action}), stamp))
+        return {"place": place, "updated_at": stamp, "saved": True}
 
     def job_summaries(self) -> list[dict[str, Any]]:
         """Every job, newest first, with what the jobs list shows: title, company, source, when

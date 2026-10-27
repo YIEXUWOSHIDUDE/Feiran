@@ -117,6 +117,8 @@ The server enforces this in three places, not only by hiding buttons:
    - editing a CV line, undoing or redoing an edit or a change, fitting to one page, checking the
      page count, approving, creating the final PDF, preview, download, and the batch ZIP of its
      own approved sample (`/download/batch.zip`; another user's job refuses it as not found);
+   - reading and saving where it last worked (`/api/recent`: its own jobs only; the place is
+     removed with the workspace);
    - `/guest/end` and `/logout`.
 
    Every other route answers **403 `guest_not_allowed`** before it runs. That covers uploads, new
