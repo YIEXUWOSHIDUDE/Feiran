@@ -17,6 +17,9 @@ from typing import Any, Callable, Iterable
 MAX_JOBS = 20  # a batch's limit
 LANGUAGES = ("en", "zh")
 AREAS = ("review", "requirements", "cv", "gaps", "batch")
+# The control of a CV the user last worked with (the page marks each with data-step), to go back to
+# it, or to the step that now follows it; never pressed for the user.
+STEPS = ("prepare", "tailor", "plan", "fit", "start_over", "edit", "pages", "approve", "export", "download")
 KINDS = ("job", "batch")
 JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -28,9 +31,10 @@ class PlaceError(ValueError):
 
 def clean_place(value: Any) -> dict[str, Any]:
     """The place as it is kept, from what the page sent: kind, jobs (one for a job, up to
-    MAX_JOBS for a batch, each once), language and area (or None), and seen (per job and
-    language, the content hash of the CV the page showed). Anything else refuses it."""
-    if not isinstance(value, dict) or set(value) - {"kind", "jobs", "language", "area", "seen"}:
+    MAX_JOBS for a batch, each once), language, area and, for a job, step (each from its list, or
+    None), and seen (per job and language, the content hash of the CV the page showed). Anything
+    else refuses it."""
+    if not isinstance(value, dict) or set(value) - {"kind", "jobs", "language", "area", "step", "seen"}:
         raise PlaceError("Invalid place")
     kind, jobs = value.get("kind"), value.get("jobs")
     if kind not in KINDS or not isinstance(jobs, list) or not jobs:
@@ -40,7 +44,10 @@ def clean_place(value: Any) -> dict[str, Any]:
     if len(jobs) > (1 if kind == "job" else MAX_JOBS):
         raise PlaceError("Invalid place")
     language, area = value.get("language"), value.get("area")
-    if language not in (None, *LANGUAGES) or area not in (None, *AREAS):
+    step = value.get("step")
+    if language not in (None, *LANGUAGES) or area not in (None, *AREAS) or step not in (None, *STEPS):
+        raise PlaceError("Invalid place")
+    if step is not None and kind != "job":
         raise PlaceError("Invalid place")
     seen = value.get("seen") or {}
     if not isinstance(seen, dict) or set(seen) - set(jobs):
@@ -53,7 +60,7 @@ def clean_place(value: Any) -> dict[str, Any]:
                for version in versions.values()):
             raise PlaceError("Invalid place")
         kept_seen[job] = {language: version for language, version in versions.items() if version}
-    return {"kind": kind, "jobs": list(jobs), "language": language, "area": area,
+    return {"kind": kind, "jobs": list(jobs), "language": language, "area": area, "step": step,
             "seen": {job: versions for job, versions in kept_seen.items() if versions}}
 
 

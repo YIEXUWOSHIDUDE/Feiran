@@ -21,14 +21,14 @@ A, B = "a" * 64, "b" * 64
 
 
 def job_place(job_id, **fields):
-    return {"kind": "job", "jobs": [job_id], "language": "en", "area": "cv", "seen": {}} | fields
+    return {"kind": "job", "jobs": [job_id], "language": "en", "area": "cv", "step": None, "seen": {}} | fields
 
 
 class PlaceRuleTests(unittest.TestCase):
     def test_a_place_holds_only_ids_a_language_an_area_and_versions(self):
         kept = clean_place({"kind": "batch", "jobs": ["j1", "j2"], "language": None, "area": "batch",
                             "seen": {"j1": {"en": A, "zh": None}, "j2": {}}})
-        self.assertEqual(kept, {"kind": "batch", "jobs": ["j1", "j2"], "language": None, "area": "batch",
+        self.assertEqual(kept, {"kind": "batch", "jobs": ["j1", "j2"], "language": None, "area": "batch", "step": None,
                                 "seen": {"j1": {"en": A}}})
         self.assertEqual(clean_place({"kind": "job", "jobs": ["j1"]})["seen"], {})
         for bad in [None, [], {"kind": "job", "jobs": []}, {"kind": "other", "jobs": ["j1"]},
@@ -42,7 +42,7 @@ class PlaceRuleTests(unittest.TestCase):
                 clean_place(bad)
 
     def test_only_jobs_still_there_are_answered(self):
-        place = {"kind": "batch", "jobs": ["j1", "j2"], "language": None, "area": "batch",
+        place = {"kind": "batch", "jobs": ["j1", "j2"], "language": None, "area": "batch", "step": None,
                  "seen": {"j1": {"en": A}, "j2": {"en": B}}}
         self.assertEqual(still_there(place, lambda jobs: {"j2"}),
                          {"place": {**place, "jobs": ["j2"], "seen": {"j2": {"en": B}}}, "gone": False})
@@ -290,7 +290,7 @@ assert.equal(notes.length, 1);
 assert.equal(notes[0].textContent, "This CV changed since you were last here; the current version is shown.");
 const zhBlock = find(app, n => n.attributes?.class === "cv-block" && n.attributes["data-language"] === "zh");
 assert(find(zhBlock, n => n === notes[0]));  // in the CV that changed, where the page goes back to
-assert.deepEqual(JSON.parse(JSON.stringify(run('place'))), {kind: "job", jobs: ["job-1"], language: "zh", area: "cv",
+assert.deepEqual(JSON.parse(JSON.stringify(run('place'))), {kind: "job", jobs: ["job-1"], language: "zh", area: "cv", step: null,
   seen: {"job-1": {en: "a".repeat(64), zh: "b".repeat(64)}}});
 assert(sandbox.__calls.every(call => !call.method || call.path === "/api/recent"));  // nothing started, nothing changed
 // Once: refreshing the page (a poll) neither restores again nor repeats anything.
@@ -339,7 +339,7 @@ assert.equal(timers.length, 3);  // each change restarts the one pending save
 await timers[2]();
 await new Promise(resolve => later(resolve, 0));
 assert.equal(posts.length, 1);
-assert.deepEqual(posts[0].body.place, {kind: "job", jobs: ["job-1"], language: "zh", area: "cv",
+assert.deepEqual(posts[0].body.place, {kind: "job", jobs: ["job-1"], language: "zh", area: "cv", step: null,
   seen: {"job-1": {en: "a".repeat(64), zh: "b".repeat(64)}}});
 assert.equal(typeof posts[0].body.action, "string");
 assert(posts[0].body.ago_ms >= 0 && posts[0].body.ago_ms < 60000);  // elapsed time, never a date

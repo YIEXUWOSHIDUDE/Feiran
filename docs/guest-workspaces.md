@@ -115,8 +115,9 @@ The server enforces this in three places, not only by hiding buttons:
      rewording and adjusting the CV; checking it, and asking for, adopting, writing or declining
      a suggestion (on this CV only);
    - editing a CV line, undoing or redoing an edit or a change, fitting to one page, checking the
-     page count, approving, creating the final PDF, preview, download, and the batch ZIP of its
-     own approved sample (`/download/batch.zip`; another user's job refuses it as not found);
+     page count, approving, creating the final PDF, preview, download (Download all on a batch
+     uses the same single-PDF route; the older `/download/batch.zip` is still allowed, and another
+     user's job refuses either as not found);
    - reading and saving where it last worked (`/api/recent`: its own jobs only; the place is
      removed with the workspace);
    - `/guest/end` and `/logout`.
