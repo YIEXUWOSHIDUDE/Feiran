@@ -159,8 +159,10 @@ HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTI
 # where the user last worked (its own small file, feiran.recent_work).
 OWN_STORE = re.compile(r"/api/sources(/.*)?|/api/cv/upload|/api/recent")
 # Reads that must see the facts, the CV profiles and the jobs at one moment: they wait for a
-# change being made and hold the next one out until they are done, as a change does.
-SNAPSHOT_READS = re.compile(r"/download/batch\.zip")
+# change being made and hold the next one out until they are done, as a change does. A final PDF
+# is one of them: whether its approval still holds, the version asked for (Download all) and its
+# bytes are then all of one moment.
+SNAPSHOT_READS = re.compile(r"/download/batch\.zip|/download/[^/]+/(?:en|zh)\.pdf")
 # How long a change waits for the one before it (DeepSeek can take a minute) before the page is
 # told to try again.
 CHANGE_WAIT_SECONDS = 90
@@ -1570,14 +1572,20 @@ def create_app(
                         headers={"Content-Disposition": batch_zip.disposition(manifest["included"])})
 
     @app.get("/download/{job_id}/{language}.pdf")
-    def cv_download(job_id: str, language: str) -> Response:
+    def cv_download(job_id: str, language: str, v: str | None = None) -> Response:
         # The approval, its PDF and the job read together, so the name (download_name) is always
         # that PDF's. Read whole (a CV is small), so a new export moving this one to history cannot
-        # cut it off.
+        # cut it off. ``v``: the version the page showed (Download all); a PDF of any other is
+        # not sent (409), as in V2.
+        if v is not None and not re.fullmatch(r"[0-9a-f]{64}", v):
+            raise WorkspaceError("版本格式无效")
         with workspace.lock:
             approved = require(job_id, f"cv-approved-{check_language(language)}")
             data = workspace.read_bytes(job_id, f"cv-final-{check_language(language)}")
             jd = (workspace.read(job_id, "input") or {}).get("jd", {})
+        if v is not None and content_fingerprint(approved) != v:
+            return JSONResponse({"error": "This CV changed after the page showed it; reload the page, then download again."},
+                                status_code=409)
         require_current_cv(approved, language)
         if data is None:
             raise WorkspaceError("还没有已批准的最终 PDF")

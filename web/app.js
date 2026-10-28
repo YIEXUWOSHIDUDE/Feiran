@@ -106,7 +106,7 @@ async function api(path, options = {}) {
       location.href = "/welcome?ended=1";
       throw new Error(t("This guest workspace has ended."));
     }
-    location.href = `/login?return_to=${encodeURIComponent("/" + location.hash)}`;
+    location.href = signInAgainAddress();
     throw new Error(t("Your session ended. Sign in again."));
   }
   if (MODE === "v2" && response.status === 403 && body.code === "consent_required") {
@@ -456,7 +456,7 @@ async function renderJobs() {
           el("td", {}, progress(job.steps)),
         )))),
       el("div", { class: "toolbar" }, openBatch,
-        el("span", { class: "muted" }, t`Tick up to ${BATCH_MAX} jobs to see their CVs side by side and download the ready ones in one ZIP.`)));
+        el("span", { class: "muted" }, t`Tick up to ${BATCH_MAX} jobs to see their CVs side by side and download the ready ones together.`)));
   updatePick();
   if (GUEST) {  // a guest workspace has its example job only: adding jobs reads pages and asks a model
     app.replaceChildren(el("section", { class: "panel jobs-panel" }, el("h2", {}, t("Jobs")), list),
@@ -1042,7 +1042,7 @@ function cvLineEditor(view, language, cv, refresh) {
         await refresh();
       }, true));
   });
-  return draftDetails(`cv:${view.job_id}:${language}`, { class: "cv-line-editor" }, el("summary", {}, t("Edit this CV")),
+  return draftDetails(`cv:${view.job_id}:${language}`, { class: "cv-line-editor", "data-step": "edit" }, el("summary", {}, t("Edit this CV")),
     el("p", { class: "muted" }, GUEST
       ? t("Edits stay in this job's CV and can be undone below. Changed CVs need approval again.")
       : t("Edits stay in this job's CV. Save a line to your profile separately to reuse it. Changed CVs need approval again.")),
@@ -1065,14 +1065,14 @@ function pageCheck(cv, post, next = null) {
   if (!check) {
     return el("div", { class: "page-check" },
       el("p", { class: "muted" }, t("Before approving, check how many pages this version prints on.")),
-      nextStepMark(actionButton(t("Check page count"), post("pages"), true), next === "pages"));
+      nextStepMark(stepMark(actionButton(t("Check page count"), post("pages"), true), "pages"), next === "pages"));
   }
   const when = I18n.date(check.checked_at, true);
   return el("div", { class: "page-check" },
     check.pages === 1
       ? el("p", { class: "ok-text" }, t`The final PDF of this version prints on 1 page (checked ${when}).`)
       : el("p", { class: "warning" }, t`The final PDF of this version prints on ${check.pages} pages (checked ${when}). Use Fit to one page above, or accept the extra pages below.`),
-    actionButton(t("Check pages again"), post("pages"), true));
+    stepMark(actionButton(t("Check pages again"), post("pages"), true), "pages"));
 }
 
 // Parts of a CV printed in the other language, because the profile has none in this one: named
@@ -1095,6 +1095,13 @@ function nextStep(cv, busy) {
   if (cv.stale) return "start_over";
   if (cv.head !== "approved") return cv.pagination ? "approve" : "pages";
   return cv.final_pdf ? "download" : "export";
+}
+
+// Which of the CV's own controls this is (recent_work.STEPS), so going back after signing in again
+// can show it, or the step that now follows it. Marking never presses anything.
+function stepMark(node, step) {
+  node.setAttribute("data-step", step);
+  return node;
 }
 
 function nextStepMark(node, on) {
@@ -1125,20 +1132,21 @@ function cvBlock(view, language, refresh) {
   if (!cv.head) {
     return el("div", { class: "cv-block", "data-language": language }, el("h3", {}, title), changed,
       cv.stale ? el("p", { class: "warning" }, t("This CV profile changed. Prepare it again and review the new version.")) : stageList(cv.stages) || el("p", { class: "muted" }, t("Not prepared yet.")),
-      el("div", { class: "toolbar" }, nextStepMark(actionButton(cv.stages ? t("Try again") : t("Prepare this CV"), post("prepare")), next === "prepare")));
+      el("div", { class: "toolbar" }, nextStepMark(stepMark(actionButton(cv.stages ? t("Try again") : t("Prepare this CV"), post("prepare")), "prepare"), next === "prepare")));
   }
   const approved = cv.head === "approved" && !cv.stale;
   const tools = [];
   // A guest uses these too, within its AI allowance (the server refuses past it, and says why).
-  if (!cv.stale && cv.head === "draft") tools.push(actionButton(t("Reword with DeepSeek"), post("tailor"), true));
-  if (!cv.stale && (cv.head === "draft" || cv.head === "tailored")) tools.push(actionButton(t("Adjust for this job"), post("plan")));
-  if (!cv.stale && cv.head === "planned") tools.push(actionButton(t("Adjust again"), post("plan"), true));
+  if (!cv.stale && cv.head === "draft") tools.push(stepMark(actionButton(t("Reword with DeepSeek"), post("tailor"), true), "tailor"));
+  if (!cv.stale && (cv.head === "draft" || cv.head === "tailored")) tools.push(stepMark(actionButton(t("Adjust for this job"), post("plan")), "plan"));
+  if (!cv.stale && cv.head === "planned") tools.push(stepMark(actionButton(t("Adjust again"), post("plan"), true), "plan"));
   // Leaves out the least related lines until the printed CV fits one page; never rewords.
-  if (!cv.stale) tools.push(actionButton(t("Fit to one page"), post("fit"), true));
-  tools.push(nextStepMark(actionButton(t("Start over"), post("prepare"), true), next === "start_over"));
-  if (approved && !cv.final_pdf) tools.push(nextStepMark(actionButton(t("Create final PDF"), post("export")), next === "export"));
+  if (!cv.stale) tools.push(stepMark(actionButton(t("Fit to one page"), post("fit"), true), "fit"));
+  tools.push(nextStepMark(stepMark(actionButton(t("Start over"), post("prepare"), true), "start_over"), next === "start_over"));
+  if (approved && !cv.final_pdf) tools.push(nextStepMark(stepMark(actionButton(t("Create final PDF"), post("export")), "export"), next === "export"));
   if (cv.final_pdf) {
-    tools.push(nextStepMark(el("a", { class: "button", href: `/download/${view.job_id}/${language}.pdf${tokenQuery("?")}` }, t("Download final PDF")), next === "download"));
+    tools.push(nextStepMark(el("a", { class: "button", href: `/download/${view.job_id}/${language}.pdf${tokenQuery("?")}`, "data-step": "download" },
+      t("Download final PDF")), next === "download"));
   }
   const notes = [];
   if (cv.stale) notes.push(el("p", { class: "warning" }, t("Your profile or facts changed. This is an old draft. Start over and review the new version.")));
@@ -1176,8 +1184,8 @@ function cvBlock(view, language, refresh) {
     // page needs the user to accept them.
     const pages = cv.pagination ? cv.pagination.pages : null;
     const accept = pages > 1 ? el("input", { type: "checkbox" }) : null;
-    const approve = nextStepMark(actionButton(t("Approve this CV"), () => post("approve", {
-      expected_content_sha256: cv.content_sha256, allow_multiple_pages: Boolean(accept && accept.checked) })()), next === "approve");
+    const approve = nextStepMark(stepMark(actionButton(t("Approve this CV"), () => post("approve", {
+      expected_content_sha256: cv.content_sha256, allow_multiple_pages: Boolean(accept && accept.checked) })()), "approve"), next === "approve");
     const read = el("input", { type: "checkbox" });
     const update = () => { approve.disabled = pages === null || !read.checked || Boolean(accept && !accept.checked); };
     read.addEventListener("change", update);
@@ -1209,7 +1217,7 @@ function cvPanel(view, refresh) {
   language.addEventListener("change", () => run(async () => {
     const visit = placeVisit;  // the answer may come after the user has gone to another job
     await api(`/api/jobs/${view.job_id}/language`, { method: "POST", body: JSON.stringify({ language: language.value }) });
-    workingIn("cv", language.value, visit);
+    workingIn("cv", language.value, { visit });
     await refresh();
   }));
   const opener = el("summary", {}, t`${CV_TITLES[other]} for this job`);
@@ -1611,7 +1619,7 @@ async function renderJob(jobId) {
       const language = kept && (view.cv_languages || []).includes(kept.language) ? kept.language : view.language || null;
       if (language && language !== view.language) OTHER_OPEN.add(jobId);
       cvsChanged = { job: jobId, languages: changedSince(kept, jobId, view.cv) };
-      arrive({ kind: "job", jobs: [jobId], language, area: (kept && kept.area) || null, seen: {} });
+      arrive({ kind: "job", jobs: [jobId], language, area: (kept && kept.area) || null, step: (kept && kept.step) || null, seen: {} });
     }
     sawVersions(jobId, view.cv);
     const jd = view.jd;
@@ -1637,7 +1645,7 @@ async function renderJob(jobId) {
       ...(needsPreparation ? [] : [requirementsPanel(view, refresh), cvPanel(view, refresh), gapsPanel(view, refresh)]),
     );
     restoreFocus();
-    if (first) showKeptArea(kept);
+    if (first) showKeptArea(kept, view);
     first = false;
     // V2: while this job's work runs on the server, look again shortly; the page stays usable.
     if ((view.tasks || []).some((task) => !TERMINAL.has(task.status))) {
@@ -1666,7 +1674,7 @@ function taskNote(task, refresh) {
       await api(`/api/tasks/${task.task_id}/cancel`, { method: "POST" });
       await refresh(true);
     }, true);
-    return el("p", { class: "muted" }, task.status === "queued" ? t`Waiting to start: ${name}.` : t`Working on it: ${name}.`, " ", cancel);
+    return el("p", { class: "muted task-note running" }, task.status === "queued" ? t`Waiting to start: ${name}.` : t`Working on it: ${name}.`, " ", cancel);
   }
   if (task.status === "succeeded" || task.status === "superseded") return null;
   const dismiss = actionButton(t("Dismiss"), async () => {
@@ -1744,8 +1752,13 @@ function savePlaceSoon() {
   placeTimer = setTimeout(() => sendPlace(), PLACE_DELAY_MS);
 }
 
-// The user opened a job or a batch (this page's address): a new visit.
+// The user opened a job or a batch (this page's address): a new visit. Coming back in this tab to
+// the job or batch the place is already for, in the same CV language, keeps its part and step, so opening it again
+// from the list never forgets where the user was in it.
 function arrive(next) {
+  if (place && placeAddress(place) === location.hash && !next.area && !next.step && (place.language || null) === (next.language || null)) {
+    next = { ...next, area: place.area, step: place.step || null };
+  }
   place = next;
   placeHash = location.hash;
   placeVisit += 1;
@@ -1753,12 +1766,15 @@ function arrive(next) {
   savePlaceSoon();
 }
 
-// The user works in a part of the page (data-area) or a CV language of this job. ``visit``: the
-// visit an answer that came late belongs to; it changes nothing once the user has left it.
-function workingIn(area, language, visit = placeVisit) {
+// The user works in a part of the page (data-area), a CV language of this job, or with one of its
+// CV's controls (``step``, data-step). ``visit``: the visit an answer that came late belongs to; it
+// changes nothing once the user has left it.
+function workingIn(area, language, { visit = placeVisit, step = null } = {}) {
   if (!place || location.hash !== placeHash || visit !== placeVisit) return;
   const next = { ...place, area: area || place.area, language: place.kind === "job" ? language || place.language : null };
-  if (next.area === place.area && next.language === place.language) return;
+  const moved = next.area !== place.area || next.language !== place.language;
+  next.step = place.kind === "job" ? step || (moved ? null : place.step || null) : null;
+  if (!moved && next.step === (place.step || null)) return;
   place = next;
   acted();
   savePlaceSoon();
@@ -1795,12 +1811,113 @@ function changedSince(kept, jobId, cvs) {
   return Object.keys(seen).filter((language) => !cvs || !cvs[language] || cvs[language].content_sha256 !== seen[language]);
 }
 
+function findNode(root, test) {
+  if (!root) return null;
+  if (root.getAttribute && test(root)) return root;
+  for (const child of root.children || []) {
+    const found = findNode(child, test);
+    if (found) return found;
+  }
+  return null;
+}
+
+const hasClass = (node, name) => (node.getAttribute("class") || "").split(" ").includes(name);
+
+// Where going back shows: work on the job still running (its own note says so); else the CV's
+// control the user last worked with, if it is still there, or the step that now follows it (a
+// PDF created meanwhile: its download); else the part of the page. Read from what the page now
+// shows, never from what was kept: nothing is pressed or redone.
+function keptTarget(kept, view) {
+  if (!kept) return null;
+  if (view && jobBusy(view)) {
+    const running = findNode(app, (node) => hasClass(node, "task-note") && hasClass(node, "running"));
+    if (running) return running;
+  }
+  const block = kept.language && findNode(app, (node) => hasClass(node, "cv-block") && node.getAttribute("data-language") === kept.language);
+  if (block && kept.step) {
+    return findNode(block, (node) => node.getAttribute("data-step") === kept.step)
+      || findNode(block, (node) => hasClass(node, "next-step")) || block;
+  }
+  if (kept.area === "cv" && block && findNode(app, (node) => hasClass(node, "other-language") && findNode(node, (inner) => inner === block))) return block;
+  return kept.area ? findNode(app, (node) => node.getAttribute("data-area") === kept.area) : null;
+}
+
 // Back to the kept part of the page, once: scrolled to, never focused, so typing is not taken over.
-function showKeptArea(kept) {
-  if (!kept || !app.querySelector) return;
-  const target = (kept.area === "cv" && kept.language && app.querySelector(`.other-language [data-language="${kept.language}"]`))
-    || (kept.area && app.querySelector(`[data-area="${kept.area}"]`));
-  if (target && target.scrollIntoView) target.scrollIntoView({ block: "start" });
+let keptShown = null;  // what going back showed last (for the page's own checks)
+function showKeptArea(kept, view = null) {
+  const target = keptTarget(kept, view);
+  keptShown = target;
+  if (!target || !target.scrollIntoView) return;
+  const align = () => target.scrollIntoView({ block: target.getAttribute("data-area") ? "start" : "center" });
+  align();
+  // CV previews and fonts still loading above it can push it out of view: for a moment, it is kept
+  // there, until the user scrolls, clicks or types, or the page is drawn again.
+  let moved = false;
+  const stop = () => { moved = true; };
+  for (const name of ["wheel", "touchstart", "keydown", "pointerdown"]) addEventListener(name, stop, { once: true, passive: true });
+  for (const delay of [250, 700, 1400]) setTimeout(() => { if (!moved && target.isConnected) align(); }, delay);
+}
+
+// Signing in again: where the user was, carried in the address back from sign-in as
+// ?resume=area.language.step, every part from a fixed list (or "-"), and only for the job or batch
+// that address names. Nothing else rides along: no text, no ID, nothing for another site.
+const RESUME_AREAS = ["review", "requirements", "cv", "gaps", "batch"];
+const RESUME_STEPS = ["prepare", "tailor", "plan", "fit", "start_over", "edit", "pages", "approve", "export", "download"];
+
+function resumeHint() {
+  if (!place || placeHash !== location.hash) return "";
+  return `?resume=${[place.area || "-", place.language || "-", place.step || "-"].join(".")}`;
+}
+
+// Where an ended session sends the page: sign-in, then back to this address with where the user
+// was (resumeHint), so the job or batch they were on comes back with its part and control.
+function signInAgainAddress() {
+  return `/login?return_to=${encodeURIComponent("/" + resumeHint() + location.hash)}`;
+}
+
+function readResumeHint(search) {
+  const value = new URLSearchParams(search || "").get("resume");
+  const [area, language, step, ...rest] = (value || "").split(".");
+  if (!value || rest.length || ![area, language, step].every((part) => part)) return null;
+  const pick = (part, list) => (part !== "-" && list.includes(part) ? part : null);
+  return { area: pick(area, RESUME_AREAS), language: pick(language, ["en", "zh"]), step: pick(step, RESUME_STEPS) };
+}
+
+// The first page this load opens. For a job or a batch named in the address (back from signing in,
+// or a page reloaded), where the user was in it comes back too: from the hint the address carried,
+// else from the kept place, but only when that place is this same job or batch, so neither can take
+// the user anywhere else. If the user goes anywhere while it is read (even away and back), nothing of
+// it is used; if the kept place cannot be read, the page simply opens.
+async function startPage() {
+  const hint = readResumeHint(location.search);
+  const params = new URLSearchParams(location.search || "");
+  if (params.has("resume") && typeof history !== "undefined") {  // used once: a reload does not repeat it
+    params.delete("resume");
+    history.replaceState(null, "", location.pathname + (params.toString() ? `?${params}` : "") + location.hash);
+  }
+  const [name, id] = location.hash.slice(1).split("/");
+  if ((name === "job" || name === "batch") && id) {
+    const hash = location.hash;
+    const untouched = pageGuard();  // any navigation meanwhile, even back to this same address (A→B→A), wins
+    let kept = null;
+    try {
+      const answer = await request("/api/recent");  // never a sign-in redirect from here: the page itself asks for that
+      if (answer.response.ok) kept = answer.body.place;
+    } catch {
+      kept = null;
+    }
+    if (!untouched()) return;  // the user went on: their pages are open already, and stay as they are
+    const same = kept && placeAddress(kept) === hash ? kept : null;
+    const kind = name === "job" ? "job" : "batch";
+    if (same || hint) {
+      restoring = { kind, jobs: kind === "job" ? [id] : batchIds(id), seen: {}, ...(same || {}), hash };
+      if (hint) {
+        for (const key of ["area", "language", "step"]) if (hint[key]) restoring[key] = hint[key];
+      }
+      if (kind !== "job") restoring.step = null;
+    }
+  }
+  route();
 }
 
 // A batch: up to BATCH_MAX jobs opened together, named only in the address (#batch/a,b,c), so a
@@ -1928,24 +2045,56 @@ function batchJob(view, refresh) {
   ].flat().filter(Boolean);
 }
 
-// The ZIP is asked for with the versions this page shows ready; the server sends it only when
-// exactly those are ready now, so it never holds a CV the page did not show.
-async function downloadBatch(ids, ready) {
-  const query = new URLSearchParams({ jobs: ids.join(",") });
-  for (const item of ready) query.append("ready", item);
-  const response = await fetch(`/download/batch.zip?${query}${tokenQuery("&")}`, { credentials: "same-origin" });
+// Download all: the PDFs this page shows ready, one after another, each the version the page
+// showed (?v=: the server sends no other, 409) and under the server's own name for it. The set is
+// fixed when the user clicks; the first file that cannot be had (signed out, changed, failed)
+// stops the rest, and the page says how many were handed to the browser, never that they were
+// saved, which a page cannot see. Nothing is retried, exported or prepared, and leaving the page
+// stops what is left without a word.
+const DOWNLOAD_GAP_MS = 400;  // between files, so the browser takes each as a download of its own
+
+function pdfName(response, fallback) {
+  const header = response.headers.get("Content-Disposition") || "";
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (encoded) {
+    try { return decodeURIComponent(encoded[1]); } catch { /* the plain name below */ }
+  }
+  return (/filename="([^"]+)"/.exec(header) || [])[1] || fallback;
+}
+
+// One file, for the version the page showed; null when it was handed to the browser, else why not.
+async function handOver(item, isCurrent) {
+  let response, blob;
+  try {
+    response = await fetch(`/download/${item.job}/${item.language}.pdf?v=${item.version}${tokenQuery("&")}`, { credentials: "same-origin" });
+  } catch {
+    return { reason: t("the connection failed") };
+  }
+  if (MODE === "v2" && response.status === 401) return { signedOut: true };
   if (!response.ok) {
     let body = {};
     try { body = await response.json(); } catch { /* not JSON */ }
-    throw new Error(body.error || `HTTP ${response.status}`);
+    return { reason: body.error ? I18n.serverText(body.error) : `HTTP ${response.status}` };
   }
-  const blob = await response.blob();
-  const name = (/filename="([^"]+)"/.exec(response.headers.get("Content-Disposition") || "") || [])[1] || "Feiran-CVs.zip";
-  const link = el("a", { href: URL.createObjectURL(blob), download: name });
+  try { blob = await response.blob(); } catch { return { reason: t("the file could not be read") }; }
+  if (!isCurrent()) return { left: true };
+  const link = el("a", { href: URL.createObjectURL(blob), download: pdfName(response, item.name) });
   document.body.append(link);
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(link.href), 60000);
+  return null;
+}
+
+async function downloadAll(items, isCurrent, progress) {
+  for (let index = 0; index < items.length; index += 1) {
+    if (index) await new Promise((resolve) => setTimeout(resolve, DOWNLOAD_GAP_MS));
+    if (!isCurrent()) return { handed: index, left: true };
+    const stopped = await handOver(items[index], isCurrent);
+    if (stopped) return { handed: index, ...stopped };
+    progress(index + 1);
+  }
+  return { handed: items.length };
 }
 
 async function renderBatch(text) {
@@ -1958,12 +2107,39 @@ async function renderBatch(text) {
   BATCH_PICK.clear();
   ids.forEach((id) => BATCH_PICK.add(id));
   const kept = keptFor(location.hash);
-  arrive({ kind: "batch", jobs: ids, language: null, area: "batch", seen: {} });
+  arrive({ kind: "batch", jobs: ids, language: null, area: "batch", step: null, seen: {} });
   const views = new Map(), cards = new Map(), polls = new Map(), tickets = new Map();
   const summary = el("div", { class: "batch-summary" });
   const keptNote = el("div", {});  // once every job is read: how many CVs changed since the kept place
   let noted = !kept;
   for (const id of ids) cards.set(id, el("section", { class: "panel batch-job", "data-job": id }, el("p", { class: "muted" }, t("Loading…"))));
+  let downloading = null;   // {done, total} while Download all runs: one at a time, whatever redraws
+  let downloadNote = null;  // one line on how the last Download all went
+  const startDownloads = (ready) => {
+    if (downloading) return;
+    const items = ready.map((item) => ({ job: item.view.job_id, language: item.language,
+      version: item.cv.content_sha256, name: item.cv.download_name }));
+    downloading = { done: 0, total: items.length };
+    downloadNote = null;
+    drawSummary();
+    downloadAll(items, current, (done) => { downloading = { ...downloading, done }; drawSummary(); }).then((result) => {
+      downloading = null;
+      // The user went elsewhere (even away and back): a late answer, a sign-in among them, changes nothing.
+      if (result.left || !current()) return;
+      if (result.signedOut) {  // as api() does: sign in, and back to this batch; nothing is asked again
+        location.href = GUEST ? "/welcome?ended=1" : signInAgainAddress();
+        return;
+      }
+      downloadNote = result.reason
+        ? el("p", { class: "warning" }, t`Handed ${result.handed} of ${items.length} PDF(s) to the browser, then stopped: ${result.reason}`)
+        : el("p", { class: "ok-text" }, t`Handed all ${items.length} ready PDF(s) to the browser.`);
+      drawSummary();
+    }).catch(() => {  // never left looking as if it were still running
+      downloading = null;
+      downloadNote = el("p", { class: "warning" }, t("Download all stopped unexpectedly; check which files your browser received."));
+      drawSummary();
+    });
+  };
   const drawSummary = () => {
     if (!current()) return;
     if (ids.some((id) => !views.has(id))) {
@@ -1981,20 +2157,23 @@ async function renderBatch(text) {
     const waiting = items.filter((item) => item.state !== "ready");
     const reload = actionButton(t("Reload the batch"), async () => { await Promise.all(ids.map((id) => refreshJob(id))); }, true);
     let download;
-    if (missing.length) {
-      const rest = ids.filter((id) => views.get(id));
-      download = el("p", { class: "warning" }, t("A job in this batch is not available, so nothing can be downloaded together. "),
-        rest.length ? el("a", { href: `#batch/${rest.join(",")}` }, t("Open the batch without it")) : null);
-    } else if (!ready.length) {
-      download = el("p", { class: "muted" }, t("Nothing is ready to download yet, so no ZIP is made."));
+    if (!ready.length) {
+      download = el("p", { class: "muted" }, t("Nothing is ready to download yet."));
+    } else if (downloading) {
+      download = el("button", { disabled: true }, t`Downloading ${downloading.done}/${downloading.total}…`);
     } else {
-      download = actionButton(t("Download ready CVs (ZIP)"), () => downloadBatch(ids,
-        ready.map((item) => `${item.view.job_id}:${item.language}:${item.cv.content_sha256}`)));
+      download = el("button", { type: "button" }, t("Download all"));
+      download.addEventListener("click", () => startDownloads(ready));
     }
+    const rest = ids.filter((id) => views.get(id));
+    const gone = missing.length ? el("p", { class: "warning" }, t("A job in this batch is not available. "),
+      rest.length ? el("a", { href: `#batch/${rest.join(",")}` }, t("Open the batch without it")) : null) : null;
     summary.replaceChildren(
       el("p", {}, el("strong", { class: "batch-count" }, t`${ready.length}/${items.length} downloadable`),
         el("span", { class: "muted" }, t(" — only CVs whose current version is approved and printed; earlier or out-of-date PDFs are never included."))),
       el("div", { class: "toolbar" }, download, reload),
+      ...[gone, downloadNote, ready.length > 1 && !downloadNote
+        ? el("p", { class: "muted" }, t("Your browser may ask to allow this site to download several files.")) : null].filter(Boolean),
       // Only when something is not ready: replaceChildren would show a null as the word "null".
       ...(waiting.length ? [el("details", {}, el("summary", {}, t`${waiting.length} not ready`),
         el("ul", { class: "batch-waiting" }, waiting.map((item) => el("li", {},
@@ -2205,12 +2384,15 @@ accountTools();
 function workedIn(event) {
   const target = event.target && event.target.closest ? event.target : null;
   if (!target) return;
-  const area = target.closest("[data-area]"), block = target.closest(".cv-block[data-language]");
-  if (area || block) workingIn(area && area.getAttribute("data-area"), block && block.getAttribute("data-language"));
+  const area = target.closest("[data-area]"), block = target.closest(".cv-block[data-language]"), step = target.closest("[data-step]");
+  if (area || block) {
+    workingIn(area && area.getAttribute("data-area"), block && block.getAttribute("data-language"),
+      { step: step && block ? step.getAttribute("data-step") : null });
+  }
 }
 app.addEventListener("pointerdown", workedIn);
 app.addEventListener("keyup", workedIn);
 window.addEventListener("pagehide", flushPlace);
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushPlace(); });
 window.addEventListener("hashchange", route);
-route();
+startPage();

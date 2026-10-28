@@ -23,10 +23,12 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
 import time
+import urllib.parse
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -76,6 +78,10 @@ LOCAL_GUEST_START_COOKIE = "feiran-guest-start"
 V2_DATA_FORMAT = 2
 V2_DATABASE = tenant_store.DATABASE
 PUBLIC_PATHS = ("/healthz", "/login", "/auth/callback", "/signed-out", "/welcome", "/guest/start")
+# A final PDF's link, followed by the browser itself (not the page's own requests): when the session
+# has ended it goes to sign-in, and back to that job with its download in view (app.js reads
+# ?resume=area.language.step). Nothing is downloaded again by itself after signing in.
+PDF_LINK = re.compile(r"/download/([A-Za-z0-9_-]{1,64})/(en|zh)\.pdf")
 # Everything a guest workspace's session may reach, by method and route: its sample to read, the
 # data-flow agreement, the sample job's requirements (found again with AI, added or decided), the
 # CV's preparation, rewording and adjustment with AI, its own edits, undo and redo, the check
@@ -115,6 +121,7 @@ BOARD_FRESH = timedelta(minutes=30)
 BOARD_READS_PER_HOUR = 60
 BOARD_READERS = 4
 PDF_READERS = 2
+SHA256_TEXT = re.compile(r"[0-9a-f]{64}")
 CV_CHANGED = "This CV changed after the page showed it (another tab or window changed it). Read it again below, then approve."
 PREVIEW_CHANGED = ("<!doctype html><meta charset=\"utf-8\"><p>This CV changed after the page showed it. "
                    "Reload the page to read the current version.</p>")
@@ -461,6 +468,10 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
                 if path == "/":
                     guests = (await run_in_threadpool(tenant_store.guest_settings, database))["enabled"]
                     return RedirectResponse("/welcome" if guests else "/login?return_to=/", status_code=303)
+                link = PDF_LINK.fullmatch(path)
+                if link and request.method == "GET" and request.headers.get("sec-fetch-mode") == "navigate":
+                    back = f"/?resume=cv.{link[2]}.download#job/{link[1]}"
+                    return RedirectResponse(f"/login?return_to={urllib.parse.quote(back, safe='')}", status_code=303)
                 response = JSONResponse({"error": "Please sign in again", "code": "signed_out"}, status_code=401)
                 return _headers(response)
             if request.method in UNSAFE_METHODS:
@@ -1268,10 +1279,14 @@ def create_v2_app(*, database: Path, identity: Identity, settings: V2Settings,
                         headers={"Content-Disposition": batch_zip.disposition(manifest["included"])})
 
     @app.get("/download/{job_id}/{language}.pdf")
-    def download(request: Request, job_id: str, language: str) -> Response:
+    def download(request: Request, job_id: str, language: str, v: str | None = None) -> Response:
         """The final PDF, named for its job and the version it prints (download_name): read with
-        the PDF in one transaction, so a CV changed meanwhile can never lend its name."""
-        data, named = workspace(request).final_download(job_id, _language(language))
+        the PDF in one transaction, so a CV changed meanwhile can never lend its name. ``v``: the
+        version the page showed (Download all on a batch); when the PDF read is not of it, nothing
+        is sent (409), so a CV changed after the page showed it is never downloaded in its place."""
+        if v is not None and not SHA256_TEXT.fullmatch(v):
+            raise StoreError("Invalid version")
+        data, named = workspace(request).final_download(job_id, _language(language), expected_content_sha256=v)
         return Response(data, media_type="application/pdf", headers={"Content-Disposition": pdf_disposition(
             company=named["company"], title=named["title"], language=language, job_id=job_id,
             version=named["content_sha256"])})

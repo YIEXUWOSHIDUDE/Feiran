@@ -662,7 +662,7 @@ assert(find(row("job-busy", "en"), n => n.tagName === "button" && n.textContent 
 
     def test_a_batch_with_everything_ready_shows_no_stray_text(self):
         # Found live by Codex: a guest's one approved PDF showed "1/1 downloadable" and the word
-        # "null" under the ZIP button, where the list of what is not ready goes.
+        # "null" under the download button, where the list of what is not ready goes.
         self.check_js(BATCH_VIEW + r'''
 // The double keeps the DOM's own behaviour that showed this: a null given to append is the text "null".
 const probe = run('document.createElement("div")');
@@ -673,7 +673,7 @@ sandbox.location.hash = "#batch/job-ready";
 await run('renderBatch("job-ready")');
 const summary = find(app, n => n.attributes?.class === "batch-summary");
 assert.equal(find(summary, n => n.attributes?.class === "batch-count").textContent, "1/1 downloadable");
-assert(button(summary, "Download ready CVs (ZIP)"));
+assert(button(summary, "Download all"));
 assert(!find(summary, n => n.tagName === "details"));  // nothing listed as not ready
 assert(!nodes(summary).some(n => !(n.tagName) && n.textContent === "null"));
 assert(!app.textContent.includes("null"));
@@ -702,37 +702,7 @@ await timers[timers.length - 1].action();
 assert.equal(sandbox.__calls.length, 0);
 ''')
 
-    def test_the_zip_asks_for_the_versions_shown_and_a_refusal_is_shown(self):
-        for mode in ("v2", "local"):
-            with self.subTest(mode=mode):
-                self.check_js(BATCH_VIEW + r'''
-const fetched = [];
-let answer = {ok: false, status: 409, json: async () => ({error: "These CVs changed after the page showed them; reload the batch and download again."})};
-sandbox.fetch = async (url, options) => { fetched.push(url); return answer; };
-run('fetch = window.fetch');
-sandbox.location.hash = "#batch/job-ready,job-printing";
-await run('renderBatch("job-ready,job-printing")');
-assert(app.textContent.includes("1/3 downloadable"));
-await button(app, "Download ready CVs (ZIP)").fire("click");
-await new Promise(resolve => setTimeout(resolve, 0));
-const url = new URL(fetched[0], "https://x.example");
-assert.equal(url.pathname, "/download/batch.zip");
-assert.equal(url.searchParams.get("jobs"), "job-ready,job-printing");
-assert.deepEqual(url.searchParams.getAll("ready"), ["job-ready:en:" + "a".repeat(64)]);
-assert.equal(url.searchParams.get("token"), MODE === "v2" ? null : "synthetic-token");
-assert(sandbox.__app && run('message').textContent.includes("These CVs changed after the page showed them"));
-// Nothing ready: no ZIP button at all; a missing job: no download together.
-sandbox.location.hash = "#batch/job-busy";
-run('pageGeneration += 1');
-await run('renderBatch("job-busy")');
-assert(!button(app, "Download ready CVs (ZIP)"));
-assert(app.textContent.includes("Nothing is ready to download yet, so no ZIP is made."));
-sandbox.location.hash = "#batch/job-ready,gone";
-run('pageGeneration += 1');
-await run('renderBatch("job-ready,gone")');
-assert(!button(app, "Download ready CVs (ZIP)"));
-assert(find(app, n => n.tagName === "a" && n.attributes.href === "#batch/job-ready"));
-''', mode=mode)
+    # The page asks for its ready CVs one by one (Download all): tests/test_download_all.py.
 
 
 def load_tests(loader, standard_tests, pattern):

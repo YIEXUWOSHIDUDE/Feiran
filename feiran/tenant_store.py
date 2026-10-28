@@ -157,6 +157,9 @@ class StoreError(Exception):
     """A V2 store operation was refused; no partial write was committed."""
 
 
+PDF_CHANGED = "This CV changed after the page showed it; reload the page, then download again."
+
+
 class NotFound(StoreError):
     """Missing and other users' objects deliberately have the same public error."""
 
@@ -2654,13 +2657,17 @@ class UserWorkspace:
         hash recorded when it was registered."""
         return self.final_download(job_id, language)[0]
 
-    def final_download(self, job_id: str, language: str) -> tuple[bytes, dict[str, Any]]:
+    def final_download(self, job_id: str, language: str,
+                       expected_content_sha256: str | None = None) -> tuple[bytes, dict[str, Any]]:
         """The final PDF (final_pdf) and what names it, read in the same transaction so the name
         is always that PDF's: the job's company and title, and the content hash of the approved
-        CV it prints."""
+        CV it prints. With ``expected_content_sha256`` (the version the page showed), a valid
+        approval of any other version, or none, is a Conflict, checked before the PDF is read."""
         with self._transaction() as connection:
             job = self._job(connection, _text(job_id, 'job_id'))
             approval = self._valid_approval(connection, job_id, _language(language))
+            if expected_content_sha256 is not None and (approval is None or approval['content_sha256'] != expected_content_sha256):
+                raise Conflict(PDF_CHANGED)
             row = connection.execute('SELECT data, sha256 FROM artifacts WHERE user_id = ? AND approval_id = ?',
                                      (self.user_id, approval['approval_id'])).fetchone() if approval else None
         if row is None:
